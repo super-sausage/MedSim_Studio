@@ -1,0 +1,128 @@
+# ============================================================
+# CT Simulator - Docker Compose Configuration
+# ============================================================
+# Orchestrates all services: frontend, backend, postgres, minio
+#
+# Quick start:
+#   docker-compose up -d
+#
+# Access:
+#   - Frontend: http://localhost:3000
+#   - Backend API: http://localhost:8000
+#   - Swagger Docs: http://localhost:8000/docs
+#   - MinIO Console: http://localhost:9001
+# ============================================================
+
+version: "3.8"
+
+services:
+  # ---- Frontend (React + Vite) ----
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    container_name: ct-frontend
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api/v1
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      - ct-network
+    restart: unless-stopped
+
+  # ---- Backend (FastAPI) ----
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: ct-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - BACKEND_DEBUG=false
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=ct_simulator
+      - POSTGRES_USER=ctuser
+      - POSTGRES_PASSWORD=ctpass123
+      - MINIO_HOST=minio
+      - MINIO_PORT=9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin123
+      - MINIO_BUCKET=dicom-studies
+      - DATABASE_URL=postgresql://ctuser:ctpass123@postgres:5432/ct_simulator
+      - LOG_LEVEL=INFO
+    volumes:
+      - backend_uploads:/tmp/uploads
+      - backend_models:/app/ai-models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - ct-network
+    restart: unless-stopped
+
+  # ---- PostgreSQL ----
+  postgres:
+    image: postgres:16-alpine
+    container_name: ct-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=ct_simulator
+      - POSTGRES_USER=ctuser
+      - POSTGRES_PASSWORD=ctpass123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ctuser -d ct_simulator"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ct-network
+    restart: unless-stopped
+
+  # ---- MinIO (S3-compatible object storage) ----
+  minio:
+    image: minio/minio:latest
+    container_name: ct-minio
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin123
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ct-network
+    restart: unless-stopped
+
+networks:
+  ct-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  minio_data:
+    driver: local
+  backend_uploads:
+    driver: local
+  backend_models:
+    driver: local
