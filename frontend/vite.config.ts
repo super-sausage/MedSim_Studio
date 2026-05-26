@@ -1,5 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import wasm from 'vite-plugin-wasm';
+import topLevelAwait from 'vite-plugin-top-level-await';
 import path from 'path';
 
 // ---------------------------------------------------------------------------
@@ -9,7 +11,8 @@ import path from 'path';
 // architecture support.
 // ---------------------------------------------------------------------------
 export default defineConfig({
-  plugins: [react()],
+  assetsInclude: ['**/*.wasm'],
+  plugins: [react(), wasm(), topLevelAwait()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -27,6 +30,9 @@ export default defineConfig({
       '@components': path.resolve(__dirname, './src/components'),
     },
   },
+  optimizeDeps: {
+    include: ['@icr/polyseg-wasm'],
+  },
   server: {
     port: 5173,
     proxy: {
@@ -41,6 +47,9 @@ export default defineConfig({
     sourcemap: true,
     // Cornerstone3D and vtk.js require larger chunks
     chunkSizeWarningLimit: 2000,
+    commonjsOptions: {
+      exclude: [/@icr\/polyseg-wasm/],
+    },
     rollupOptions: {
       output: {
         manualChunks: {

@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { dicomService } from '@services/index';
-import type { DicomStudy, DicomSeries } from '@types/index';
+import type { DicomStudy, DicomSeries } from '@/types/index';
 
 /**
  * Hook for DICOM data loading

@@ -1,5 +1,5 @@
 import { api } from './api';
-import type { DicomStudy, DicomSeries, PaginatedResponse } from '@types/index';
+import type { DicomStudy, DicomSeries, PaginatedResponse } from '@/types/index';
 
 /**
  * DICOM Service

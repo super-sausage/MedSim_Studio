@@ -13,8 +13,8 @@ WORKDIR /app
 COPY frontend/package.json ./
 COPY frontend/yarn.lock* ./
 
-# Install dependencies (frozen lockfile for reproducibility)
-RUN yarn install --frozen-lockfile --network-timeout 300000
+# Install dependencies (using npmmirror registry for faster downloads)
+RUN yarn install --registry=https://registry.npmmirror.com --network-timeout 300000
 
 # ---- Stage 2: Build ----
 FROM node:20-alpine AS builder

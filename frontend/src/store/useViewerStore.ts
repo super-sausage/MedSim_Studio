@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ViewportLayout, MPRViewState, ViewportState, WindowLevelPreset } from '@types/dicom';
+import type { ViewportLayout, MPRViewState, ViewportState, WindowLevelPreset } from '@/types/dicom';
 
 /**
  * Viewer Store

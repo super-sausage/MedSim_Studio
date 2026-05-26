@@ -1,7 +1,7 @@
 import { useViewerStore } from '@store/useViewerStore';
 import { MPRViewer } from '@viewer/mpr/MPRViewer';
 import { VolumeRenderer } from '@vtk/volumeRendering/VolumeRenderer';
-import { WINDOW_LEVEL_PRESETS } from '@types/dicom';
+import { WINDOW_LEVEL_PRESETS } from '@/types/dicom';
 import { Button } from '@components/ui/button';
 
 /**

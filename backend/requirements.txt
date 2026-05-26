@@ -7,7 +7,7 @@ uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 
 # DICOM Processing
-pydicom==2.4.4
+pydicom==3.0.1
 pynetdicom==2.0.2
 highdicom==0.23.1
 

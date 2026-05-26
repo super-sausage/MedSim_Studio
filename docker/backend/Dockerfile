@@ -9,10 +9,12 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# System dependencies for medical imaging libraries
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# System dependencies for medical imaging libraries (using Tsinghua mirror)
+RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
+    sed -i 's|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
@@ -21,19 +23,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Install Python dependencies (offline from local cache)
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+COPY pip_cache/ /pip_cache/
+RUN pip install --no-cache-dir --timeout 600 --no-index --find-links=/pip_cache \
+        torch==2.1.2 torchvision==0.16.2 && \
+    pip install --no-cache-dir --timeout 300 --no-index --find-links=/pip_cache \
+        -r requirements.txt
 
 # ---- Stage 2: Runtime ----
 FROM python:3.11-slim AS runner
 
 WORKDIR /app
 
-# Runtime system dependencies only
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx \
+# Runtime system dependencies only (using Tsinghua mirror)
+RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
+    sed -i 's|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \

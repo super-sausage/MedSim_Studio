@@ -1,5 +1,5 @@
 import { api } from './api';
-import type { SimulationJob } from '@types/simulation';
+import type { SimulationJob } from '@/types/simulation';
 
 /**
  * Simulation Service

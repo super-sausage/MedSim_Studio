@@ -1,5 +1,5 @@
 import axios, { type AxiosInstance, type AxiosRequestConfig, type AxiosResponse } from 'axios';
-import type { APIResponse } from '@types/index';
+import type { APIResponse } from '@/types/index';
 
 /**
  * API Service Layer

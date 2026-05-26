@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { LesionConfig, OrganConfig, SimulationJob, DeformationConfig } from '@types/simulation';
+import type { LesionConfig, OrganConfig, SimulationJob, DeformationConfig } from '@/types/simulation';
 
 /**
  * Simulation Store
