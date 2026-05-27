@@ -15,9 +15,10 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@cornerstonejs/core": "^1.75.0",
-    "@cornerstonejs/tools": "^1.75.0",
     "@cornerstonejs/adapters": "^1.75.0",
+    "@cornerstonejs/core": "^1.75.0",
+    "@cornerstonejs/dicom-image-loader": "^1.75.0",
+    "@cornerstonejs/tools": "^1.75.0",
     "@kitware/vtk.js": "^30.4.0",
     "@radix-ui/react-dialog": "^1.0.5",
     "@radix-ui/react-dropdown-menu": "^2.0.6",
@@ -52,7 +53,7 @@
     "typescript": "^5.2.2",
     "vite": "^5.0.8",
     "vite-plugin-top-level-await": "^1.4.1",
-    "vite-plugin-wasm": "^3.3.0",
+    "vite-plugin-wasm": "^3.6.0",
     "vitest": "^1.1.0"
   }
 }

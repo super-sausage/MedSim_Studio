@@ -117,6 +117,7 @@ class DicomParser:
 
     def _extract_study_metadata(self, ds: Dataset) -> Dict[str, Any]:
         """Extract study-level metadata from a DICOM dataset."""
+        modality = self._get_tag(ds, "Modality")
         return {
             "patient_id": self._get_tag(ds, "PatientID", "UNKNOWN"),
             "patient_name": str(getattr(ds, "PatientName", "UNKNOWN")),
@@ -128,7 +129,7 @@ class DicomParser:
             "study_description": self._get_tag(ds, "StudyDescription"),
             "accession_number": self._get_tag(ds, "AccessionNumber"),
             "referring_physician": str(getattr(ds, "ReferringPhysicianName", "")),
-            "modality": self._get_tag(ds, "Modality"),
+            "modalities": [modality] if modality else [],
         }
 
     def _extract_series_metadata(self, ds: Dataset, file_path: str) -> Dict[str, Any]:
@@ -138,14 +139,21 @@ class DicomParser:
             pixel_spacing = [float(v) for v in ds.PixelSpacing]
 
         # Calculate window center/width if available
+        # Note: pydicom returns MultiValue for multi-valued tags, which is NOT a list
         window_center = None
         window_width = None
         if hasattr(ds, "WindowCenter"):
             wc = ds.WindowCenter
-            window_center = float(wc[0]) if isinstance(wc, list) else float(wc)
+            try:
+                window_center = float(wc)
+            except TypeError:
+                window_center = float(wc[0])
         if hasattr(ds, "WindowWidth"):
             ww = ds.WindowWidth
-            window_width = float(ww[0]) if isinstance(ww, list) else float(ww)
+            try:
+                window_width = float(ww)
+            except TypeError:
+                window_width = float(ww[0])
 
         return {
             "series_instance_uid": ds.SeriesInstanceUID,
@@ -177,6 +185,7 @@ class DicomParser:
 
         return {
             "sop_instance_uid": ds.SOPInstanceUID,
+            "series_instance_uid": ds.SeriesInstanceUID,
             "instance_number": self._get_int_tag(ds, "InstanceNumber"),
             "image_position": image_position,
             "image_orientation": image_orientation,
@@ -211,7 +220,6 @@ class DicomParser:
             study = DicomStudy(
                 id=study_id,
                 **study_info,
-                modalities=[study_info.get("modality", "")] if study_info.get("modality") else [],
                 series_count=len(series_data),
                 instance_count=len(instances),
             )
@@ -228,12 +236,16 @@ class DicomParser:
                     id=str(uuid.uuid4()),
                     study_id=study_id,
                     **series_info,
+                    image_count=len(instances),
                     file_count=sum(
                         1 for inst in instances
                         if inst["sop_instance_uid"] != "UNKNOWN"
                     ),
                 )
                 db.add(series)
+
+        # Flush so instance queries can find the newly created series
+        db.flush()
 
         # Store instances
         for inst_info in instances:
@@ -250,7 +262,7 @@ class DicomParser:
                     instance = DicomInstance(
                         id=str(uuid.uuid4()),
                         series_id=series.id,
-                        **inst_info,
+                        **{k: v for k, v in inst_info.items() if k != "series_instance_uid"},
                     )
                     db.add(instance)
 
@@ -285,4 +297,7 @@ class DicomParser:
         try:
             return float(value)
         except (ValueError, TypeError):
-            return None
+            try:
+                return float(value[0])  # handle MultiValue
+            except (ValueError, TypeError, IndexError):
+                return None

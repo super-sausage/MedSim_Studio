@@ -29,7 +29,7 @@ export function useDicomLoader(): UseDicomLoaderResult {
     setError(null);
     try {
       const response = await dicomService.getStudies();
-      setStudies(response.data.items);
+      setStudies(response.items);
     } catch (err: any) {
       setError(err.message || 'Failed to load studies');
     } finally {
@@ -42,7 +42,7 @@ export function useDicomLoader(): UseDicomLoaderResult {
     setError(null);
     try {
       const response = await dicomService.getSeries(studyId);
-      setSeries(response.data);
+      setSeries(response);
     } catch (err: any) {
       setError(err.message || 'Failed to load series');
     } finally {

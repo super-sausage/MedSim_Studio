@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import wasm from 'vite-plugin-wasm';
 import topLevelAwait from 'vite-plugin-top-level-await';
 import path from 'path';
 
@@ -12,7 +11,10 @@ import path from 'path';
 // ---------------------------------------------------------------------------
 export default defineConfig({
   assetsInclude: ['**/*.wasm'],
-  plugins: [react(), wasm(), topLevelAwait()],
+  plugins: [
+    react(),
+    topLevelAwait(),
+  ],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -31,7 +33,14 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    include: ['@icr/polyseg-wasm'],
+    exclude: [],
+    include: [
+      '@cornerstonejs/core',
+      '@cornerstonejs/tools',
+      '@cornerstonejs/dicom-image-loader',
+      '@kitware/vtk.js',
+      'lodash.clonedeep',
+    ],
   },
   server: {
     port: 5173,
@@ -49,6 +58,7 @@ export default defineConfig({
     chunkSizeWarningLimit: 2000,
     commonjsOptions: {
       exclude: [/@icr\/polyseg-wasm/],
+      requireReturnsDefault: 'auto',
     },
     rollupOptions: {
       output: {

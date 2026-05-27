@@ -47,6 +47,17 @@ export interface DicomSeries {
   windowWidth: number;
 }
 
+/** DICOM instance (single slice) within a series */
+export interface DicomInstance {
+  id: string;
+  seriesId: string;
+  sopInstanceUid: string;
+  instanceNumber: number | null;
+  sliceLocation: number | null;
+  rows: number | null;
+  columns: number | null;
+}
+
 /** Viewport layout configuration */
 export interface ViewportLayout {
   id: string;

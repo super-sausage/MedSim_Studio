@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "/tmp/uploads"
     MAX_UPLOAD_SIZE: int = 500 * 1024 * 1024  # 500MB
 
+    # DICOM file storage (persistent — not cleaned after upload)
+    DICOM_STORAGE_DIR: str = "/app/static/dicom"
+
     # AI Services
     AI_MONAI_ENABLED: bool = False
     AI_DEVICE: str = "cpu"

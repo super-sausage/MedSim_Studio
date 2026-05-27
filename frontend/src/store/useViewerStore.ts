@@ -23,6 +23,9 @@ interface ViewerStore {
   // Window/Level
   activePreset: WindowLevelPreset | null;
 
+  // Active tool
+  activeTool: string;
+
   // 3D volume rendering
   volumeRenderingEnabled: boolean;
   volumeOpacity: number;
@@ -34,6 +37,7 @@ interface ViewerStore {
   setMPRState: (state: MPRViewState) => void;
   updateViewport: (viewportId: string, state: Partial<ViewportState>) => void;
   setWindowLevel: (preset: WindowLevelPreset) => void;
+  setActiveTool: (tool: string) => void;
   toggleVolumeRendering: () => void;
   setVolumeOpacity: (opacity: number) => void;
   resetViewer: () => void;
@@ -59,6 +63,7 @@ export const useViewerStore = create<ViewerStore>((set) => ({
   ],
   mprState: null,
   activePreset: null,
+  activeTool: 'windowLevel',
   volumeRenderingEnabled: false,
   volumeOpacity: 0.5,
 
@@ -105,12 +110,15 @@ export const useViewerStore = create<ViewerStore>((set) => ({
 
   setVolumeOpacity: (volumeOpacity) => set({ volumeOpacity }),
 
+  setActiveTool: (tool) => set({ activeTool: tool }),
+
   resetViewer: () =>
     set({
       activeStudyId: null,
       activeSeriesId: null,
       mprState: null,
       activePreset: null,
+      activeTool: 'windowLevel',
       volumeRenderingEnabled: false,
       volumeOpacity: 0.5,
     }),

@@ -1,15 +1,37 @@
-import axios, { type AxiosInstance, type AxiosRequestConfig, type AxiosResponse } from 'axios';
-import type { APIResponse } from '@/types/index';
+import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
 
 /**
  * API Service Layer
  *
  * Centralized HTTP client for all backend communications.
- * Handles request/response interceptors, error normalization,
- * and type-safe API calls for all modules.
+ * Backend endpoints return data directly (no { success, data } wrapper),
+ * so the typed response is the raw data from the backend.
  */
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1';
+
+// ---------------------------------------------------------------------------
+// snake_case → camelCase converter for backend responses
+// ---------------------------------------------------------------------------
+
+function toCamel(str: string): string {
+  return str.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+}
+
+function convertKeys(obj: unknown): unknown {
+  if (Array.isArray(obj)) {
+    return obj.map(convertKeys);
+  }
+  if (obj !== null && typeof obj === 'object' && !(obj instanceof Date)) {
+    return Object.fromEntries(
+      Object.entries(obj as Record<string, unknown>).map(([k, v]) => [
+        toCamel(k),
+        convertKeys(v),
+      ]),
+    );
+  }
+  return obj;
+}
 
 class ApiService {
   private client: AxiosInstance;
@@ -26,15 +48,19 @@ class ApiService {
     // Request interceptor for auth and logging
     this.client.interceptors.request.use(
       (config) => {
-        // Future: attach auth tokens here
         return config;
       },
       (error) => Promise.reject(error),
     );
 
-    // Response interceptor for error normalization
+    // Response interceptor — converts snake_case to camelCase + error normalization
     this.client.interceptors.response.use(
-      (response) => response,
+      (response) => {
+        if (response.data !== null && response.data !== undefined) {
+          response.data = convertKeys(response.data) as any;
+        }
+        return response;
+      },
       (error) => {
         const normalized = {
           status: error.response?.status || 0,
@@ -46,39 +72,44 @@ class ApiService {
     );
   }
 
-  /** GET request with generic response typing */
-  async get<T>(url: string, config?: AxiosRequestConfig): Promise<APIResponse<T>> {
-    const response: AxiosResponse<APIResponse<T>> = await this.client.get(url, config);
+  /** GET request — returns the backend response body directly */
+  async get<T>(url: string, config?: AxiosRequestConfig): Promise<T> {
+    const response = await this.client.get<T>(url, config);
     return response.data;
   }
 
-  /** POST request with generic response typing */
-  async post<T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<APIResponse<T>> {
-    const response: AxiosResponse<APIResponse<T>> = await this.client.post(url, data, config);
+  /** POST request — returns the backend response body directly */
+  async post<T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T> {
+    const response = await this.client.post<T>(url, data, config);
     return response.data;
   }
 
-  /** PUT request with generic response typing */
-  async put<T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<APIResponse<T>> {
-    const response: AxiosResponse<APIResponse<T>> = await this.client.put(url, data, config);
+  /** PUT request — returns the backend response body directly */
+  async put<T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T> {
+    const response = await this.client.put<T>(url, data, config);
     return response.data;
   }
 
-  /** DELETE request with generic response typing */
-  async delete<T>(url: string, config?: AxiosRequestConfig): Promise<APIResponse<T>> {
-    const response: AxiosResponse<APIResponse<T>> = await this.client.delete(url, config);
+  /** DELETE request — returns the backend response body directly */
+  async delete<T>(url: string, config?: AxiosRequestConfig): Promise<T> {
+    const response = await this.client.delete<T>(url, config);
     return response.data;
   }
 
   /** Upload DICOM files with multipart/form-data */
-  async uploadDicom(files: File[], studyId?: string): Promise<APIResponse<any>> {
+  async uploadDicom(files: File[], studyId?: string): Promise<{
+    studyId: string;
+    seriesCount: number;
+    instanceCount: number;
+    message: string;
+  }> {
     const formData = new FormData();
-    files.forEach((file) => formData.append('dicom_files', file));
-    if (studyId) formData.append('study_id', studyId);
+    files.forEach((file) => formData.append('files', file));
 
     return this.post('/dicom/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 120000, // 2 min for large studies
+      params: studyId ? { study_id: studyId } : undefined,
+      timeout: 120000,
     });
   }
 }

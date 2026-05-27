@@ -12,3 +12,14 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+
+/**
+ * Type declarations for @cornerstonejs/dicom-image-loader
+ * This package does not ship its own TypeScript declarations.
+ */
+declare module '@cornerstonejs/dicom-image-loader' {
+  export const configure: (config: Record<string, any>) => void;
+  export const external: { cornerstone: Record<string, any> };
+  export const wadouri: { registerImageLoader: () => void };
+  export const unknown: { createImageIds: (opts: any) => any };
+}
