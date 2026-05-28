@@ -9,10 +9,13 @@ import os
 import uuid
 import shutil
 import logging
-from typing import List, Optional
+import traceback
+from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
+
+import pydicom
 
 from app.database.session import get_db
 from app.models.dicom import DicomStudy, DicomSeries, DicomInstance
@@ -24,11 +27,120 @@ from app.schemas.dicom import (
     PaginatedResponse,
 )
 from app.dicom.parser.dicom_parser import DicomParser
+from app.dicom.storage import MinIOStorage
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def safe_exception_message(e: Exception) -> str:
+    """Safely stringify exceptions that may contain non-UTF8 payloads."""
+    try:
+        return str(e)
+    except UnicodeDecodeError:
+        return repr(e)
+    except Exception:
+        return e.__class__.__name__
+
+
+def safe_dicom_value(value) -> Optional[str]:
+    """Safely convert a pydicom attribute value to a plain Python str."""
+    if value is None:
+        return None
+    try:
+        result = str(value)
+        if not isinstance(result, str):
+            result = repr(value)
+        return result
+    except UnicodeDecodeError:
+        try:
+            if hasattr(value, "original_string"):
+                raw = value.original_string
+                if isinstance(raw, bytes):
+                    return raw.decode("latin1", errors="replace")
+            return repr(value)
+        except Exception:
+            return repr(value)
+    except Exception:
+        return repr(value)
+
+
+_TEXT_VRS = {
+    "AE", "AS", "CS", "DA", "DS", "DT", "IS", "LO", "LT",
+    "PN", "SH", "ST", "TM", "UC", "UI", "UR", "UT",
+}
+
+
+def _sanitize_dicom_dataset(ds):
+    """Pre-decode all text VR values to safe Python strings.
+
+    pydicom lazily decodes text VR values on first str() access.
+    If SpecificCharacterSet is missing or wrong, str() raises UnicodeDecodeError.
+    This forces all text values to Python str eagerly, falling back to
+    latin1 with errors='replace' on failure.
+    """
+    if not getattr(ds, "SpecificCharacterSet", None):
+        ds.SpecificCharacterSet = "ISO_IR 192"
+
+    for elem in ds:
+        if elem.VR in _TEXT_VRS and elem.value is not None:
+            try:
+                safe = str(elem.value)
+                if isinstance(safe, str):
+                    elem.value = safe
+            except (UnicodeDecodeError, Exception):
+                try:
+                    if hasattr(elem.value, "original_string"):
+                        raw = elem.value.original_string
+                        if isinstance(raw, bytes):
+                            elem.value = raw.decode("latin1", errors="replace")
+                            continue
+                    elem.value = repr(elem.value)
+                except Exception:
+                    elem.value = ""
+
+
+def _patched_dcmread_force(original):
+    """Create a wrapper that forces force=True and sanitizes text values on pydicom.dcmread."""
+    def wrapper(*args, **kwargs):
+        kwargs["force"] = True
+        ds = original(*args, **kwargs)
+        try:
+            _sanitize_dicom_dataset(ds)
+        except Exception:
+            logger.warning("Failed to sanitize DICOM text values", exc_info=True)
+        return ds
+
+    for attr in ("__module__", "__name__", "__qualname__", "__doc__", "__annotations__"):
+        try:
+            setattr(wrapper, attr, getattr(original, attr))
+        except (AttributeError, TypeError):
+            pass
+    wrapper.__wrapped__ = original
+    return wrapper
+
+
 router = APIRouter(prefix="/dicom", tags=["DICOM"])
+
+
+def _generate_dicom_object_key(
+    study_uid: str, series_uid: str, sop_uid: str
+) -> Optional[str]:
+    """
+    Generate MinIO object key for a DICOM file.
+
+    Format: dicom/{study_uid}/{series_uid}/{sop_uid}.dcm
+
+    Returns None if any UID is missing or empty after cleanup.
+    """
+    study_uid = str(study_uid).strip().replace("/", "_").replace("\\", "_")
+    series_uid = str(series_uid).strip().replace("/", "_").replace("\\", "_")
+    sop_uid = str(sop_uid).strip().replace("/", "_").replace("\\", "_")
+
+    if not study_uid or not series_uid or not sop_uid:
+        return None
+
+    return f"dicom/{study_uid}/{series_uid}/{sop_uid}.dcm"
 
 
 @router.get("/studies", response_model=PaginatedResponse)
@@ -144,6 +256,8 @@ async def get_instance_file(instance_id: str, db: Session = Depends(get_db)):
     """
     Serve the raw DICOM file for an instance.
     Used by Cornerstone3D's wadouri image loader to load image data.
+
+    Phase 5A: Reads from MinIO object storage instead of local file path.
     """
     instance = db.query(DicomInstance).filter(
         DicomInstance.id == instance_id
@@ -154,16 +268,35 @@ async def get_instance_file(instance_id: str, db: Session = Depends(get_db)):
             detail=f"Instance {instance_id} not found",
         )
 
-    if not instance.pixel_data_path or not os.path.exists(instance.pixel_data_path):
+    if not instance.pixel_data_path:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"DICOM file not found on disk for instance {instance_id}",
+            detail=f"DICOM object key is empty for instance {instance_id}",
         )
 
-    return FileResponse(
-        path=instance.pixel_data_path,
+    storage = MinIOStorage()
+
+    if not storage.check_health():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Storage service unavailable",
+        )
+
+    dicom_bytes = storage.get_object_bytes(instance.pixel_data_path)
+    if dicom_bytes is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"DICOM object not found in storage for instance {instance_id}",
+        )
+
+    filename = f"{instance.sop_instance_uid}.dcm" if instance.sop_instance_uid else f"{instance_id}.dcm"
+
+    return Response(
+        content=dicom_bytes,
         media_type="application/dicom",
-        filename=os.path.basename(instance.pixel_data_path),
+        headers={
+            "Content-Disposition": f"inline; filename=\"{filename}\"",
+        },
     )
 
 
@@ -181,9 +314,8 @@ async def upload_dicom(
     """
     Upload and parse DICOM files.
 
-    Accepts multiple DICOM files, parses them, extracts metadata,
-    stores DICOM files persistently on disk, and creates database records.
-    Supports standard DICOM and DICOMDIR formats.
+    Accepts multiple DICOM files, pre-parses to extract UIDs, uploads to MinIO,
+    then parses metadata and creates database records with MinIO object keys.
     """
     if not files:
         raise HTTPException(
@@ -191,70 +323,101 @@ async def upload_dicom(
             detail="No files provided",
         )
 
-    # Use a temp staging area for upload, then move to persistent storage
+    # Use a temp staging area for upload
     upload_id = str(uuid.uuid4())
     staging_dir = f"{settings.UPLOAD_DIR}/{upload_id}"
     os.makedirs(staging_dir, exist_ok=True)
 
     saved_paths = []
+    uploaded_keys: List[str] = []  # Track uploaded MinIO objects for rollback
+    storage = MinIOStorage()
+
     try:
-        # Save uploaded files to staging directory
+        # Step 1: Save uploaded files to staging directory
         for file in files:
             content = await file.read()
-            file_name = os.path.basename(file.filename) or f"dicom_{uuid.uuid4()}.dcm"
+            file_name = file.filename or f"dicom_{uuid.uuid4()}.dcm"
             file_path = os.path.join(staging_dir, file_name)
             with open(file_path, "wb") as f:
                 f.write(content)
             saved_paths.append(file_path)
 
-        # Parse DICOM files to extract metadata
-        parser = DicomParser()
-        result = parser.parse_files(saved_paths, db)
+        # Step 2: Pre-parse to extract UIDs and build storage_map
+        pre_parse_results: List[tuple[str, str]] = []  # [(file_path, object_key), ...]
 
-        # Move DICOM files from staging to persistent storage
-        study_persistent_dir = f"{settings.DICOM_STORAGE_DIR}/{result['study_id']}"
-        os.makedirs(study_persistent_dir, exist_ok=True)
+        for file_path in saved_paths:
+            try:
+                # Read only metadata, skip pixel data for performance
+                ds = pydicom.dcmread(file_path, stop_before_pixels=True, force=True)
 
-        # Update pixel_data_path for all instances in this study
-        series_list = (
-            db.query(DicomSeries)
-            .filter(DicomSeries.study_id == result["study_id"])
-            .all()
-        )
+                # Sanitize text values to prevent UTF-8 decode errors on str() calls
+                _sanitize_dicom_dataset(ds)
 
-        for series in series_list:
-            series_storage = f"{study_persistent_dir}/{series.id}"
-            os.makedirs(series_storage, exist_ok=True)
+                # Extract required UIDs
+                study_uid = getattr(ds, "StudyInstanceUID", None)
+                series_uid = getattr(ds, "SeriesInstanceUID", None)
+                sop_uid = getattr(ds, "SOPInstanceUID", None)
 
-            instances = (
-                db.query(DicomInstance)
-                .filter(DicomInstance.series_id == series.id)
-                .all()
+                # Generate object key
+                object_key = _generate_dicom_object_key(study_uid, series_uid, sop_uid)
+
+                if not object_key:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=f"DICOM file {os.path.basename(file_path)} missing required UIDs "
+                               f"(StudyInstanceUID, SeriesInstanceUID, or SOPInstanceUID)",
+                    )
+
+                pre_parse_results.append((file_path, object_key))
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Failed to parse DICOM file {os.path.basename(file_path)}: {safe_exception_message(e)}",
+                )
+
+        # Step 3: Build storage_map and upload to MinIO
+        storage_map: Dict[str, str] = {
+            file_path: object_key for file_path, object_key in pre_parse_results
+        }
+
+        for file_path, object_key in pre_parse_results:
+            success = storage.upload_file(
+                object_key=object_key,
+                file_path=file_path,
+                content_type="application/dicom",
             )
+            if not success:
+                # Rollback: delete already uploaded files
+                for uploaded_key in uploaded_keys:
+                    storage.delete_file(uploaded_key)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Failed to upload {os.path.basename(file_path)} to MinIO storage",
+                )
+            uploaded_keys.append(object_key)
 
-            for inst in instances:
-                old_path = inst.pixel_data_path
-                if old_path and os.path.exists(old_path):
-                    # Preserve original filename for the DICOM file
-                    orig_name = os.path.basename(old_path)
-                    new_path = os.path.join(series_storage, orig_name)
-
-                    # Handle duplicate filenames
-                    counter = 1
-                    while os.path.exists(new_path):
-                        name_parts = os.path.splitext(orig_name)
-                        new_path = os.path.join(
-                            series_storage, f"{name_parts[0]}_{counter}{name_parts[1]}"
-                        )
-                        counter += 1
-
-                    shutil.move(old_path, new_path)
-                    inst.pixel_data_path = new_path
-
-            # Update series storage path
-            series.storage_path = series_storage
-
-        db.commit()
+        # Step 4: Parse DICOM files with storage_map
+        # Monkey-patch pydicom.dcmread to force force=True during parsing.
+        # The parser calls dcmread without force=True, which causes UnicodeDecodeError
+        # on DICOM files with non-UTF8 encoded text tags (e.g. Chinese PatientName).
+        parser = DicomParser()
+        original_dcmread = pydicom.dcmread
+        try:
+            pydicom.dcmread = _patched_dcmread_force(original_dcmread)
+            result = parser.parse_files(saved_paths, db, storage_map=storage_map)
+        except Exception as e:
+            # Parser failed: try to clean up MinIO objects
+            for uploaded_key in uploaded_keys:
+                try:
+                    storage.delete_file(uploaded_key)
+                except Exception:
+                    pass
+            raise
+        finally:
+            pydicom.dcmread = original_dcmread
 
         return DicomUploadResponse(
             study_id=result["study_id"],
@@ -262,14 +425,24 @@ async def upload_dicom(
             instance_count=result["instance_count"],
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Upload failed: {e}")
+        # Unknown error: try to clean up MinIO objects
+        for uploaded_key in uploaded_keys:
+            try:
+                storage.delete_file(uploaded_key)
+            except Exception:
+                pass
+        logger.exception("FULL TRACEBACK in upload_dicom")
+        tb = traceback.format_exc()
+        logger.error(tb)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process DICOM files: {str(e)}",
+            detail=f"TRACEBACK:\n{tb}",
         )
     finally:
-        # Clean up staging directory only
+        # Clean up staging directory
         if os.path.exists(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
 

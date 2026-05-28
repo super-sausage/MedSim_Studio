@@ -12,6 +12,12 @@ from app import __version__, __app_name__
 router = APIRouter(tags=["Health"])
 
 
+def _get_minio_storage():
+    """Lazy import to avoid circular dependency at module load time."""
+    from app.main import minio_storage
+    return minio_storage
+
+
 @router.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
     """
@@ -34,17 +40,34 @@ async def readiness_check():
     Checks if the service is ready to accept traffic.
     Verifies database connectivity and storage availability.
     """
-    # TODO: Add actual readiness checks:
-    # - Database connection pool health
-    # - MinIO bucket accessibility
-    # - Volume rendering cache status
+    checks: dict[str, str] = {}
+
+    # Database: still pending (not yet wired up)
+    checks["database"] = "pending"
+
+    # Storage: real MinIO health check
+    storage = _get_minio_storage()
+    if storage is None:
+        checks["storage"] = "unhealthy"
+    else:
+        try:
+            checks["storage"] = "healthy" if storage.check_health() else "unhealthy"
+        except Exception:
+            checks["storage"] = "unhealthy"
+
+    # Cache: not yet implemented, skip without blocking readiness
+    checks["cache"] = "skipped"
+
+    # Overall status: only database and storage matter
+    ready = (
+        checks["database"] in ("healthy", "pending")
+        and checks["storage"] == "healthy"
+    )
+    overall = "ready" if ready else "not_ready"
+
     return {
-        "status": "ready",
-        "checks": {
-            "database": "pending",
-            "storage": "pending",
-            "cache": "pending",
-        },
+        "status": overall,
+        "checks": checks,
         "timestamp": datetime.utcnow().isoformat(),
     }
 

@@ -21,6 +21,57 @@ from app.models.dicom import DicomStudy, DicomSeries, DicomInstance
 logger = logging.getLogger(__name__)
 
 
+def safe_str(value, default=None):
+    try:
+        if value is None:
+            return default
+        return str(value)
+    except Exception:
+        return default
+
+
+def safe_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (list, tuple)) or (hasattr(value, "__iter__") and not isinstance(value, (str, bytes))):
+            items = list(value)
+            value = items[0] if items else None
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value, default=None):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (list, tuple)) or (hasattr(value, "__iter__") and not isinstance(value, (str, bytes))):
+            items = list(value)
+            value = items[0] if items else None
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def safe_list(value, converter=None, default=None):
+    try:
+        if value is None:
+            return default if default is not None else []
+        if isinstance(value, (str, bytes)):
+            return [converter(value) if converter else value]
+        items = list(value)
+        if converter:
+            return [converter(v) for v in items if v is not None]
+        return items
+    except Exception:
+        return default if default is not None else []
+
+
 class DicomParserError(Exception):
     """Custom exception for DICOM parsing errors."""
     pass
@@ -54,7 +105,12 @@ class DicomParser:
         "Rows", "Columns", "SliceLocation",
     ]
 
-    def parse_files(self, file_paths: List[str], db: Session) -> Dict[str, Any]:
+    def parse_files(
+        self,
+        file_paths: List[str],
+        db: Session,
+        storage_map: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         """
         Parse a list of DICOM files and store metadata in the database.
 
@@ -84,17 +140,36 @@ class DicomParser:
                 study_uid = ds.StudyInstanceUID
                 series_uid = ds.SeriesInstanceUID
 
+                storage_object_key = storage_map.get(file_path) if storage_map else None
+
+                study_meta = self._extract_study_metadata(ds)
+                series_info = self._extract_series_metadata(ds, file_path)
+                if storage_object_key:
+                    series_info["storage_path"] = storage_object_key.rsplit("/", 1)[0] + "/"
+                instance_info = self._extract_instance_metadata(ds, file_path)
+                if storage_object_key:
+                    instance_info["pixel_data_path"] = storage_object_key
+
                 if study_uid not in studies_data:
-                    studies_data[study_uid] = self._extract_study_metadata(ds)
-
+                    studies_data[study_uid] = study_meta
                 if series_uid not in series_data:
-                    series_data[series_uid] = self._extract_series_metadata(ds, file_path)
+                    series_data[series_uid] = series_info
+                instances.append(instance_info)
 
-                instances.append(self._extract_instance_metadata(ds, file_path))
+                logger.info(
+                    "Parsed %s: study=%s series=%s sop=%s",
+                    os.path.basename(file_path), study_uid, series_uid,
+                    instance_info.get("sop_instance_uid"),
+                )
 
             except Exception as e:
-                logger.warning(f"Failed to parse {file_path}: {e}")
+                logger.warning("Failed to parse %s: %s", file_path, e, exc_info=True)
                 continue
+
+        logger.info(
+            "Parse complete: studies=%d series=%d instances=%d",
+            len(studies_data), len(series_data), len(instances),
+        )
 
         if not studies_data:
             raise DicomParserError("No valid DICOM files found")
@@ -134,39 +209,23 @@ class DicomParser:
 
     def _extract_series_metadata(self, ds: Dataset, file_path: str) -> Dict[str, Any]:
         """Extract series-level metadata from a DICOM dataset."""
-        pixel_spacing = None
-        if hasattr(ds, "PixelSpacing"):
-            pixel_spacing = [float(v) for v in ds.PixelSpacing]
+        pixel_spacing = safe_list(getattr(ds, "PixelSpacing", None), converter=safe_float) or None
 
-        # Calculate window center/width if available
-        # Note: pydicom returns MultiValue for multi-valued tags, which is NOT a list
-        window_center = None
-        window_width = None
-        if hasattr(ds, "WindowCenter"):
-            wc = ds.WindowCenter
-            try:
-                window_center = float(wc)
-            except TypeError:
-                window_center = float(wc[0])
-        if hasattr(ds, "WindowWidth"):
-            ww = ds.WindowWidth
-            try:
-                window_width = float(ww)
-            except TypeError:
-                window_width = float(ww[0])
+        window_center = safe_float(getattr(ds, "WindowCenter", None))
+        window_width = safe_float(getattr(ds, "WindowWidth", None))
 
         return {
             "series_instance_uid": ds.SeriesInstanceUID,
-            "series_number": self._get_int_tag(ds, "SeriesNumber"),
-            "series_description": self._get_tag(ds, "SeriesDescription"),
-            "modality": self._get_tag(ds, "Modality"),
-            "manufacturer": self._get_tag(ds, "Manufacturer"),
-            "body_part_examined": self._get_tag(ds, "BodyPartExamined"),
-            "laterality": self._get_tag(ds, "Laterality"),
-            "protocol_name": self._get_tag(ds, "ProtocolName"),
-            "rows": self._get_int_tag(ds, "Rows"),
-            "columns": self._get_int_tag(ds, "Columns"),
-            "slice_thickness": self._get_float_tag(ds, "SliceThickness"),
+            "series_number": safe_int(getattr(ds, "SeriesNumber", None)),
+            "series_description": safe_str(getattr(ds, "SeriesDescription", None)),
+            "modality": safe_str(getattr(ds, "Modality", None)),
+            "manufacturer": safe_str(getattr(ds, "Manufacturer", None)),
+            "body_part_examined": safe_str(getattr(ds, "BodyPartExamined", None)),
+            "laterality": safe_str(getattr(ds, "Laterality", None)),
+            "protocol_name": safe_str(getattr(ds, "ProtocolName", None)),
+            "rows": safe_int(getattr(ds, "Rows", None)),
+            "columns": safe_int(getattr(ds, "Columns", None)),
+            "slice_thickness": safe_float(getattr(ds, "SliceThickness", None)),
             "pixel_spacing": pixel_spacing,
             "window_center": window_center,
             "window_width": window_width,
@@ -175,23 +234,18 @@ class DicomParser:
 
     def _extract_instance_metadata(self, ds: Dataset, file_path: str) -> Dict[str, Any]:
         """Extract instance-level metadata from a DICOM dataset."""
-        image_position = None
-        if hasattr(ds, "ImagePositionPatient"):
-            image_position = [float(v) for v in ds.ImagePositionPatient]
-
-        image_orientation = None
-        if hasattr(ds, "ImageOrientationPatient"):
-            image_orientation = [float(v) for v in ds.ImageOrientationPatient]
+        image_position = safe_list(getattr(ds, "ImagePositionPatient", None), converter=safe_float) or None
+        image_orientation = safe_list(getattr(ds, "ImageOrientationPatient", None), converter=safe_float) or None
 
         return {
             "sop_instance_uid": ds.SOPInstanceUID,
             "series_instance_uid": ds.SeriesInstanceUID,
-            "instance_number": self._get_int_tag(ds, "InstanceNumber"),
+            "instance_number": safe_int(getattr(ds, "InstanceNumber", None)),
             "image_position": image_position,
             "image_orientation": image_orientation,
-            "slice_location": self._get_float_tag(ds, "SliceLocation"),
-            "rows": self._get_int_tag(ds, "Rows"),
-            "columns": self._get_int_tag(ds, "Columns"),
+            "slice_location": safe_float(getattr(ds, "SliceLocation", None)),
+            "rows": safe_int(getattr(ds, "Rows", None)),
+            "columns": safe_int(getattr(ds, "Columns", None)),
             "pixel_data_path": file_path,
             "file_size": os.path.getsize(file_path),
         }
@@ -214,6 +268,8 @@ class DicomParser:
 
         if existing:
             study_id = existing.id
+            existing.series_count = len(series_data)
+            existing.instance_count = len(instances)
             logger.info(f"Appending to existing study {study_id}")
         else:
             study_id = str(uuid.uuid4())
@@ -232,34 +288,28 @@ class DicomParser:
             ).first()
 
             if not existing_series:
+                series_instance_count = sum(
+                    1 for inst in instances
+                    if inst.get("series_instance_uid") == series_uid
+                )
                 series = DicomSeries(
                     id=str(uuid.uuid4()),
                     study_id=study_id,
                     **series_info,
-                    image_count=len(instances),
-                    file_count=sum(
-                        1 for inst in instances
-                        if inst["sop_instance_uid"] != "UNKNOWN"
-                    ),
+                    image_count=series_instance_count,
+                    file_count=series_instance_count,
                 )
                 db.add(series)
+                logger.info(f"Created series {series_uid} with {series_instance_count} instances")
 
         # Flush so instance queries can find the newly created series
         db.flush()
 
-        # Track seen SOP UIDs within this batch to handle
-        # duplicate files across subdirectories
-        seen_sop_uids: set = set()
-
         # Store instances
+        instances_created = 0
         for inst_info in instances:
-            sop_uid = inst_info.get("sop_instance_uid", "")
-            if not sop_uid or sop_uid in seen_sop_uids:
-                continue
-            seen_sop_uids.add(sop_uid)
-
             existing_instance = db.query(DicomInstance).filter(
-                DicomInstance.sop_instance_uid == sop_uid
+                DicomInstance.sop_instance_uid == inst_info["sop_instance_uid"]
             ).first()
 
             if not existing_instance:
@@ -274,8 +324,16 @@ class DicomParser:
                         **{k: v for k, v in inst_info.items() if k != "series_instance_uid"},
                     )
                     db.add(instance)
+                    instances_created += 1
+                else:
+                    logger.warning(
+                        "No series found for instance %s with series_uid %s",
+                        inst_info.get("sop_instance_uid"),
+                        inst_info.get("series_instance_uid"),
+                    )
 
         db.commit()
+        logger.info(f"Stored study {study_id}: {len(series_data)} series, {instances_created} instances created")
         return study_id
 
     @staticmethod

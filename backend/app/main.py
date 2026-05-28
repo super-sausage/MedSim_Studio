@@ -18,9 +18,8 @@ from fastapi.staticfiles import StaticFiles
 
 from app import __version__, __app_name__
 from app.core.config import settings
-from app.database.session import Base, engine
-from app.models import dicom, simulation  # noqa: F401 — register models with Base.metadata
 from app.api.v1 import health_router, dicom_router, simulation_router, segmentation_router
+from app.dicom.storage import MinIOStorage
 
 # Configure structured logging
 logging.basicConfig(
@@ -28,6 +27,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# MinIO storage instance, initialized during lifespan startup.
+# health.py imports this to perform real readiness checks.
+minio_storage: MinIOStorage | None = None
 
 
 @asynccontextmanager
@@ -41,13 +44,27 @@ async def lifespan(app: FastAPI):
     - AI model loading
     - Volume rendering cache warmup
     """
+    global minio_storage
     logger.info(f"Starting {__app_name__} v{__version__}")
 
     # --- Startup ---
-    # Create all database tables if they don't exist
-    Base.metadata.create_all(bind=engine)
     # TODO: Initialize database connection pool
-    # TODO: Create MinIO bucket if not exists
+
+    # Initialize MinIO storage and ensure bucket exists.
+    # Failure here does NOT crash the app — the backend still starts,
+    # but readiness check will report storage as unhealthy.
+    try:
+        minio_storage = MinIOStorage()
+        if minio_storage.ensure_bucket():
+            logger.info(f"MinIO bucket ready: {settings.MINIO_BUCKET}")
+        else:
+            logger.error(
+                f"MinIO bucket ensure failed for '{settings.MINIO_BUCKET}'; "
+                "storage will be reported unhealthy"
+            )
+    except Exception:
+        logger.exception("MinIO storage initialization failed; continuing startup without storage")
+
     # TODO: Load AI models (if enabled)
     # TODO: Initialize volume rendering cache
 
