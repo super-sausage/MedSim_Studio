@@ -90,3 +90,54 @@ docker compose build
 docker compose up -d
 # 访问 http://localhost:5173
 ```
+
+## v0.1.2 — 2026-05-28
+
+### 文件夹上传支持
+
+**问题**: 上传 DICOM 时只能选单个文件，无法直接选择整个文件夹。
+
+**改动** (`frontend/src/pages/StudiesPage.tsx`):
+- 新增 **Upload Folder** 按钮，使用 `webkitdirectory` 属性支持整个文件夹递归选择
+- 后端 `os.path.basename()` 处理浏览器传入的相对路径，平铺存储到 staging 目录
+
+### 重复 SOP UID 处理
+
+**问题**: 数据集子目录间存在相同 DICOM 文件，导致 `UniqueViolation` 错误。
+
+**改动** (`backend/app/dicom/parser/dicom_parser.py`):
+- 在上传批次内使用 `seen_sop_uids` 集合跟踪已处理的 SOP Instance UID
+- 跳过同一批次内的重复文件，避免唯一键冲突
+
+### 后端文件存储持久化
+
+**问题**: DICOM 文件存在容器内但未挂载 volume，容器重建后文件丢失（404），数据库记录却保留。
+
+**改动** (`docker-compose.yml`):
+- 新增 `backend_dicom:/app/static/dicom` 卷挂载，持久化 DICOM 文件
+- 清理因文件丢失产生的无效数据库记录
+
+### Viewer 非成像序列过滤
+
+**问题**: RTSTRUCT/SEG 等非成像序列只有 1 个实例，选中后 `createAndCacheVolumeFromImages` 因元数据不足报错 `Cannot read properties of undefined (reading '0')`。
+
+**改动** (`frontend/src/pages/ViewerPage.tsx`):
+- 筛选 `['CT', 'MR', 'PT', 'NM', 'US', 'XA', 'CR']` 成像模态，过滤 RTSTRUCT、SEG 等非成像序列
+- 自动选中第一个成像序列进行三维重建
+
+### 前端删除功能
+
+**改动** (`frontend/src/pages/StudiesPage.tsx`):
+- 研究卡片右上角添加 **×** 删除按钮（hover 显示）
+- 确认对话框防止误删
+- 后端已有 `DELETE /api/v1/dicom/studies/{study_id}` 接口
+
+### 已验证功能
+
+| 功能 | 状态 |
+|------|------|
+| 文件夹递归上传 | ✓ |
+| 重复 SOP UID 自动去重 | ✓ |
+| 容器重建后 DICOM 文件持久化 | ✓ |
+| 多序列研究自动选择 CT 序列 | ✓ |
+| 前端删除研究 | ✓ |

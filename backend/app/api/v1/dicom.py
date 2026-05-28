@@ -201,7 +201,7 @@ async def upload_dicom(
         # Save uploaded files to staging directory
         for file in files:
             content = await file.read()
-            file_name = file.filename or f"dicom_{uuid.uuid4()}.dcm"
+            file_name = os.path.basename(file.filename) or f"dicom_{uuid.uuid4()}.dcm"
             file_path = os.path.join(staging_dir, file_name)
             with open(file_path, "wb") as f:
                 f.write(content)

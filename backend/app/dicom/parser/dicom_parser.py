@@ -247,10 +247,19 @@ class DicomParser:
         # Flush so instance queries can find the newly created series
         db.flush()
 
+        # Track seen SOP UIDs within this batch to handle
+        # duplicate files across subdirectories
+        seen_sop_uids: set = set()
+
         # Store instances
         for inst_info in instances:
+            sop_uid = inst_info.get("sop_instance_uid", "")
+            if not sop_uid or sop_uid in seen_sop_uids:
+                continue
+            seen_sop_uids.add(sop_uid)
+
             existing_instance = db.query(DicomInstance).filter(
-                DicomInstance.sop_instance_uid == inst_info["sop_instance_uid"]
+                DicomInstance.sop_instance_uid == sop_uid
             ).first()
 
             if not existing_instance:

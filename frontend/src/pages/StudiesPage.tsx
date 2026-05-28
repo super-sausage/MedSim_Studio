@@ -18,7 +18,9 @@ export default function StudiesPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dirInputRef = useRef<HTMLInputElement>(null);
 
   // Load studies on mount
   const loadStudies = useCallback(async () => {
@@ -64,6 +66,20 @@ export default function StudiesPage() {
     }
   }, [navigate, loadStudies]);
 
+  // Handle study deletion
+  const handleDeleteStudy = useCallback(async (studyId: string) => {
+    if (!window.confirm('Delete this study and all its files?')) return;
+    setDeletingId(studyId);
+    try {
+      await dicomService.deleteStudy(studyId);
+      await loadStudies();
+    } catch (error: any) {
+      console.error('Failed to delete study:', error);
+    } finally {
+      setDeletingId(null);
+    }
+  }, [loadStudies]);
+
   return (
     <div className="flex h-full flex-col p-6">
       {/* Header */}
@@ -81,12 +97,27 @@ export default function StudiesPage() {
             accept=".dcm,.DCM,application/dicom"
             onChange={(e) => handleFileUpload(e.target.files)}
           />
+          <input
+            ref={dirInputRef}
+            type="file"
+            className="hidden"
+            // @ts-ignore — webkitdirectory is not in TS lib but supported in all major browsers
+            webkitdirectory=""
+            onChange={(e) => handleFileUpload(e.target.files)}
+          />
           <Button
             variant="default"
             onClick={() => fileInputRef.current?.click()}
             disabled={isUploading}
           >
             {isUploading ? 'Uploading...' : 'Upload DICOM'}
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => dirInputRef.current?.click()}
+            disabled={isUploading}
+          >
+            Upload Folder
           </Button>
         </div>
       </div>
@@ -120,32 +151,47 @@ export default function StudiesPage() {
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {studies.map((study) => (
-              <button
+              <div
                 key={study.id}
-                onClick={() => navigate(`/viewer/${study.id}`)}
-                className="group rounded-lg border border-border bg-card p-4 text-left transition-colors hover:border-primary/50 hover:bg-accent"
+                className="group relative rounded-lg border border-border bg-card transition-colors hover:border-primary/50 hover:bg-accent"
               >
-                <div className="mb-2 flex items-start justify-between">
-                  <span className="font-medium text-foreground">
-                    {study.patientName}
-                  </span>
-                  <span className="whitespace-nowrap rounded bg-primary/10 px-1.5 py-0.5 text-xs text-primary">
-                    {study.modalities?.join(', ') || 'CT'}
-                  </span>
-                </div>
-                <div className="space-y-1 text-xs text-muted-foreground">
-                  <p>Patient ID: {study.patientId}</p>
-                  {study.studyDescription && (
-                    <p className="truncate">{study.studyDescription}</p>
-                  )}
-                  <p>
-                    {study.seriesCount} series &middot; {study.instanceCount} instances
-                  </p>
-                  {study.studyDate && (
-                    <p>{study.studyDate}</p>
-                  )}
-                </div>
-              </button>
+                <button
+                  onClick={() => navigate(`/viewer/${study.id}`)}
+                  className="w-full p-4 text-left"
+                >
+                  <div className="mb-2 flex items-start justify-between">
+                    <span className="font-medium text-foreground">
+                      {study.patientName}
+                    </span>
+                    <span className="whitespace-nowrap rounded bg-primary/10 px-1.5 py-0.5 text-xs text-primary">
+                      {study.modalities?.join(', ') || 'CT'}
+                    </span>
+                  </div>
+                  <div className="space-y-1 text-xs text-muted-foreground">
+                    <p>Patient ID: {study.patientId}</p>
+                    {study.studyDescription && (
+                      <p className="truncate">{study.studyDescription}</p>
+                    )}
+                    <p>
+                      {study.seriesCount} series &middot; {study.instanceCount} instances
+                    </p>
+                    {study.studyDate && (
+                      <p>{study.studyDate}</p>
+                    )}
+                  </div>
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleDeleteStudy(study.id);
+                  }}
+                  disabled={deletingId === study.id}
+                  className="absolute right-2 top-2 rounded px-1.5 py-0.5 text-xs text-red-400 opacity-0 transition-opacity hover:bg-red-500/10 group-hover:opacity-100 disabled:opacity-50"
+                  title="Delete study"
+                >
+                  {deletingId === study.id ? '...' : '×'}
+                </button>
+              </div>
             ))}
           </div>
         )}

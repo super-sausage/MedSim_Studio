@@ -79,8 +79,15 @@ export default function ViewerPage() {
 
     const loadSeries = async () => {
       try {
-        const series = await dicomService.getSeries(studyId);
+        const allSeries = await dicomService.getSeries(studyId);
         if (!mounted) return;
+
+        // Only imaging modalities (CT, MR, etc.) can be used for volume
+        // rendering. Exclude RTSTRUCT, SEG, REG, PR and other non-image types.
+        const IMAGE_MODALITIES = ['CT', 'MR', 'PT', 'NM', 'US', 'XA', 'CR'];
+        const series = allSeries.filter(
+          (s: DicomSeries) => IMAGE_MODALITIES.includes(s.modality)
+        );
 
         setSeriesList(series);
 
