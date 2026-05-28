@@ -13,11 +13,12 @@ from minio import Minio
 from minio.error import S3Error
 
 from app.core.config import settings
+from app.dicom.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
 
 
-class MinIOStorage:
+class MinIOStorage(StorageBackend):
     """
     MinIO client wrapper.
 
@@ -48,6 +49,10 @@ class MinIOStorage:
         except Exception:
             logger.exception("Unexpected error ensuring MinIO bucket")
             return False
+
+    def ensure_storage(self) -> bool:
+        """Implement StorageBackend interface."""
+        return self.ensure_bucket()
 
     def upload_file(
         self,

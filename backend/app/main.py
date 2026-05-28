@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from app import __version__, __app_name__
 from app.core.config import settings
 from app.api.v1 import health_router, dicom_router, simulation_router, segmentation_router
-from app.dicom.storage import MinIOStorage
+from app.dicom.storage import StorageBackend, get_storage_backend
 
 # Configure structured logging
 logging.basicConfig(
@@ -28,9 +28,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# MinIO storage instance, initialized during lifespan startup.
+# Storage backend instance, initialized during lifespan startup.
 # health.py imports this to perform real readiness checks.
-minio_storage: MinIOStorage | None = None
+storage_backend: StorageBackend | None = None
 
 
 @asynccontextmanager
@@ -40,30 +40,33 @@ async def lifespan(app: FastAPI):
 
     Handles startup and shutdown events including:
     - Database connection pool initialization
-    - MinIO bucket creation
+    - Storage backend initialization (MinIO or Local)
     - AI model loading
     - Volume rendering cache warmup
     """
-    global minio_storage
+    global storage_backend
     logger.info(f"Starting {__app_name__} v{__version__}")
 
     # --- Startup ---
     # TODO: Initialize database connection pool
 
-    # Initialize MinIO storage and ensure bucket exists.
+    # Initialize storage backend and ensure it is ready.
     # Failure here does NOT crash the app — the backend still starts,
     # but readiness check will report storage as unhealthy.
     try:
-        minio_storage = MinIOStorage()
-        if minio_storage.ensure_bucket():
-            logger.info(f"MinIO bucket ready: {settings.MINIO_BUCKET}")
+        storage_backend = get_storage_backend()
+        if storage_backend.ensure_storage():
+            if settings.STORAGE_BACKEND.lower() == "minio":
+                logger.info(f"MinIO bucket ready: {settings.MINIO_BUCKET}")
+            else:
+                logger.info(f"Local storage ready: {settings.DICOM_STORAGE_DIR}")
         else:
             logger.error(
-                f"MinIO bucket ensure failed for '{settings.MINIO_BUCKET}'; "
+                "Storage backend ensure_storage failed; "
                 "storage will be reported unhealthy"
             )
     except Exception:
-        logger.exception("MinIO storage initialization failed; continuing startup without storage")
+        logger.exception("Storage backend initialization failed; continuing startup without storage")
 
     # TODO: Load AI models (if enabled)
     # TODO: Initialize volume rendering cache

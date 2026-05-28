@@ -27,7 +27,7 @@ from app.schemas.dicom import (
     PaginatedResponse,
 )
 from app.dicom.parser.dicom_parser import DicomParser
-from app.dicom.storage import MinIOStorage
+from app.dicom.storage import get_storage_backend
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -274,7 +274,7 @@ async def get_instance_file(instance_id: str, db: Session = Depends(get_db)):
             detail=f"DICOM object key is empty for instance {instance_id}",
         )
 
-    storage = MinIOStorage()
+    storage = get_storage_backend()
 
     if not storage.check_health():
         raise HTTPException(
@@ -330,7 +330,7 @@ async def upload_dicom(
 
     saved_paths = []
     uploaded_keys: List[str] = []  # Track uploaded MinIO objects for rollback
-    storage = MinIOStorage()
+    storage = get_storage_backend()
 
     try:
         # Step 1: Save uploaded files to staging directory
@@ -499,7 +499,7 @@ async def delete_study(study_id: str, db: Session = Depends(get_db)):
         )
 
     if object_keys:
-        storage = MinIOStorage()
+        storage = get_storage_backend()
         for key in object_keys:
             if not isinstance(key, str) or not key.startswith("dicom/"):
                 logger.warning(

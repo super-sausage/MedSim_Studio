@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: str = "ctpass123"
     DATABASE_URL: str = "sqlite:///./ct_simulator.db"
 
+    # Storage backend: "minio" or "local"
+    STORAGE_BACKEND: str = "minio"
+
     # MinIO (Object Storage)
     MINIO_HOST: str = "minio"
     MINIO_PORT: int = 9000
