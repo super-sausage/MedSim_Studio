@@ -13,6 +13,7 @@ coverage/
 dist/
 build/
 docker/data/
-datasets/dicom/raw/
-datasets/annotations/
+datasets/
 *.log
+.venv/
+*.db

@@ -13,7 +13,6 @@
  * Subsequent calls are safe (no-op after first initialization).
  */
 
-import { init as csInit, setUseSharedArrayBuffer } from '@cornerstonejs/core';
 import * as cs from '@cornerstonejs/core';
 import {
   init as csToolsInit,
@@ -30,7 +29,6 @@ import {
 import {
   configure as configureImageLoader,
   external as dicomImageLoaderExternal,
-  wadouri,
 } from '@cornerstonejs/dicom-image-loader';
 
 // ---------------------------------------------------------------------------
@@ -118,14 +116,14 @@ export async function initCornerstone(): Promise<void> {
       // Disable SharedArrayBuffer to avoid requiring cross-origin isolation
       // headers (Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy).
       // Fall back to regular typed arrays for volume scalar data.
-      setUseSharedArrayBuffer(false);
+      cs.setUseSharedArrayBuffer(false);
 
       // ------------------------------------------------------------------
       // Step 1: Initialize @cornerstonejs/core
       // ------------------------------------------------------------------
       // This sets up the WebGL rendering context, GPU tier detection,
       // shared cache, and event system.
-      await csInit(RENDERING_CONFIG);
+      await cs.init(RENDERING_CONFIG);
       console.info('[Cornerstone3D] Core initialized');
 
       // ------------------------------------------------------------------
@@ -139,11 +137,9 @@ export async function initCornerstone(): Promise<void> {
 
       // ------------------------------------------------------------------
       // Step 3: Configure DICOM image loader
-      // ------------------------------------------------------------------
-      // The decorrelation service (CS) is shared from the core module
-      // for coordinate system operations needed during image decoding.
-      // CS needs to be initialized before core init, but after the
-      // dicom-image-loader external reference is set.
+      // Provide core module refs to dicom-image-loader.
+      // The setter on `external.cornerstone` auto-registers
+      // wadouri/wadors/dicomweb/dicomfile schemes.
       (dicomImageLoaderExternal as any).cornerstone = cs;
       // dicom-parser is required for DICOM image decoding; use dynamic
       // import to bypass CJS/ESM interop issues with the package's
@@ -155,15 +151,6 @@ export async function initCornerstone(): Promise<void> {
       console.info(
         `[Cornerstone3D] Image loader configured (${IMAGE_LOADER_CONFIG.maxWebWorkers} web workers)`
       );
-
-      // ------------------------------------------------------------------
-      // Step 4: Register wadouri image loader
-      // ------------------------------------------------------------------
-      // The wadouri scheme loads DICOM files via HTTP/HTTPS URLs.
-      // imageId format: wadouri:<url-to-dicom-file>
-      // This is the standard scheme for loading DICOM from a REST API.
-      (wadouri as any).register(cs);
-      console.info('[Cornerstone3D] wadouri image loader registered');
 
       // ------------------------------------------------------------------
       // Step 5: Register tools globally

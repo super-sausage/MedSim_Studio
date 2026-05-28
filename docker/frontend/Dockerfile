@@ -5,19 +5,20 @@
 # ============================================================
 
 # ---- Stage 1: Dependencies ----
-FROM node:20-alpine AS deps
+FROM node:20-slim AS deps
 
 WORKDIR /app
 
-# Copy package files
+# Copy package.json only (lockfile is Windows-generated, skip it so
+# npm resolves platform-specific optional deps for Linux)
 COPY frontend/package.json ./
-COPY frontend/yarn.lock* ./
 
 # Install dependencies (using npmmirror registry for faster downloads)
-RUN yarn install --registry=https://registry.npmmirror.com --network-timeout 300000
+RUN npm config set registry https://registry.npmmirror.com && \
+    npm install --timeout=300000
 
 # ---- Stage 2: Build ----
-FROM node:20-alpine AS builder
+FROM node:20-slim AS builder
 
 WORKDIR /app
 
@@ -25,7 +26,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY frontend/ .
 
 # Build the application
-RUN yarn build
+RUN npm run build
 
 # ---- Stage 3: Serve ----
 FROM nginx:alpine AS runner

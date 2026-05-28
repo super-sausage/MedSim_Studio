@@ -25,16 +25,13 @@ class Settings(BaseSettings):
         "http://localhost:3000",
     ]
 
-    # Database (PostgreSQL)
+    # Database (PostgreSQL in Docker; SQLite fallback for local dev)
     POSTGRES_HOST: str = "postgres"
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "ct_simulator"
     POSTGRES_USER: str = "ctuser"
     POSTGRES_PASSWORD: str = "ctpass123"
-    DATABASE_URL: str = (
-        f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
-        f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
-    )
+    DATABASE_URL: str = "sqlite:///./ct_simulator.db"
 
     # MinIO (Object Storage)
     MINIO_HOST: str = "minio"

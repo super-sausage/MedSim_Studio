@@ -18,6 +18,8 @@ from fastapi.staticfiles import StaticFiles
 
 from app import __version__, __app_name__
 from app.core.config import settings
+from app.database.session import Base, engine
+from app.models import dicom, simulation  # noqa: F401 — register models with Base.metadata
 from app.api.v1 import health_router, dicom_router, simulation_router, segmentation_router
 
 # Configure structured logging
@@ -42,6 +44,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {__app_name__} v{__version__}")
 
     # --- Startup ---
+    # Create all database tables if they don't exist
+    Base.metadata.create_all(bind=engine)
     # TODO: Initialize database connection pool
     # TODO: Create MinIO bucket if not exists
     # TODO: Load AI models (if enabled)

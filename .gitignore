@@ -70,3 +70,4 @@ uploads/
 
 # Pre-downloaded pip wheels for Docker builds
 pip_cache/
+*.db
