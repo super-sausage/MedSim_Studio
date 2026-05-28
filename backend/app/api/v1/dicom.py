@@ -454,7 +454,18 @@ async def upload_dicom(
 
 @router.delete("/studies/{study_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_study(study_id: str, db: Session = Depends(get_db)):
-    """Delete a study and all associated series, instances, and files."""
+    """Delete a study and all associated series, instances, and MinIO objects.
+
+    Order of operations:
+      1. Load study (404 if missing).
+      2. Cache MinIO object keys from all instances BEFORE db.delete (cascade
+         invalidates ORM relationships after delete).
+      3. db.delete(study) + db.commit().
+      4. On successful commit, best-effort delete cached MinIO objects.
+
+    MinIO cleanup failures are logged but never block the 204 response. If the
+    DB commit fails, MinIO is not touched.
+    """
     study = db.query(DicomStudy).filter(DicomStudy.id == study_id).first()
     if not study:
         raise HTTPException(
@@ -462,10 +473,52 @@ async def delete_study(study_id: str, db: Session = Depends(get_db)):
             detail=f"Study {study_id} not found",
         )
 
-    # Remove persistent DICOM files from disk
-    study_dir = f"{settings.DICOM_STORAGE_DIR}/{study_id}"
-    if os.path.exists(study_dir):
-        shutil.rmtree(study_dir, ignore_errors=True)
+    series_ids = [s.id for s in study.series]
+    object_keys: List[str] = []
+    if series_ids:
+        instances = (
+            db.query(DicomInstance)
+            .filter(DicomInstance.series_id.in_(series_ids))
+            .all()
+        )
+        object_keys = [
+            inst.pixel_data_path
+            for inst in instances
+            if inst.pixel_data_path
+        ]
 
-    db.delete(study)
-    db.commit()
+    try:
+        db.delete(study)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to delete study %s from database", study_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete study {study_id} from database",
+        )
+
+    if object_keys:
+        storage = MinIOStorage()
+        for key in object_keys:
+            if not isinstance(key, str) or not key.startswith("dicom/"):
+                logger.warning(
+                    "Skipping unexpected MinIO object key for study %s: %r",
+                    study_id,
+                    key,
+                )
+                continue
+            try:
+                ok = storage.delete_file(key)
+                if not ok:
+                    logger.warning(
+                        "MinIO delete_file reported failure for key %s (study %s)",
+                        key,
+                        study_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Unexpected error deleting MinIO object %s (study %s)",
+                    key,
+                    study_id,
+                )
