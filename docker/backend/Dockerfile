@@ -23,13 +23,22 @@ RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies (offline from local cache)
+# Install Python dependencies (offline from local cache if available, otherwise online)
 COPY backend/requirements.txt .
-COPY pip_cache/ /pip_cache/
-RUN pip install --no-cache-dir --timeout 600 --no-index --find-links=/pip_cache \
-        torch==2.1.2 torchvision==0.16.2 && \
-    pip install --no-cache-dir --timeout 300 --no-index --find-links=/pip_cache \
-        -r requirements.txt
+RUN --mount=type=bind,source=pip_cache,target=/pip_cache \
+    if [ -d /pip_cache ] && [ "$(ls -A /pip_cache 2>/dev/null)" ]; then \
+        echo "=== Installing from local pip cache ===" && \
+        pip install --no-cache-dir --timeout 600 --no-index --find-links=/pip_cache \
+            torch==2.1.2 torchvision==0.16.2 && \
+        pip install --no-cache-dir --timeout 300 --no-index --find-links=/pip_cache \
+            -r requirements.txt; \
+    else \
+        echo "=== Local pip cache not found, installing from online ===" && \
+        pip install --no-cache-dir --timeout 600 \
+            torch==2.1.2 torchvision==0.16.2 && \
+        pip install --no-cache-dir --timeout 300 \
+            -r requirements.txt; \
+    fi
 
 # ---- Stage 2: Runtime ----
 FROM python:3.11-slim AS runner

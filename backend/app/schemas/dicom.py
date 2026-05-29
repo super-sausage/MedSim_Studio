@@ -5,7 +5,7 @@ Request/response schemas for DICOM study and series management APIs.
 """
 
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 
 
@@ -55,6 +55,16 @@ class DicomSeriesResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+    @field_validator("pixel_spacing", mode="before")
+    @classmethod
+    def clean_pixel_spacing(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            cleaned = [x for x in v if x is not None]
+            return cleaned if cleaned else None
+        return v
 
 
 class DicomInstanceResponse(BaseModel):

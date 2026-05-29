@@ -210,6 +210,8 @@ class DicomParser:
     def _extract_series_metadata(self, ds: Dataset, file_path: str) -> Dict[str, Any]:
         """Extract series-level metadata from a DICOM dataset."""
         pixel_spacing = safe_list(getattr(ds, "PixelSpacing", None), converter=safe_float) or None
+        if pixel_spacing is not None and any(v is None for v in pixel_spacing):
+            pixel_spacing = None
 
         window_center = safe_float(getattr(ds, "WindowCenter", None))
         window_width = safe_float(getattr(ds, "WindowWidth", None))

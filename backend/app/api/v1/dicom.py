@@ -337,7 +337,10 @@ async def upload_dicom(
         for file in files:
             content = await file.read()
             file_name = file.filename or f"dicom_{uuid.uuid4()}.dcm"
+            # Sanitize: strip leading slashes/dots to prevent path traversal
+            file_name = file_name.lstrip("/").lstrip("\\").lstrip(".")
             file_path = os.path.join(staging_dir, file_name)
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, "wb") as f:
                 f.write(content)
             saved_paths.append(file_path)
