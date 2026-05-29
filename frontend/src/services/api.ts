@@ -1,4 +1,4 @@
-import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
+import axios, { type AxiosInstance, type AxiosRequestConfig, type AxiosResponse } from 'axios';
 
 /**
  * API Service Layer
@@ -56,7 +56,11 @@ class ApiService {
     // Response interceptor — converts snake_case to camelCase + error normalization
     this.client.interceptors.response.use(
       (response) => {
-        if (response.data !== null && response.data !== undefined) {
+        const isBlobResponse =
+          response.config.responseType === 'blob' ||
+          (typeof Blob !== 'undefined' && response.data instanceof Blob);
+
+        if (!isBlobResponse && response.data !== null && response.data !== undefined) {
           response.data = convertKeys(response.data) as any;
         }
         return response;
@@ -94,6 +98,17 @@ class ApiService {
   async delete<T>(url: string, config?: AxiosRequestConfig): Promise<T> {
     const response = await this.client.delete<T>(url, config);
     return response.data;
+  }
+
+  /** Download a file as blob — returns full AxiosResponse (data + headers) */
+  async download(
+    url: string,
+    config?: AxiosRequestConfig,
+  ): Promise<AxiosResponse> {
+    return this.client.get(url, {
+      ...config,
+      responseType: 'blob',
+    });
   }
 
   /** Upload DICOM files with multipart/form-data */
