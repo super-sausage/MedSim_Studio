@@ -1,0 +1,7 @@
+HTTP/1.1 200 OK
+date: Fri, 29 May 2026 02:46:18 GMT
+server: uvicorn
+content-disposition: attachment; filename="simulation_3d317e08-413f-4511-8c4e-c48d8fac4741.nii.gz"
+content-length: 709777
+content-type: application/gzip
+
