@@ -17,3 +17,7 @@ datasets/
 *.log
 .venv/
 *.db
+pip_cache/
+*.whl
+
+backend/export_test/

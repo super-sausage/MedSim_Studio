@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Button } from '@components/ui/button';
 import { useSimulationStore } from '@store/useSimulationStore';
+import { simulationService } from '@/services/simulationService';
 
 /**
  * SimulationPage
@@ -13,8 +14,107 @@ import { useSimulationStore } from '@store/useSimulationStore';
  */
 
 export default function SimulationPage() {
-  const { lesions, organs, addLesion } = useSimulationStore();
+  const { lesions, organs, addLesion, completedJobs } = useSimulationStore();
   const [activeTab, setActiveTab] = useState<'lesion' | 'organ' | 'deformation'>('lesion');
+
+  // Export state
+  const [exportFormat, setExportFormat] = useState<'dicom' | 'nifti' | 'nrrd'>('dicom');
+  const [exporting, setExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  // Get the most recent completed job
+  const latestCompletedJob = completedJobs[completedJobs.length - 1];
+
+  /**
+   * Parse filename from Content-Disposition header
+   */
+  const parseFilename = (headers: any, fallback: string): string => {
+    const disposition = headers['content-disposition'];
+    if (disposition) {
+      const match = disposition.match(/filename\*?=['"]?([^'";]+)['"]?/);
+      if (match && match[1]) {
+        return decodeURIComponent(match[1]);
+      }
+    }
+    return fallback;
+  };
+
+  /**
+   * Trigger browser download
+   */
+  const triggerDownload = (blob: Blob, filename: string) => {
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    document.body.removeChild(a);
+  };
+
+  /**
+   * Export simulation results
+   */
+  const handleExport = async () => {
+    if (!latestCompletedJob) {
+      setExportError('No completed simulation jobs available for export');
+      return;
+    }
+
+    setExporting(true);
+    setExportProgress(0);
+    setExportError(null);
+
+    try {
+      const response = await simulationService.exportResults(
+        latestCompletedJob.id,
+        exportFormat,
+        (progressEvent) => {
+          if (progressEvent.total) {
+            const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            setExportProgress(percent);
+          } else {
+            setExportProgress(-1); // Unknown total
+          }
+        },
+      );
+
+      // Parse filename from headers or use fallback
+      const fallbackNames = {
+        dicom: `simulation_${latestCompletedJob.id}_dicom.zip`,
+        nifti: `simulation_${latestCompletedJob.id}.nii.gz`,
+        nrrd: `simulation_${latestCompletedJob.id}.nrrd`,
+      };
+      const filename = parseFilename(response.headers, fallbackNames[exportFormat]);
+
+      // Trigger download
+      triggerDownload(response.data, filename);
+
+      setExportProgress(100);
+    } catch (error: any) {
+      const status = error.status;
+      let message = 'Export failed';
+
+      if (status === 409) {
+        message = 'Simulation job is not completed';
+      } else if (status === 404) {
+        message = 'Simulation job not found';
+      } else if (status === 400) {
+        message = error.message || 'Invalid export request';
+      } else if (status === 500) {
+        message = 'Server error during export';
+      } else if (error.message) {
+        message = error.message;
+      }
+
+      setExportError(message);
+    } finally {
+      setExporting(false);
+      setTimeout(() => setExportProgress(0), 1000);
+    }
+  };
 
   return (
     <div className="flex h-full flex-col p-6">
@@ -122,8 +222,40 @@ export default function SimulationPage() {
       <div className="mt-auto flex gap-2 border-t border-border pt-4">
         <Button variant="default">Run Simulation</Button>
         <Button variant="outline">Preview</Button>
-        <Button variant="ghost">Export Results</Button>
+
+        {/* Export section */}
+        <div className="flex items-center gap-2">
+          <select
+            value={exportFormat}
+            onChange={(e) => setExportFormat(e.target.value as 'dicom' | 'nifti' | 'nrrd')}
+            className="rounded-md border border-border bg-background px-3 py-2 text-sm"
+            disabled={exporting}
+          >
+            <option value="dicom">DICOM</option>
+            <option value="nifti">NIfTI</option>
+            <option value="nrrd">NRRD</option>
+          </select>
+
+          <Button
+            variant="ghost"
+            onClick={handleExport}
+            disabled={exporting}
+          >
+            {exporting
+              ? exportProgress === -1
+                ? 'Exporting...'
+                : exportProgress > 0 && exportProgress < 100
+                ? `Exporting ${exportProgress}%`
+                : 'Exporting...'
+              : 'Export Results'}
+          </Button>
+        </div>
       </div>
+
+      {/* Export error message */}
+      {exportError && (
+        <div className="mt-2 text-sm text-destructive">{exportError}</div>
+      )}
     </div>
   );
 }

@@ -1,5 +1,6 @@
 import { api } from './api';
 import type { SimulationJob } from '@/types/simulation';
+import type { AxiosProgressEvent, AxiosResponse } from 'axios';
 
 /**
  * Simulation Service
@@ -38,7 +39,12 @@ export const simulationService = {
     api.post<any>('/simulation/preview/organ', config),
 
   /** Export simulation results */
-  exportResults: (jobId: string, format: 'dicom' | 'nifti' | 'nrrd') =>
-    api.post<Blob>(`/simulation/jobs/${jobId}/export?format=${format}`,
-      {}, { responseType: 'blob' }),
+  exportResults: (
+    jobId: string,
+    format: 'dicom' | 'nifti' | 'nrrd',
+    onDownloadProgress?: (progressEvent: AxiosProgressEvent) => void,
+  ): Promise<AxiosResponse<Blob>> =>
+    api.download(`/simulation/jobs/${jobId}/export?format=${format}`, {
+      onDownloadProgress,
+    }),
 };
