@@ -13,6 +13,7 @@ import {
 } from '@viewer/cornerstone/toolGroups';
 import { initCornerstone } from '@viewer/cornerstone/initCornerstone';
 import { fetchImageIdsForSeries } from '@viewer/cornerstone/loadDicomSeries';
+import { VolumeRenderer } from '@vtk';
 import type { DicomSeries } from '@/types/index';
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,7 @@ export default function ViewerPage() {
 
   const [seriesList, setSeriesList] = useState<DicomSeries[]>([]);
   const [activeSeriesId, setActiveSeriesId] = useState<string | null>(null);
+  const [viewerMode, setViewerMode] = useState<'mpr' | '3d'>('mpr');
   const [cornerstoneReady, setCornerstoneReady] = useState(false);
   const [volumeReady, setVolumeReady] = useState(false);
   const [viewportReady, setViewportReady] = useState(false);
@@ -208,6 +210,20 @@ export default function ViewerPage() {
 
         <div className="mx-2 h-6 w-px bg-border" />
 
+        {/* 3D toggle */}
+        <Button
+          variant={viewerMode === '3d' ? 'secondary' : 'ghost'}
+          size="sm"
+          onClick={() =>
+            setViewerMode((v) => (v === 'mpr' ? '3d' : 'mpr'))
+          }
+          disabled={!activeSeriesId || !volumeReady}
+        >
+          3D
+        </Button>
+
+        <div className="mx-2 h-6 w-px bg-border" />
+
         {/* Window/Level presets */}
         <div className="flex items-center gap-1">
           {WINDOW_LEVEL_PRESETS.map((preset) => (
@@ -237,6 +253,13 @@ export default function ViewerPage() {
           <div className="flex h-full items-center justify-center bg-black">
             <p className="text-lg text-white/40">No study selected</p>
           </div>
+        ) : viewerMode === '3d' && activeSeriesId ? (
+          <VolumeRenderer
+            mode="dicom"
+            seriesId={activeSeriesId}
+            showControls
+            opacityPreset="ct-soft-tissue"
+          />
         ) : !activeSeriesId || !volumeReady ? (
           <div className="flex h-full items-center justify-center bg-black">
             <div className="flex flex-col items-center gap-3">
