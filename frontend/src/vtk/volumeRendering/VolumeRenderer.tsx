@@ -17,6 +17,7 @@ import vtkColorTransferFunction from '@kitware/vtk.js/Rendering/Core/ColorTransf
 import vtkPiecewiseFunction from '@kitware/vtk.js/Common/DataModel/PiecewiseFunction';
 import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
+import vtkPlane from '@kitware/vtk.js/Common/DataModel/Plane';
 
 import { loadDicomVolume, type DicomVolumeData } from './dicomVolumeLoader';
 
@@ -25,6 +26,13 @@ import { loadDicomVolume, type DicomVolumeData } from './dicomVolumeLoader';
 // ---------------------------------------------------------------------------
 
 type PresetName = 'ct-bone' | 'ct-soft-tissue' | 'ct-lung' | 'ct-angio';
+
+/** Normalised clipping plane positions (0..1). 0 = disabled, 1 = max clip. */
+interface ClipState {
+  x: number;
+  y: number;
+  z: number;
+}
 
 interface VolumeRendererProps {
   /** Render mode: synthetic phantom (default) or real DICOM series */
@@ -220,6 +228,7 @@ export function VolumeRenderer({
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<PresetName>(initialPreset);
+  const [clip, setClip] = useState<ClipState>({ x: 0, y: 0, z: 0 });
 
   // ------------------------------------------------------------------
   // 1. Initialise vtk.js pipeline
@@ -235,6 +244,7 @@ export function VolumeRenderer({
     const init = async () => {
       setIsLoading(true);
       setLoadError(null);
+      setClip({ x: 0, y: 0, z: 0 });
 
       try {
         // ------ acquire volume data ------
@@ -438,7 +448,53 @@ export function VolumeRenderer({
   }, [activePreset, isReady]);
 
   // ------------------------------------------------------------------
-  // 3. Handle container resize
+  // 3. Clipping plane management — rebuild planes when clip state changes
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const state = vtkRef.current;
+    if (!state || !isReady) return;
+
+    const { mapper, imageData, renderWindow } = state;
+    if (!mapper || !imageData || !renderWindow) return;
+
+    const bounds = imageData.getBounds();
+    // bounds: [xMin, xMax, yMin, yMax, zMin, zMax]
+    const activePlanes: any[] = [];
+
+    // ---- X axis (normal points +X, clip negative side) ----
+    if (clip.x > 0) {
+      const xPos = bounds[0] + clip.x * (bounds[1] - bounds[0]);
+      activePlanes.push(
+        vtkPlane.newInstance({ normal: [1, 0, 0], origin: [xPos, 0, 0] }),
+      );
+    }
+
+    // ---- Y axis (normal points +Y, clip negative side) ----
+    if (clip.y > 0) {
+      const yPos = bounds[2] + clip.y * (bounds[3] - bounds[2]);
+      activePlanes.push(
+        vtkPlane.newInstance({ normal: [0, 1, 0], origin: [0, yPos, 0] }),
+      );
+    }
+
+    // ---- Z axis (normal points +Z, clip negative side) ----
+    if (clip.z > 0) {
+      const zPos = bounds[4] + clip.z * (bounds[5] - bounds[4]);
+      activePlanes.push(
+        vtkPlane.newInstance({ normal: [0, 0, 1], origin: [0, 0, zPos] }),
+      );
+    }
+
+    mapper.removeAllClippingPlanes();
+    for (const plane of activePlanes) {
+      mapper.addClippingPlane(plane);
+    }
+    renderWindow.render();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clip, isReady]);
+
+  // ------------------------------------------------------------------
+  // 4. Handle container resize
   // ------------------------------------------------------------------
   useEffect(() => {
     const container = containerRef.current;
@@ -458,7 +514,7 @@ export function VolumeRenderer({
   }, [isReady]);
 
   // ------------------------------------------------------------------
-  // 4. Preset button handler
+  // 5. Preset button handler
   // ------------------------------------------------------------------
   const handlePresetChange = useCallback((name: PresetName) => {
     setActivePreset(name);
@@ -512,27 +568,49 @@ export function VolumeRenderer({
 
       {/* Controls overlay */}
       {showControls && isReady && (
-        <div className="absolute bottom-2 right-2 z-10 flex gap-1">
-          <PresetButton
-            label="Bone"
-            active={activePreset === 'ct-bone'}
-            onClick={() => handlePresetChange('ct-bone')}
-          />
-          <PresetButton
-            label="Soft"
-            active={activePreset === 'ct-soft-tissue'}
-            onClick={() => handlePresetChange('ct-soft-tissue')}
-          />
-          <PresetButton
-            label="Lung"
-            active={activePreset === 'ct-lung'}
-            onClick={() => handlePresetChange('ct-lung')}
-          />
-          <PresetButton
-            label="Angio"
-            active={activePreset === 'ct-angio'}
-            onClick={() => handlePresetChange('ct-angio')}
-          />
+        <div className="absolute bottom-2 right-2 z-10 flex flex-col gap-1.5 items-end">
+          {/* Preset buttons */}
+          <div className="flex gap-1">
+            <PresetButton
+              label="Bone"
+              active={activePreset === 'ct-bone'}
+              onClick={() => handlePresetChange('ct-bone')}
+            />
+            <PresetButton
+              label="Soft"
+              active={activePreset === 'ct-soft-tissue'}
+              onClick={() => handlePresetChange('ct-soft-tissue')}
+            />
+            <PresetButton
+              label="Lung"
+              active={activePreset === 'ct-lung'}
+              onClick={() => handlePresetChange('ct-lung')}
+            />
+            <PresetButton
+              label="Angio"
+              active={activePreset === 'ct-angio'}
+              onClick={() => handlePresetChange('ct-angio')}
+            />
+          </div>
+
+          {/* Clipping plane sliders */}
+          <div className="flex flex-col gap-0.5 rounded bg-black/60 px-2 py-1.5 min-w-[220px]">
+            <ClipSlider
+              label="X"
+              value={clip.x}
+              onChange={(v) => setClip((prev) => ({ ...prev, x: v }))}
+            />
+            <ClipSlider
+              label="Y"
+              value={clip.y}
+              onChange={(v) => setClip((prev) => ({ ...prev, y: v }))}
+            />
+            <ClipSlider
+              label="Z"
+              value={clip.z}
+              onChange={(v) => setClip((prev) => ({ ...prev, z: v }))}
+            />
+          </div>
         </div>
       )}
     </div>
@@ -555,6 +633,37 @@ function applyPreset(
   for (const [x, y] of preset.opacityPoints) {
     opacityTF.addPoint(x, y);
   }
+}
+
+/** Small slider for a single clipping axis. */
+function ClipSlider({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="w-3 text-right text-[10px] font-medium text-white/50">
+        {label}
+      </span>
+      <input
+        type="range"
+        min={0}
+        max={1}
+        step={0.01}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="h-1 flex-1 cursor-pointer accent-primary"
+      />
+      <span className="w-8 text-right text-[10px] tabular-nums text-white/50">
+        {Math.round(value * 100)}%
+      </span>
+    </div>
+  );
 }
 
 /** Small internal button for the preset bar. */
