@@ -18,6 +18,8 @@ import vtkPiecewiseFunction from '@kitware/vtk.js/Common/DataModel/PiecewiseFunc
 import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 
+import { loadDicomVolume, type DicomVolumeData } from './dicomVolumeLoader';
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -25,8 +27,10 @@ import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 type PresetName = 'ct-bone' | 'ct-soft-tissue' | 'ct-lung' | 'ct-angio';
 
 interface VolumeRendererProps {
-  /** Volume data URL or array buffer (unused in Phase 1 — synthetic data) */
-  volumeId?: string;
+  /** Render mode: synthetic phantom (default) or real DICOM series */
+  mode?: 'synthetic' | 'dicom';
+  /** DICOM series ID — required when mode='dicom' */
+  seriesId?: string;
   /** Initial opacity function preset */
   opacityPreset?: PresetName;
   /** Whether to show rendering controls */
@@ -190,7 +194,8 @@ function generateSyntheticVolume(): Float32Array {
 // ---------------------------------------------------------------------------
 
 export function VolumeRenderer({
-  volumeId: _volumeId,
+  mode = 'synthetic',
+  seriesId,
   opacityPreset: initialPreset = 'ct-soft-tissue',
   showControls = false,
 }: VolumeRendererProps) {
@@ -213,10 +218,13 @@ export function VolumeRenderer({
   // ---- UI state ----
   const [isReady, setIsReady] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<PresetName>(initialPreset);
 
   // ------------------------------------------------------------------
-  // 1. Initialise vtk.js pipeline (runs once per mount)
+  // 1. Initialise vtk.js pipeline
+  //    — synthetic: runs once on mount
+  //    — dicom: re-runs when seriesId changes
   // ------------------------------------------------------------------
   useEffect(() => {
     const container = containerRef.current;
@@ -224,22 +232,50 @@ export function VolumeRenderer({
 
     let cancelled = false;
 
-    const init = () => {
+    const init = async () => {
       setIsLoading(true);
+      setLoadError(null);
 
       try {
-        // ------- synthetic volume data -------
-        const scalarData = generateSyntheticVolume();
+        // ------ acquire volume data ------
+        let volData: {
+          scalarData: Float32Array;
+          dimensions: [number, number, number];
+          spacing: [number, number, number];
+          origin: [number, number, number];
+        };
+
+        if (mode === 'dicom' && seriesId) {
+          // ---- load real DICOM series ----
+          const dicomVol: DicomVolumeData = await loadDicomVolume(seriesId);
+          if (cancelled) return;
+          volData = {
+            scalarData: dicomVol.scalarData,
+            dimensions: dicomVol.dimensions,
+            spacing: dicomVol.spacing,
+            origin: dicomVol.origin,
+          };
+        } else {
+          // ---- synthetic phantom (Phase 1) ----
+          volData = {
+            scalarData: generateSyntheticVolume(),
+            dimensions: [64, 64, 64],
+            spacing: [1, 1, 1],
+            origin: [-32, -32, -32],
+          };
+        }
+
+        if (cancelled) return;
 
         // ------- vtkImageData -------
         const imageData = vtkImageData.newInstance();
-        imageData.setDimensions(64, 64, 64);
-        imageData.setSpacing([1, 1, 1]);
-        imageData.setOrigin([-32, -32, -32]); // centre at world origin
+        imageData.setDimensions(volData.dimensions);
+        imageData.setSpacing(volData.spacing);
+        imageData.setOrigin(volData.origin);
 
         const dataArray = vtkDataArray.newInstance({
           name: 'Scalars',
-          values: scalarData,
+          values: volData.scalarData,
           numberOfComponents: 1,
         });
         imageData.getPointData().setScalars(dataArray);
@@ -279,7 +315,6 @@ export function VolumeRenderer({
         property.setSpecular(0.2);
         property.setSpecularPower(10.0);
 
-        // ---- independent components (sample distance) ----
         property.setIndependentComponents(true);
         property.setUseGradientOpacity(0, false);
 
@@ -314,10 +349,14 @@ export function VolumeRenderer({
         if (!cancelled) {
           setIsReady(true);
           setIsLoading(false);
+          setLoadError(null);
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error('[VolumeRenderer] Initialization failed:', error);
-        if (!cancelled) setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+          setLoadError(error.message ?? 'Unknown error loading volume');
+        }
       }
     };
 
@@ -375,7 +414,7 @@ export function VolumeRenderer({
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [mode, seriesId]);
 
   // ------------------------------------------------------------------
   // 2. Handle preset changes (update transfer functions in-place)
@@ -446,8 +485,20 @@ export function VolumeRenderer({
           <div className="flex flex-col items-center gap-2">
             <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
             <span className="text-xs text-muted-foreground">
-              Loading volume...
+              {mode === 'dicom' ? 'Loading DICOM volume...' : 'Loading volume...'}
             </span>
+          </div>
+        </div>
+      )}
+
+      {/* Error overlay */}
+      {loadError && !isLoading && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/80">
+          <div className="max-w-sm text-center">
+            <p className="mb-1 text-sm font-medium text-red-400">
+              Failed to load volume
+            </p>
+            <p className="text-xs text-white/50">{loadError}</p>
           </div>
         </div>
       )}
