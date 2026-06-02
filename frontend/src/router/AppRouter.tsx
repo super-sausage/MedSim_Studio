@@ -6,6 +6,7 @@ const ViewerPage = lazy(() => import('@pages/ViewerPage'));
 const StudiesPage = lazy(() => import('@pages/StudiesPage'));
 const SimulationPage = lazy(() => import('@pages/SimulationPage'));
 const SegmentationPage = lazy(() => import('@pages/SegmentationPage'));
+const VtkDemoPage = lazy(() => import('@pages/VtkDemoPage'));
 
 /**
  * Application Router
@@ -28,6 +29,7 @@ export function AppRouter() {
       <Route path="/viewer/:studyId" element={<ViewerPage />} />
       <Route path="/simulation" element={<SimulationPage />} />
       <Route path="/segmentation" element={<SegmentationPage />} />
+      <Route path="/vtk-demo" element={<VtkDemoPage />} />
     </Routes>
   );
 }

@@ -21,6 +21,7 @@
       "@app/*": ["src/app/*"],
       "@pages/*": ["src/pages/*"],
       "@viewer/*": ["src/viewer/*"],
+      "@vtk": ["src/vtk/index.ts"],
       "@vtk/*": ["src/vtk/*"],
       "@simulation/*": ["src/simulation/*"],
       "@segmentation/*": ["src/segmentation/*"],
