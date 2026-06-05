@@ -99,6 +99,8 @@ services:
       - "9000:9000"   # API
       - "9001:9001"   # Console
     environment:
+      - AI_MONAI_ENABLED=true
+      - AI_DEVICE=cpu
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin123
     volumes:

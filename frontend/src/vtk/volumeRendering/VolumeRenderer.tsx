@@ -34,6 +34,13 @@ interface ClipState {
   z: number;
 }
 
+/** A single segmentation label with RGB color */
+interface SegmentationLabelDef {
+  index: number;
+  name: string;
+  color: [number, number, number]; // RGB 0-255
+}
+
 interface VolumeRendererProps {
   /** Render mode: synthetic phantom (default) or real DICOM series */
   mode?: 'synthetic' | 'dicom';
@@ -43,6 +50,10 @@ interface VolumeRendererProps {
   opacityPreset?: PresetName;
   /** Whether to show rendering controls */
   showControls?: boolean;
+  /** Optional 3D segmentation label map for overlay */
+  segmentationMask?: Float32Array | null;
+  /** Label definitions for coloring the segmentation mask */
+  segmentationLabels?: SegmentationLabelDef[] | null;
 }
 
 /** Shape of a transfer function preset */
@@ -206,6 +217,8 @@ export function VolumeRenderer({
   seriesId,
   opacityPreset: initialPreset = 'ct-soft-tissue',
   showControls = false,
+  segmentationMask,
+  segmentationLabels,
 }: VolumeRendererProps) {
   // ---- DOM ref ----
   const containerRef = useRef<HTMLDivElement>(null);
@@ -216,6 +229,15 @@ export function VolumeRenderer({
     renderer: any;
     openglRW: any;
     interactor: any;
+    volume: any;
+    mapper: any;
+    imageData: any;
+    colorTransfer: any;
+    piecewiseFunc: any;
+  } | null>(null);
+
+  // ---- Segmentation overlay volume ref (separate from main CT volume) ----
+  const segRef = useRef<{
     volume: any;
     mapper: any;
     imageData: any;
@@ -378,6 +400,22 @@ export function VolumeRenderer({
       cancelled = true;
       clearTimeout(timer);
 
+      // Cleanup segmentation overlay first
+      const seg = segRef.current;
+      if (seg) {
+        try {
+          if (vtkRef.current?.renderer) {
+            vtkRef.current.renderer.removeVolume(seg.volume);
+          }
+        } catch (_) { /* ignore */ }
+        try { seg.volume.delete(); } catch (_) { /* ignore */ }
+        try { seg.mapper.delete(); } catch (_) { /* ignore */ }
+        try { seg.imageData.delete(); } catch (_) { /* ignore */ }
+        try { seg.colorTransfer.delete(); } catch (_) { /* ignore */ }
+        try { seg.piecewiseFunc.delete(); } catch (_) { /* ignore */ }
+        segRef.current = null;
+      }
+
       const s = vtkRef.current;
       if (s) {
         try {
@@ -494,7 +532,105 @@ export function VolumeRenderer({
   }, [clip, isReady]);
 
   // ------------------------------------------------------------------
-  // 4. Handle container resize
+  // 4. Segmentation overlay — add/remove a second volume for mask
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const state = vtkRef.current;
+    if (!state || !isReady) return;
+
+    const { renderer, renderWindow, imageData: ctImageData } = state;
+
+    // Cleanup previous segmentation overlay
+    if (segRef.current) {
+      try {
+        renderer.removeVolume(segRef.current.volume);
+        segRef.current.volume.delete();
+        segRef.current.mapper.delete();
+        segRef.current.imageData.delete();
+        segRef.current.colorTransfer.delete();
+        segRef.current.piecewiseFunc.delete();
+      } catch (_) { /* ignore */ }
+      segRef.current = null;
+    }
+
+    // If no mask provided, we're done
+    if (!segmentationMask || !segmentationLabels || segmentationLabels.length === 0) {
+      renderWindow.render();
+      return;
+    }
+
+    try {
+      // Get CT volume dimensions — segmentation mask should match
+      const dims = ctImageData.getDimensions();
+      const spacing = ctImageData.getSpacing();
+      const origin = ctImageData.getOrigin();
+
+      // ------- segmentation vtkImageData -------
+      const segImageData = vtkImageData.newInstance();
+      segImageData.setDimensions(dims);
+      segImageData.setSpacing(spacing);
+      segImageData.setOrigin(origin);
+
+      const segArray = vtkDataArray.newInstance({
+        name: 'Segmentation',
+        values: segmentationMask,
+        numberOfComponents: 1,
+      });
+      segImageData.getPointData().setScalars(segArray);
+
+      // ------- discrete color transfer function -------
+      const segColor = vtkColorTransferFunction.newInstance();
+      const segOpacity = vtkPiecewiseFunction.newInstance();
+
+      // Background fully transparent
+      segOpacity.addPoint(0, 0.0);
+
+      // Each label gets its color and partial opacity
+      for (const label of segmentationLabels) {
+        const [r, g, b] = label.color;
+        const idx = label.index;
+        // Normalize RGB from 0-255 to 0-1 for VTK
+        segColor.addRGBPoint(idx, r / 255, g / 255, b / 255);
+        // Semi-transparent for overlay blending
+        segOpacity.addPoint(idx, 0.4);
+        // Sharp falloff around the label value
+        segOpacity.addPoint(idx - 0.5, 0.0);
+        segOpacity.addPoint(idx + 0.5, 0.4);
+      }
+
+      // ------- segmentation volume actor -------
+      const segMapper = vtkVolumeMapper.newInstance();
+      segMapper.setInputData(segImageData);
+      segMapper.setBlendModeToComposite();
+
+      const segVolume = vtkVolume.newInstance();
+      segVolume.setMapper(segMapper);
+
+      const segProp = segVolume.getProperty();
+      segProp.setRGBTransferFunction(0, segColor);
+      segProp.setScalarOpacity(0, segOpacity);
+      segProp.setInterpolationTypeToNearest(); // nearest-neighbor for labels
+      segProp.setShade(false); // no shading for labels
+      segProp.setIndependentComponents(true);
+
+      renderer.addVolume(segVolume);
+      renderWindow.render();
+
+      segRef.current = {
+        volume: segVolume,
+        mapper: segMapper,
+        imageData: segImageData,
+        colorTransfer: segColor,
+        piecewiseFunc: segOpacity,
+      };
+    } catch (err) {
+      console.error('[VolumeRenderer] Segmentation overlay failed:', err);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segmentationMask, segmentationLabels, isReady]);
+
+  // ------------------------------------------------------------------
+  // 5. Handle container resize
   // ------------------------------------------------------------------
   useEffect(() => {
     const container = containerRef.current;

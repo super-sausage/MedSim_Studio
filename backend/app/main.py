@@ -20,6 +20,10 @@ from app import __version__, __app_name__
 from app.core.config import settings
 from app.api.v1 import health_router, dicom_router, simulation_router, segmentation_router
 from app.dicom.storage import StorageBackend, get_storage_backend
+from app.database.session import engine, Base
+import app.models.dicom  # noqa: F401 — register models for create_all
+import app.models.simulation  # noqa: F401 — register models for create_all
+import app.models.segmentation  # noqa: F401 — register models for create_all
 
 # Configure structured logging
 logging.basicConfig(
@@ -48,7 +52,12 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {__app_name__} v{__version__}")
 
     # --- Startup ---
-    # TODO: Initialize database connection pool
+    # Create all database tables if they don't exist
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database tables created/verified")
+    except Exception:
+        logger.exception("Failed to create database tables; continuing startup")
 
     # Initialize storage backend and ensure it is ready.
     # Failure here does NOT crash the app — the backend still starts,

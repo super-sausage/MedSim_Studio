@@ -6,6 +6,7 @@
 
 export * from './dicom';
 export * from './simulation';
+export * from './segmentation';
 
 /** Generic API response wrapper */
 export interface APIResponse<T> {

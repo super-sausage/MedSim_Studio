@@ -9,6 +9,7 @@
  * - DICOM series loading via loadDicomSeries module
  * - Tool group binding
  * - WebGL memory leak prevention on unmount
+ * - Optional segmentation mask overlay rendering
  *
  * Usage:
  * ```tsx
@@ -17,6 +18,7 @@
  *   seriesId="abc-123"
  *   className="h-full w-full"
  *   onViewportReady={(id) => console.log('ready', id)}
+ *   segmentationData={{ sliceMask, opacity: 0.4, visibleLabels }}
  * />
  * ```
  */
@@ -32,6 +34,7 @@ import {
 } from '../createRenderingEngine';
 import { loadSeriesOnViewport, loadVolumeOnViewport } from '../loadDicomSeries';
 import { createToolGroup, addViewportToToolGroup } from '../toolGroups';
+import type { SliceMask } from '@/types/segmentation';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,6 +57,12 @@ export interface CornerstoneViewportProps {
   onViewportReady?: (viewportId: string) => void;
   /** ToolGroup identifier to bind this viewport to */
   toolGroupId?: string;
+  /** Optional segmentation mask for overlay rendering */
+  segmentationData?: {
+    sliceMask: SliceMask;
+    opacity: number;
+    visibleLabels: Set<number>;
+  } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +78,7 @@ export function CornerstoneViewport({
   className = '',
   onViewportReady,
   toolGroupId = 'ct-tool-group',
+  segmentationData,
 }: CornerstoneViewportProps) {
   // Ref to the DOM container element
   const elementRef = useRef<HTMLDivElement>(null);
@@ -79,6 +89,9 @@ export function CornerstoneViewport({
   // Stable ref for the onViewportReady callback
   const onReadyRef = useRef(onViewportReady);
   onReadyRef.current = onViewportReady;
+
+  // Canvas ref for segmentation overlay
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // Loading/error state for UI feedback
   const [loadState, setLoadState] = useState<
@@ -102,6 +115,68 @@ export function CornerstoneViewport({
       observer.disconnect();
     };
   }, []);
+
+  // ------------------------------------------------------------------
+  // Segmentation overlay canvas rendering
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !segmentationData) return;
+
+    const parent = canvas.parentElement;
+    if (!parent) return;
+
+    // Size canvas to match parent container (accounting for DPR)
+    const dpr = window.devicePixelRatio || 1;
+    const rect = parent.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = `${rect.width}px`;
+    canvas.style.height = `${rect.height}px`;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, rect.width, rect.height);
+
+    const { sliceMask, opacity, visibleLabels } = segmentationData;
+    if (!sliceMask?.maskData?.length) return;
+
+    // Build label color map: label index → RGBA string
+    const colorMap = new Map<number, string>();
+    if (sliceMask.labels) {
+      for (const label of sliceMask.labels) {
+        const [r, g, b] = label.color;
+        colorMap.set(label.index, `rgba(${r}, ${g}, ${b}, ${opacity})`);
+      }
+    }
+
+    // Calculate pixel size to fit mask into canvas
+    const rows = sliceMask.maskData.length;
+    const cols = rows > 0 ? sliceMask.maskData[0]?.length ?? 0 : 0;
+    if (rows === 0 || cols === 0) return;
+
+    const cellH = rect.height / rows;
+    const cellW = rect.width / cols;
+
+    // Draw each pixel of the mask
+    for (let y = 0; y < rows; y++) {
+      const row = sliceMask.maskData[y];
+      if (!row) continue;
+      for (let x = 0; x < cols && x < row.length; x++) {
+        const labelIndex = row[x];
+        if (labelIndex === 0) continue; // skip background
+        if (!visibleLabels.has(labelIndex)) continue;
+
+        const color = colorMap.get(labelIndex);
+        if (!color) continue;
+
+        ctx.fillStyle = color;
+        ctx.fillRect(x * cellW, y * cellH, Math.ceil(cellW), Math.ceil(cellH));
+      }
+    }
+  }, [segmentationData]);
 
   // ------------------------------------------------------------------
   // Main initialization effect
@@ -217,6 +292,14 @@ export function CornerstoneViewport({
         data-viewport-id={viewportId}
         style={{ minHeight: '100%', minWidth: '100%' }}
       />
+
+      {/* Segmentation mask overlay canvas — positioned over the Cornerstone viewport */}
+      {segmentationData && loadState === 'loaded' && (
+        <canvas
+          ref={canvasRef}
+          className="pointer-events-none absolute inset-0 z-10"
+        />
+      )}
 
       {/* Loading overlay */}
       {loadState === 'loading' && (

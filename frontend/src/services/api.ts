@@ -18,6 +18,11 @@ function toCamel(str: string): string {
   return str.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 }
 
+/** camelCase → snake_case converter for request bodies */
+function toSnake(str: string): string {
+  return str.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+}
+
 function convertKeys(obj: unknown): unknown {
   if (Array.isArray(obj)) {
     return obj.map(convertKeys);
@@ -27,6 +32,22 @@ function convertKeys(obj: unknown): unknown {
       Object.entries(obj as Record<string, unknown>).map(([k, v]) => [
         toCamel(k),
         convertKeys(v),
+      ]),
+    );
+  }
+  return obj;
+}
+
+/** Convert object keys from camelCase to snake_case (for request bodies) */
+function convertKeysToSnake(obj: unknown): unknown {
+  if (Array.isArray(obj)) {
+    return obj.map(convertKeysToSnake);
+  }
+  if (obj !== null && typeof obj === 'object' && !(obj instanceof Date)) {
+    return Object.fromEntries(
+      Object.entries(obj as Record<string, unknown>).map(([k, v]) => [
+        toSnake(k),
+        convertKeysToSnake(v),
       ]),
     );
   }
@@ -45,9 +66,19 @@ class ApiService {
       },
     });
 
-    // Request interceptor for auth and logging
+    // Request interceptor — converts camelCase request bodies to snake_case
     this.client.interceptors.request.use(
       (config) => {
+        // Only convert JSON request bodies (not FormData, Blob, etc.)
+        if (
+          config.data &&
+          config.headers['Content-Type'] === 'application/json' &&
+          typeof config.data === 'object' &&
+          !(config.data instanceof FormData) &&
+          !(config.data instanceof Blob)
+        ) {
+          config.data = convertKeysToSnake(config.data) as any;
+        }
         return config;
       },
       (error) => Promise.reject(error),

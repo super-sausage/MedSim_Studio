@@ -10,6 +10,15 @@ from app.schemas.simulation import (
     LesionConfigResponse,
     LesionConfigCreate,
 )
+from app.schemas.segmentation import (
+    SegmentationJobResponse,
+    SegmentationJobCreate,
+    SliceMaskResponse,
+    InteractiveClickRequest,
+    InteractiveClickResponse,
+    ModelInfoResponse,
+    LabelDef,
+)
 
 __all__ = [
     "DicomStudyResponse",
@@ -19,4 +28,11 @@ __all__ = [
     "SimulationJobCreate",
     "LesionConfigResponse",
     "LesionConfigCreate",
+    "SegmentationJobResponse",
+    "SegmentationJobCreate",
+    "SliceMaskResponse",
+    "InteractiveClickRequest",
+    "InteractiveClickResponse",
+    "ModelInfoResponse",
+    "LabelDef",
 ]

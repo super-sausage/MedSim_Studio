@@ -23,17 +23,19 @@ RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies, excluding heavy PyTorch packages.
-# The main backend/API/export workflow does not require torch.
+# Install Python dependencies with BuildKit pip cache.
+# Uses PyTorch CPU-only index as primary (no CUDA deps ~2GB smaller),
+# with Tsinghua mirror as fallback for all other packages.
 COPY backend/requirements.txt .
 
-RUN grep -viE '^[[:space:]]*(torch|torchvision|torchaudio|monai|torchio|ultralytics|sentence-transformers|pytorch-lightning|segment-anything|nvidia-|triton|cupy)([<=> ].*)?$' requirements.txt > requirements-no-torch.txt && \
-    echo "=== requirements-no-torch.txt ===" && \
-    cat requirements-no-torch.txt && \
-    python -m pip install --no-cache-dir \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
     --trusted-host pypi.tuna.tsinghua.edu.cn \
-    -r requirements-no-torch.txt
+    --timeout 120 \
+    torch==2.1.2 \
+    -r requirements.txt
 # ---- Stage 2: Runtime ----
 FROM python:3.11-slim AS runner
 
