@@ -55,10 +55,32 @@ services:
       - MINIO_BUCKET=dicom-studies
       - DATABASE_URL=postgresql://ctuser:ctpass123@postgres:5432/ct_simulator
       - LOG_LEVEL=INFO
+      - AI_DEVICE=cuda
+      - AI_MODEL_PATH=/app/custom-models
+      # TotalSegmentator weights — mounted to a separate path to avoid
+      # conflicting with the backend_models named volume at /app/ai-models
+      - TOTALSEGMENTATOR_DIR=/app/models/totalsegmentator
+      # TOTALSEGMENTATOR_FAST: true = 3mm fast model, false = 1.5mm full model (5 models, higher accuracy, slower)
+      - TOTALSEGMENTATOR_FAST=false
     volumes:
       - backend_uploads:/tmp/uploads
       - backend_models:/app/ai-models
       - backend_dicom:/app/static/dicom
+      # Mount local pretrained TotalSegmentator weights (avoid ~2 GB re-download)
+      - ./models/totalsegmentator:/app/models/totalsegmentator
+      # Mount custom-trained nnUNet model (Dataset701_TotalSegOrgans6, 6 organs)
+      - ./models/nnunet701_full_handoff/nnunet_handoff/model/Dataset701_TotalSegOrgans6/nnUNetTrainer__nnUNetPlans__3d_fullres:/app/models/nnunet_handoff
+    # TotalSegmentator uses PyTorch DataLoader multiprocessing workers
+    # which require large /dev/shm for inter-process communication.
+    # Default 64MB is far too small; allocate 8GB.
+    shm_size: 8g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     depends_on:
       postgres:
         condition: service_healthy

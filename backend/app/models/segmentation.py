@@ -21,7 +21,7 @@ class SegmentationJob(Base):
     status = Column(String, default="pending")  # pending, running, completed, failed
 
     # Configuration
-    model_name = Column(String, default="unet")  # unet, segresnet, swin_unetr
+    model_name = Column(String, default="unet")  # unet, segresnet, swin_unetr, totalsegmentator, nnunet_handoff
     target_organs = Column(JSON, default=list)
     detect_lesions = Column(Boolean, default=False)
 

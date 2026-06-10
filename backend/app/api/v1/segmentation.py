@@ -143,13 +143,11 @@ def run_segmentation_job(job_id: str) -> None:
         db.commit()
 
         # --- Step 3: Create label map metadata (progress -> 90) ---
-        from app.ai.monai.model_loader import ORGAN_LABEL_MAP
+        from app.ai.totalsegmentator.labels import get_label_defs
 
+        label_defs = get_label_defs(job.model_name, categories=False)
         label_map_json = {
-            "labels": [
-                {"index": idx, "name": name}
-                for name, idx in ORGAN_LABEL_MAP.items()
-            ],
+            "labels": label_defs,
             "shape": seg_metadata.get("shape"),
             "spacing": seg_metadata.get("spacing"),
         }
@@ -415,30 +413,12 @@ async def get_slice_mask(
     # Extract slice
     slice_2d = mask_array[z_index].astype(np.int32)
 
-    # Build label definitions from the ORGAN_LABEL_MAP with colors
-    from app.ai.monai.model_loader import ORGAN_LABEL_MAP
+    # Build label definitions from the correct model's label map
+    from app.ai.totalsegmentator.labels import get_label_defs
 
-    labels_response = []
-    # Color mapping matching the original API's /labels endpoint
-    LABEL_COLORS = {
-        0: [0, 0, 0],        # Background — black
-        1: [255, 0, 0],      # Liver — red
-        2: [0, 255, 0],      # Kidney — green
-        3: [0, 0, 255],      # Lung — blue
-        4: [255, 255, 0],    # Spleen — yellow
-        5: [255, 0, 255],    # Pancreas — magenta
-        6: [0, 255, 255],    # Bladder — cyan
-        7: [128, 128, 255],  # Bone — light blue
-        8: [255, 128, 0],    # Lesion (tumor) — orange
-        9: [255, 0, 128],    # Lesion (metastasis) — pink
-    }
-
-    for name, idx in ORGAN_LABEL_MAP.items():
-        labels_response.append(LabelDef(
-            index=idx,
-            name=name.replace("_", " ").title(),
-            color=LABEL_COLORS.get(idx, [128, 128, 128]),
-        ))
+    labels_response = [
+        LabelDef(**item) for item in get_label_defs(job.model_name, categories=False)
+    ]
 
     # Serialize 2D array as list of lists for JSON transport
     mask_data = slice_2d.tolist()
@@ -693,11 +673,27 @@ async def interactive_click_refinement(
 @router.get("/models", response_model=List[ModelInfoResponse])
 async def list_available_models():
     """List available segmentation models and the organs they support."""
+    from app.ai.totalsegmentator import is_available as ts_available
+    from app.ai.nnunet_custom import is_available as nnunet_available
     return [
         ModelInfoResponse(
-            name="unet",
-            description="3D U-Net for multi-organ segmentation (liver, kidney, lung, spleen)",
+            name="totalsegmentator",
+            description="TotalSegmentator v2 — pretrained segmentation of 117 anatomical structures "
+                        "(organs, bones, muscles, vessels, glands). No training required.",
+            organs=["all (117 structures)"],
+            status="available" if ts_available() else "coming_soon",
+        ),
+        ModelInfoResponse(
+            name="nnunet_handoff",
+            description="Custom nnUNet (Dataset701_TotalSegOrgans6) — 6 organs: liver, kidney, "
+                        "lung, spleen, pancreas, bladder",
             organs=["liver", "kidney", "lung", "spleen", "pancreas", "bladder"],
+            status="available" if nnunet_available() else "coming_soon",
+        ),
+        ModelInfoResponse(
+            name="unet",
+            description="Custom-trained 3D U-Net for abdominal organ segmentation (liver, kidney, lung, spleen, pancreas)",
+            organs=["liver", "kidney", "lung", "spleen", "pancreas"],
             status="available",
         ),
         ModelInfoResponse(
@@ -716,19 +712,25 @@ async def list_available_models():
 
 
 @router.get("/labels")
-async def get_segmentation_labels():
-    """Get available segmentation label definitions with colors."""
-    return {
-        "labels": [
-            {"index": 0, "name": "Background", "color": [0, 0, 0]},
-            {"index": 1, "name": "Liver", "color": [255, 0, 0]},
-            {"index": 2, "name": "Kidney", "color": [0, 255, 0]},
-            {"index": 3, "name": "Lung", "color": [0, 0, 255]},
-            {"index": 4, "name": "Spleen", "color": [255, 255, 0]},
-            {"index": 5, "name": "Pancreas", "color": [255, 0, 255]},
-            {"index": 6, "name": "Bladder", "color": [0, 255, 255]},
-            {"index": 7, "name": "Bone", "color": [128, 128, 255]},
-            {"index": 8, "name": "Lesion (Tumor)", "color": [255, 128, 0]},
-            {"index": 9, "name": "Lesion (Metastasis)", "color": [255, 0, 128]},
-        ]
-    }
+async def get_segmentation_labels(
+    model_name: str = Query(
+        "unet",
+        description="Model name: 'totalsegmentator' for 117-class labels, 'unet' for legacy 10-class",
+    ),
+):
+    """Get available segmentation label definitions with colors.
+
+    Args:
+        model_name: Select which model's label set to return.
+            - 'totalsegmentator': Returns all 117 TotalSegmentator labels
+            - 'unet' / others: Returns the legacy 10-class label map
+
+    Returns:
+        Dict with 'labels' list, each containing index, name, color,
+        and for TotalSegmentator: category and category_label.
+    """
+    from app.ai.totalsegmentator.labels import get_label_defs
+
+    include_categories = model_name and model_name.lower() == "totalsegmentator"
+    labels = get_label_defs(model_name, categories=include_categories)
+    return {"labels": labels}

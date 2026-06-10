@@ -49,6 +49,10 @@ export interface SegmentationLabel {
   index: number;
   name: string;
   color: [number, number, number]; // RGB values 0-255
+  /** Optional category grouping (e.g., "abdomen", "bones") for TotalSegmentator */
+  category?: string;
+  /** Optional human-readable category label */
+  category_label?: string;
 }
 
 /** 2D slice mask for overlay rendering */

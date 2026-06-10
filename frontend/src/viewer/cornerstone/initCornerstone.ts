@@ -21,10 +21,12 @@ import {
   PanTool,
   ZoomTool,
   StackScrollTool,
+  StackScrollMouseWheelTool,
   LengthTool,
   RectangleROITool,
   EllipticalROITool,
   ProbeTool,
+  SegmentationDisplayTool,
 } from '@cornerstonejs/tools';
 import {
   configure as configureImageLoader,
@@ -79,10 +81,12 @@ const TOOLS_TO_REGISTER = [
   PanTool,
   ZoomTool,
   StackScrollTool,
+  StackScrollMouseWheelTool,
   LengthTool,
   RectangleROITool,
   EllipticalROITool,
   ProbeTool,
+  SegmentationDisplayTool,
 ] as const;
 
 // ---------------------------------------------------------------------------

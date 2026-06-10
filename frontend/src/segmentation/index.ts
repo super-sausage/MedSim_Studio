@@ -14,4 +14,6 @@ export { LabelToggleList } from '@segmentation/components/LabelToggleList';
 export { JobProgressPanel } from '@segmentation/components/JobProgressPanel';
 export { ExportDialog } from '@segmentation/components/ExportDialog';
 export { BrushToolToggle } from '@segmentation/components/BrushToolToggle';
+// Segmentation hooks
 export { useSegmentationOverlay } from '@segmentation/hooks/useSegmentationOverlay';
+export { useSegmentation } from '@segmentation/hooks/useSegmentation';

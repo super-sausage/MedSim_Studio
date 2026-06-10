@@ -40,7 +40,7 @@ interface SegmentationStore {
   setActiveStudy: (studyId: string) => void;
   setActiveSeries: (seriesId: string) => void;
   fetchModels: () => Promise<void>;
-  fetchLabels: () => Promise<void>;
+  fetchLabels: (modelName?: string) => Promise<void>;
   toggleOrgan: (organ: string) => void;
   setDetectLesions: (enabled: boolean) => void;
   clearTargets: () => void;
@@ -87,10 +87,10 @@ export const useSegmentationStore = create<SegmentationStore>((set, get) => ({
     }
   },
 
-  fetchLabels: async () => {
+  fetchLabels: async (modelName?: string) => {
     set({ labelsLoading: true });
     try {
-      const response = await segmentationService.getLabels();
+      const response = await segmentationService.getLabels(modelName);
       set({ labels: response.labels, labelsLoading: false });
     } catch {
       set({ labelsLoading: false });

@@ -6,6 +6,7 @@ Reads from environment variables with sensible defaults
 for development, production-ready defaults for deployment.
 """
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 from typing import List
 import os
@@ -53,8 +54,22 @@ class Settings(BaseSettings):
 
     # AI Services
     AI_MONAI_ENABLED: bool = False
-    AI_DEVICE: str = "cpu"
+    AI_DEVICE: str = "cuda"  # Set to "cpu" to force CPU; "cuda" auto-detects NVIDIA GPU
     AI_MODEL_PATH: str = "/app/ai-models"
+    AI_TOTALSEGMENTATOR_ENABLED: bool = True
+
+    # TotalSegmentator model weights directory
+    # Points to local nnUNet checkpoint files (Dataset291_..., etc.)
+    # so the ~2 GB download is skipped on first inference.
+    # Resolved automatically for both Docker and local development.
+    TOTALSEGMENTATOR_DIR: str = Field(default="/app/ai-models/totalsegmentator")
+
+    TOTALSEGMENTATOR_FAST: bool = True
+
+    # Custom nnUNet model (Dataset701_TotalSegOrgans6, user-trained)
+    # Points to the nnUNetTrainer__nnUNetPlans__3d_fullres folder
+    # containing dataset.json, plans.json, and fold_0/checkpoint_best.pth
+    NNUNET_CUSTOM_MODEL_PATH: str = Field(default="/app/models/nnunet_handoff")
 
     # Simulation
     SIMULATION_DEFAULT_SEED: int = 42

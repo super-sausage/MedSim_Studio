@@ -20,7 +20,18 @@ interface OverlayCache {
   [key: string]: SliceMask; // key = `${jobId}:${zIndex}`
 }
 
+/** Shared cache accessible from both the hook and fire-and-forget prefetch */
+const globalCache: OverlayCache = {};
+const globalCacheKeys: string[] = [];
+
 const MAX_CACHE_SIZE = 50;
+
+function evictFromGlobalCache() {
+  while (globalCacheKeys.length > MAX_CACHE_SIZE) {
+    const oldest = globalCacheKeys.shift();
+    if (oldest) delete globalCache[oldest];
+  }
+}
 
 export function useSegmentationOverlay(jobId: string | null) {
   const [currentSlice, setCurrentSlice] = useState<SliceMask | null>(null);
@@ -28,23 +39,10 @@ export function useSegmentationOverlay(jobId: string | null) {
   const [error, setError] = useState<string | null>(null);
   const [labels, setLabels] = useState<SegmentationLabel[]>([]);
 
-  // LRU-ish cache using a plain object + key tracking
-  const cacheRef = useRef<OverlayCache>({});
-  const cacheKeysRef = useRef<string[]>([]);
-
   const getCacheKey = useCallback(
     (zIndex: number) => `${jobId}:${zIndex}`,
     [jobId],
   );
-
-  const evictIfNeeded = useCallback(() => {
-    const cache = cacheRef.current;
-    const keys = cacheKeysRef.current;
-    while (keys.length > MAX_CACHE_SIZE) {
-      const oldest = keys.shift();
-      if (oldest) delete cache[oldest];
-    }
-  }, []);
 
   const loadSlice = useCallback(
     async (zIndex: number) => {
@@ -55,8 +53,8 @@ export function useSegmentationOverlay(jobId: string | null) {
 
       const key = getCacheKey(zIndex);
 
-      // Check cache first
-      const cached = cacheRef.current[key];
+      // Check global cache first
+      const cached = globalCache[key];
       if (cached) {
         setCurrentSlice(cached);
         if (labels.length === 0 && cached.labels.length > 0) {
@@ -71,10 +69,10 @@ export function useSegmentationOverlay(jobId: string | null) {
       try {
         const sliceMask = await segmentationService.getSliceMask(jobId, zIndex);
 
-        // Store in cache
-        cacheRef.current[key] = sliceMask;
-        cacheKeysRef.current.push(key);
-        evictIfNeeded();
+        // Store in global cache
+        globalCache[key] = sliceMask;
+        globalCacheKeys.push(key);
+        evictFromGlobalCache();
 
         setCurrentSlice(sliceMask);
         if (sliceMask.labels.length > 0) {
@@ -87,15 +85,18 @@ export function useSegmentationOverlay(jobId: string | null) {
         setLoading(false);
       }
 
-      // Prefetch adjacent slices for smooth scrolling
+      // Prefetch adjacent slices for smooth scrolling (fire-and-forget)
       prefetchAdjacent(jobId, zIndex, getCacheKey);
     },
-    [jobId, getCacheKey, evictIfNeeded, labels.length],
+    [jobId, getCacheKey, labels.length],
   );
 
   const clearCache = useCallback(() => {
-    cacheRef.current = {};
-    cacheKeysRef.current = [];
+    // Clear global cache (owned by this hook instance — only one is expected)
+    globalCacheKeys.length = 0;
+    for (const key of Object.keys(globalCache)) {
+      delete globalCache[key];
+    }
     setCurrentSlice(null);
     setError(null);
     setLabels([]);
@@ -113,6 +114,7 @@ export function useSegmentationOverlay(jobId: string | null) {
 
 /**
  * Prefetch adjacent slices without awaiting (fire-and-forget).
+ * Skips negative indices to avoid 400 errors from the backend.
  */
 function prefetchAdjacent(
   jobId: string,
@@ -120,33 +122,18 @@ function prefetchAdjacent(
   getCacheKey: (z: number) => string,
 ) {
   [zIndex - 1, zIndex + 1].forEach((adjZ) => {
+    // Skip negative indices — backend rejects them with 400
+    if (adjZ < 0) return;
+
     const key = getCacheKey(adjZ);
-    if (!cacheRefCurrent(key)) {
-      segmentationService.getSliceMask(jobId, adjZ).then((sliceMask) => {
-        // Store in the cache via the ref
-        const cache = window.__segCache;
-        if (cache) cache[`${jobId}:${adjZ}`] = sliceMask;
-      }).catch(() => {
-        // Prefetch failures are silently ignored
-      });
-    }
+    if (globalCache[key]) return; // already cached
+
+    segmentationService.getSliceMask(jobId, adjZ).then((sliceMask) => {
+      globalCache[key] = sliceMask;
+      globalCacheKeys.push(key);
+      evictFromGlobalCache();
+    }).catch(() => {
+      // Prefetch failures are silently ignored
+    });
   });
-}
-
-// Minimal global cache reference for prefetch writes
-// The actual cache is in the hook, but prefetch writes to a shared global.
-// This is a simple solution — in production you'd use a shared cache service.
-declare global {
-  interface Window {
-    __segCache?: Record<string, SliceMask>;
-  }
-}
-
-function cacheRefCurrent(key: string): boolean {
-  return !!(window.__segCache?.[key]);
-}
-
-// Initialize global cache on first import
-if (!window.__segCache) {
-  window.__segCache = {};
 }

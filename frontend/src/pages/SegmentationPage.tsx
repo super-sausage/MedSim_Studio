@@ -6,7 +6,7 @@ import { LabelToggleList } from '@segmentation/components/LabelToggleList';
 import { JobProgressPanel } from '@segmentation/components/JobProgressPanel';
 import { ExportDialog } from '@segmentation/components/ExportDialog';
 import { BrushToolToggle } from '@segmentation/components/BrushToolToggle';
-import { useSegmentationOverlay } from '@segmentation/hooks/useSegmentationOverlay';
+import { useSegmentation } from '@segmentation/hooks/useSegmentation';
 import { CornerstoneViewport } from '@viewer/cornerstone/viewport/CornerstoneViewport';
 import { VolumeRenderer } from '@vtk/volumeRendering/VolumeRenderer';
 import {
@@ -74,15 +74,24 @@ export default function SegmentationPage() {
   const [jobRunning, setJobRunning] = useState(false);
   const [activeJob, setActiveJob] = useState<SegmentationJob | null>(null);
 
-  // ---- Overlay state ----
-  const {
-    currentSlice,
-    loadSlice,
-    clearCache: clearOverlayCache,
-  } = useSegmentationOverlay(activeJob?.id ?? null);
+  // ---- Volume ID (shared across MPR viewports) ----
+  const volumeId = selectedSeriesId
+    ? `${VOLUME_ID_PREFIX}-${selectedSeriesId}`
+    : undefined;
 
-  const [brushActive, setBrushActive] = useState(false);
+  // ---- Cornerstone3D Segmentation ----
+  const {
+    segState: csSegState,
+    loading: segLoading,
+    loadMask,
+    syncVisibilityFromSet,
+    clearMask,
+    maskData,
+  } = useSegmentation(volumeId);
+
+  // ---- Organ label visibility ----
   const [visibleLabels, setVisibleLabels] = useState<Set<number>>(new Set([1, 2, 3, 4, 5, 6, 7, 8, 9]));
+  const [brushActive, setBrushActive] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
 
   // ==================================================================
@@ -113,8 +122,46 @@ export default function SegmentationPage() {
     };
     init();
     fetchModels();
+    // Initial label fetch uses the default model ('unet');
+    // refetch happens automatically in the model-change effect below.
     fetchLabels();
   }, [fetchModels, fetchLabels]);
+
+  // ==================================================================
+  // Refetch labels when model selection changes
+  // ==================================================================
+  useEffect(() => {
+    fetchLabels(selectedModel);
+  }, [selectedModel, fetchLabels]);
+
+  // ==================================================================
+  // Update visible labels when model changes
+  // ==================================================================
+  useEffect(() => {
+    if (selectedModel === 'totalsegmentator') {
+      // Enable key organs by default: lungs, heart, liver, spleen,
+      // kidneys, bladder, pancreas, stomach, aorta, spine
+      setVisibleLabels(new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 21, 22, 30, 31, 34]));
+    } else {
+      setVisibleLabels(new Set([1, 2, 3, 4, 5, 6, 7, 8, 9]));
+    }
+  }, [selectedModel]);
+
+  // ==================================================================
+  // Sync visibleLabels → Cornerstone3D segment visibility
+  // ==================================================================
+  useEffect(() => {
+    if (csSegState?.loaded) {
+      syncVisibilityFromSet(visibleLabels);
+    }
+  }, [visibleLabels, csSegState?.loaded, syncVisibilityFromSet]);
+
+  // ==================================================================
+  // Clear segmentation mask when model or series changes
+  // ==================================================================
+  useEffect(() => {
+    clearMask();
+  }, [selectedModel, selectedSeriesId, clearMask]);
 
   // ==================================================================
   // Load series when study changes
@@ -163,8 +210,8 @@ export default function SegmentationPage() {
         await Promise.all(imageLoader.loadAndCacheImages(ids));
         if (cancelled) return;
 
-        const volumeId = `${VOLUME_ID_PREFIX}-${selectedSeriesId}`;
-        await createAndCacheVolumeFromImages(volumeId, ids);
+        const volId = `${VOLUME_ID_PREFIX}-${selectedSeriesId}`;
+        await createAndCacheVolumeFromImages(volId, ids);
         if (cancelled) return;
         setVolumeReady(true);
       } catch (err) {
@@ -206,13 +253,28 @@ export default function SegmentationPage() {
   }, [selectedStudyId, selectedSeriesId, selectedModel, selectedOrgans, detectLesions, createJob, startPolling]);
 
   // ==================================================================
+  // Compute which completed job is current
+  // ==================================================================
+  const completedJob = completedJobs.length > 0 ? completedJobs[completedJobs.length - 1] : null;
+
+  // ==================================================================
+  // Load mask into Cornerstone3D when a job completes
+  // ==================================================================
+  useEffect(() => {
+    if (completedJob?.id && completedJob.status === 'completed' && volumeReady && volumeId) {
+      loadMask(completedJob.id, labels.length > 0 ? labels : DEFAULT_LABELS);
+    }
+  }, [completedJob?.id, completedJob?.status, volumeReady, volumeId, loadMask, labels]);
+
+  // ==================================================================
   // Handle cancel
   // ==================================================================
   const handleCancel = useCallback(async (jobId: string) => {
     await cancelJob(jobId);
     setJobRunning(false);
     setActiveJob(null);
-  }, [cancelJob]);
+    clearMask();
+  }, [cancelJob, clearMask]);
 
   // ==================================================================
   // Handle label visibility toggle
@@ -231,32 +293,7 @@ export default function SegmentationPage() {
   // ==================================================================
   const handleViewportReady = useCallback((viewportId: string) => {
     console.info(`[SegmentationPage] Viewport ready: ${viewportId}`);
-    // Start loading slice mask at slice 0
-    if (activeJob?.id) {
-      loadSlice(0);
-    }
-  }, [activeJob?.id, loadSlice]);
-
-  // ==================================================================
-  // Volume ID for viewports
-  // ==================================================================
-  const volumeId = selectedSeriesId
-    ? `${VOLUME_ID_PREFIX}-${selectedSeriesId}`
-    : undefined;
-
-  // ==================================================================
-  // Compute which completed job is current
-  // ==================================================================
-  const completedJob = completedJobs.length > 0 ? completedJobs[completedJobs.length - 1] : null;
-
-  // ==================================================================
-  // When a segmentation job completes, start loading slice 0 overlay
-  // ==================================================================
-  useEffect(() => {
-    if (completedJob?.id && volumeReady) {
-      loadSlice(0);
-    }
-  }, [completedJob?.id, volumeReady, loadSlice]);
+  }, []);
 
   // ==================================================================
   // Render
@@ -395,6 +432,14 @@ export default function SegmentationPage() {
             )}
           </div>
 
+          {/* Segmentation loading indicator */}
+          {segLoading && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <div className="h-3 w-3 animate-spin rounded-full border border-current border-t-transparent" />
+              Loading segmentation mask...
+            </div>
+          )}
+
           {/* Job status */}
           {activeJob && (
             <div>
@@ -453,8 +498,8 @@ export default function SegmentationPage() {
               seriesId={selectedSeriesId}
               showControls
               opacityPreset="ct-soft-tissue"
-              segmentationMask={null}  // Will connect when VTK overlay is Phase 4
-              segmentationLabels={labels}
+              segmentationMask={maskData}
+              segmentationLabels={labels.length > 0 ? labels : DEFAULT_LABELS}
             />
           ) : (
             <div className="grid h-full w-full grid-cols-2 grid-rows-[1fr_1fr] gap-0.5 bg-black">
@@ -473,15 +518,6 @@ export default function SegmentationPage() {
                     imageIds={imageIds}
                     className="h-full w-full"
                     onViewportReady={handleViewportReady}
-                    segmentationData={
-                      currentSlice && completedJob
-                        ? {
-                            sliceMask: currentSlice,
-                            opacity: 0.4,
-                            visibleLabels,
-                          }
-                        : undefined
-                    }
                   />
                   <span className="pointer-events-none absolute left-2 top-2 z-10 rounded bg-black/60 px-1.5 py-0.5 text-xs text-white/70">
                     {vp.label}

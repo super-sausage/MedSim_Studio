@@ -56,6 +56,17 @@ coverage/
 htmlcov/
 .pytest_cache/
 
+# Model weights (large binary files, not tracked in git)
+*.pth
+*.pt
+*.nii.gz
+
+# TotalSegmentator pretrained weights (~2GB) — auto-downloaded
+models/totalsegmentator/
+
+# Claude Code project settings
+.claude/
+
 # DICOM
 datasets/dicom/raw/*
 datasets/annotations/*
@@ -70,6 +81,7 @@ uploads/
 
 # Pre-downloaded pip wheels for Docker builds
 pip_cache/
+downloads/
 *.db
 
 backend/export_test/

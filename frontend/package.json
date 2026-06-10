@@ -18,7 +18,7 @@
     "@cornerstonejs/adapters": "^1.75.0",
     "@cornerstonejs/core": "^1.75.0",
     "@cornerstonejs/dicom-image-loader": "^1.75.0",
-    "@cornerstonejs/tools": "^1.75.0",
+    "@cornerstonejs/tools": "^1.86.1",
     "@kitware/vtk.js": "^30.4.0",
     "@radix-ui/react-dialog": "^1.0.5",
     "@radix-ui/react-dropdown-menu": "^2.0.6",

@@ -25,6 +25,7 @@ from app.dicom.storage.base import StorageBackend
 from app.simulation.volume_builder import build_volume_from_dicom
 from app.models.dicom import DicomInstance
 from app.segmentation.export import export_mask_nrrd
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -81,43 +82,92 @@ def run_full_segmentation(
 
     spacing = metadata.get("spacing", (1.0, 1.0, 1.0))
 
-    # Step 2: Run primary organ segmentation
+    # Step 2: Run segmentation (TotalSegmentator or MONAI)
     _t2 = _time.time()
-    logger.info(
-        "[PIPELINE] Job %s: calling run_segmentation(model=%s)...",
-        job_id, model_name,
-    )
-    try:
-        label_map = run_segmentation(
-            volume=volume,
-            model_name=model_name,
-            target_organs=target_organs,
-            spacing=spacing,
-        )
-    except Exception as e:
-        logger.error("[PIPELINE] Job %s: run_segmentation FAILED: %s", job_id, e, exc_info=True)
-        raise
-    logger.info(
-        "[PIPELINE] Job %s: segmentation complete, shape=%s unique_labels=%s (%.1fs)",
-        job_id, label_map.shape, np.unique(label_map), _time.time() - _t2,
-    )
 
-    # Step 3: Optionally run lesion detection (merges into label_map)
-    if detect_lesions:
-        _t3 = _time.time()
-        logger.info("[PIPELINE] Job %s: running lesion detection...", job_id)
+    if model_name and model_name.lower() in ("nnunet_handoff", "nnunet701_full_handoff"):
+        # --- Custom nnUNet path (Dataset701_TotalSegOrgans6, 6 organs) ---
+        logger.info("[PIPELINE] Job %s: calling custom nnUNet (model=%s)...", job_id, model_name)
         try:
-            lesion_map = run_lesion_detection(
+            from app.ai.nnunet_custom import run_nnunet_custom, is_available as nnunet_available
+            if not nnunet_available():
+                raise RuntimeError(
+                    f"Custom nnUNet model not found at {settings.NNUNET_CUSTOM_MODEL_PATH}. "
+                    "Verify the model directory is mounted in Docker."
+                )
+            label_map = run_nnunet_custom(
                 volume=volume,
                 spacing=spacing,
             )
         except Exception as e:
-            logger.error("[PIPELINE] Job %s: lesion detection FAILED: %s", job_id, e, exc_info=True)
+            logger.error("[PIPELINE] Job %s: custom nnUNet FAILED: %s", job_id, e, exc_info=True)
             raise
-        organ_indices = set(range(1, 8))
-        lesion_mask = (lesion_map > 0) & ~np.isin(label_map, list(organ_indices))
-        label_map[lesion_mask] = lesion_map[lesion_mask]
-        logger.info("[PIPELINE] Job %s: lesion detection done (%.1fs)", job_id, _time.time() - _t3)
+
+        # This model does not do lesion detection
+        detect_lesions = False
+
+    elif model_name and model_name.lower() == "totalsegmentator":
+        # --- TotalSegmentator path (pretrained, 117 structures) ---
+        logger.info("[PIPELINE] Job %s: calling TotalSegmentator (model=%s)...", job_id, model_name)
+        try:
+            from app.ai.totalsegmentator import run_totalsegmentator, is_available
+            if not is_available():
+                raise ImportError(
+                    "TotalSegmentator is not installed. "
+                    "Run: pip install TotalSegmentator"
+                )
+            label_map = run_totalsegmentator(
+                volume=volume,
+                spacing=spacing,
+                task="total",
+                fast=settings.TOTALSEGMENTATOR_FAST,
+            )
+        except Exception as e:
+            logger.error("[PIPELINE] Job %s: TotalSegmentator FAILED: %s", job_id, e, exc_info=True)
+            raise
+
+        # TotalSegmentator already segments lesions/abnormalities natively,
+        # so skip the separate lesion detection step
+        detect_lesions = False
+
+    else:
+        # --- MONAI path (existing, fallback) ---
+        logger.info(
+            "[PIPELINE] Job %s: calling run_segmentation(model=%s)...",
+            job_id, model_name,
+        )
+        try:
+            label_map = run_segmentation(
+                volume=volume,
+                model_name=model_name,
+                target_organs=target_organs,
+                spacing=spacing,
+            )
+        except Exception as e:
+            logger.error("[PIPELINE] Job %s: run_segmentation FAILED: %s", job_id, e, exc_info=True)
+            raise
+
+        # Step 3: Optionally run lesion detection (merges into label_map)
+        if detect_lesions:
+            _t3 = _time.time()
+            logger.info("[PIPELINE] Job %s: running lesion detection...", job_id)
+            try:
+                lesion_map = run_lesion_detection(
+                    volume=volume,
+                    spacing=spacing,
+                )
+            except Exception as e:
+                logger.error("[PIPELINE] Job %s: lesion detection FAILED: %s", job_id, e, exc_info=True)
+                raise
+            organ_indices = set(range(1, 8))
+            lesion_mask = (lesion_map > 0) & ~np.isin(label_map, list(organ_indices))
+            label_map[lesion_mask] = lesion_map[lesion_mask]
+            logger.info("[PIPELINE] Job %s: lesion detection done (%.1fs)", job_id, _time.time() - _t3)
+
+    logger.info(
+        "[PIPELINE] Job %s: segmentation complete, shape=%s unique_labels=%s (%.1fs)",
+        job_id, label_map.shape, np.unique(label_map), _time.time() - _t2,
+    )
 
     # Step 4: Save mask as NRRD to temp file, then upload to storage
     _t4 = _time.time()

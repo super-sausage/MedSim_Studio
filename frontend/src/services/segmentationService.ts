@@ -68,6 +68,9 @@ export const segmentationService = {
     api.get<SegmentationModel[]>('/segment/models'),
 
   /** Get label definitions with colors */
-  getLabels: () =>
-    api.get<{ labels: SegmentationLabel[] }>('/segment/labels'),
+  getLabels: (modelName?: string) => {
+    const params: Record<string, string> = {};
+    if (modelName) params.model_name = modelName;
+    return api.get<{ labels: SegmentationLabel[] }>('/segment/labels', { params });
+  },
 };

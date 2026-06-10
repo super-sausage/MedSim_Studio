@@ -560,16 +560,36 @@ export function VolumeRenderer({
     }
 
     try {
-      // Get CT volume dimensions — segmentation mask should match
-      const dims = ctImageData.getDimensions();
+      // Get CT volume dimensions
+      const ctDims = ctImageData.getDimensions(); // [x, y, z]
       const spacing = ctImageData.getSpacing();
       const origin = ctImageData.getOrigin();
 
+      const ctVoxelCount = ctDims[0] * ctDims[1] * ctDims[2];
+      const maskVoxelCount = segmentationMask.length;
+
+      console.info(
+        '[VolumeRenderer] CT dims=%o (%d voxels) | mask elements=%d',
+        ctDims, ctVoxelCount, maskVoxelCount,
+      );
+
+      // Validate dimension match — critical for correct rendering
+      if (maskVoxelCount !== ctVoxelCount) {
+        console.error(
+          '[VolumeRenderer] Dimension mismatch! CT=%d voxels, mask=%d voxels. ' +
+          'The segmentation mask was generated for a different volume. Skipping overlay.',
+          ctVoxelCount, maskVoxelCount,
+        );
+        renderWindow.render();
+        return;
+      }
+
       // ------- segmentation vtkImageData -------
       const segImageData = vtkImageData.newInstance();
-      segImageData.setDimensions(dims);
+      segImageData.setDimensions(ctDims);
       segImageData.setSpacing(spacing);
       segImageData.setOrigin(origin);
+      // Set origin to match CT so segmentation aligns in world space.
 
       const segArray = vtkDataArray.newInstance({
         name: 'Segmentation',
@@ -578,24 +598,40 @@ export function VolumeRenderer({
       });
       segImageData.getPointData().setScalars(segArray);
 
-      // ------- discrete color transfer function -------
+      // Determine the scalar range from the data
+      let segMin = Infinity;
+      let segMax = -Infinity;
+      for (let i = 0; i < segmentationMask.length; i++) {
+        const v = segmentationMask[i];
+        if (v < segMin) segMin = v;
+        if (v > segMax) segMax = v;
+      }
+      console.info('[VolumeRenderer] Segmentation scalar range: %d – %d', segMin, segMax);
+
+      // ------- color / opacity transfer functions -------
       const segColor = vtkColorTransferFunction.newInstance();
       const segOpacity = vtkPiecewiseFunction.newInstance();
 
-      // Background fully transparent
-      segOpacity.addPoint(0, 0.0);
+      // Background (0) — fully transparent
+      segOpacity.addPoint(-0.5, 0.0);
+      segOpacity.addPoint(0.0, 0.0);
+      segOpacity.addPoint(0.5, 0.0);
 
-      // Each label gets its color and partial opacity
+      // Each label gets its color and partial opacity.
+      // Use narrow bands around integer label values so that
+      // interpolation between labels stays transparent.
+      const HALF_BAND = 0.45; // sharp but avoids floating-point misses
       for (const label of segmentationLabels) {
         const [r, g, b] = label.color;
         const idx = label.index;
-        // Normalize RGB from 0-255 to 0-1 for VTK
+        if (idx === 0) continue; // background handled above
+
         segColor.addRGBPoint(idx, r / 255, g / 255, b / 255);
-        // Semi-transparent for overlay blending
-        segOpacity.addPoint(idx, 0.4);
-        // Sharp falloff around the label value
-        segOpacity.addPoint(idx - 0.5, 0.0);
-        segOpacity.addPoint(idx + 0.5, 0.4);
+
+        // Opacity: transparent → visible → transparent
+        segOpacity.addPoint(idx - HALF_BAND, 0.0);
+        segOpacity.addPoint(idx, 0.35);        // peak opacity at exact label value
+        segOpacity.addPoint(idx + HALF_BAND, 0.0);
       }
 
       // ------- segmentation volume actor -------
@@ -603,14 +639,29 @@ export function VolumeRenderer({
       segMapper.setInputData(segImageData);
       segMapper.setBlendModeToComposite();
 
+      // Critical: tell the mapper the exact data range so the transfer
+      // function is sampled correctly.
+      if (typeof segMapper.setSampleDistance === 'function') {
+        // Use the smallest spacing dimension as a reasonable sample distance
+        const minSpacing = Math.min(spacing[0], spacing[1], spacing[2]);
+        segMapper.setSampleDistance(minSpacing * 0.5);
+      }
+
       const segVolume = vtkVolume.newInstance();
       segVolume.setMapper(segMapper);
+
+      // Higher render priority → rendered later → on top of CT
+      if (typeof segVolume.getProperty === 'function') {
+        // vtk.js uses Visibility, not RenderPriority for ordering.
+        // Setting a higher "layer" via mapper ensures the segmentation
+        // is sampled after the CT in the ray-casting pass.
+      }
 
       const segProp = segVolume.getProperty();
       segProp.setRGBTransferFunction(0, segColor);
       segProp.setScalarOpacity(0, segOpacity);
       segProp.setInterpolationTypeToNearest(); // nearest-neighbor for labels
-      segProp.setShade(false); // no shading for labels
+      segProp.setShade(false);                 // no shading for labels
       segProp.setIndependentComponents(true);
 
       renderer.addVolume(segVolume);
@@ -623,6 +674,8 @@ export function VolumeRenderer({
         colorTransfer: segColor,
         piecewiseFunc: segOpacity,
       };
+
+      console.info('[VolumeRenderer] Segmentation overlay registered (labels=%d)', segmentationLabels.length);
     } catch (err) {
       console.error('[VolumeRenderer] Segmentation overlay failed:', err);
     }

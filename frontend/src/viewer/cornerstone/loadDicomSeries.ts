@@ -231,6 +231,25 @@ export async function loadVolumeOnViewport(
   // Set the volume on the viewport
   await viewport.setVolumes([{ volumeId: volume.volumeId }]);
 
+  // Increase maximum ray-cast samples per ray to handle large CT volumes.
+  // Default is 1000 in vtk.js; Cornerstone3D sets 4000 on its shared mapper,
+  // but the GPU-specific renderable may not inherit that value, producing
+  // "The number of steps required NNN is larger than the specified maximum"
+  // warnings. We bump it here on each actor to suppress the noise.
+  try {
+    const actors = (viewport as any).getActors?.() as any[];
+    if (actors) {
+      for (const actor of actors) {
+        const mapper = actor?.getMapper?.();
+        if (mapper && typeof mapper.setMaximumSamplesPerRay === 'function') {
+          mapper.setMaximumSamplesPerRay(10000);
+        }
+      }
+    }
+  } catch {
+    // getActors may not exist in all Cornerstone3D versions — safe to ignore
+  }
+
   console.info(
     `[LoadVolumeOnViewport] Loaded volume ${volumeId} ` +
       `(${imageIds.length} slices) onto ${viewport.id}`

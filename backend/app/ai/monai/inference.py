@@ -30,8 +30,26 @@ CT_WINDOW_MIN = CT_WINDOW_CENTER - CT_WINDOW_WIDTH / 2  # -135
 CT_WINDOW_MAX = CT_WINDOW_CENTER + CT_WINDOW_WIDTH / 2  #  215
 
 # Patch size for sliding-window inference (avoids OOM on large volumes)
-PATCH_SIZE = (64, 128, 128)  # (z, y, x)
+DEFAULT_PATCH_SIZE = (64, 128, 128)  # (z, y, x) — legacy default
+
+# Model-specific patch sizes (must match training setup)
+MODEL_PATCH_SIZES = {
+    "unet": (64, 96, 96),              # custom-trained organ model
+    "segresnet": (64, 128, 128),
+    "swin_unetr": (96, 96, 96),
+}
+
 PATCH_OVERLAP = 0.25
+
+# Foreground crop threshold (HU-windowed volume, range [0, 1])
+# Voxels above this are considered "body" rather than "air"
+FOREGROUND_THRESHOLD = 0.05
+FOREGROUND_MARGIN = 10  # voxels to pad around the bounding box
+
+# Labels not trained in the current weights
+# Classes 6-9 were suppressed during training via active-label suppression
+# Any voxel assigned these labels will be reset to background (0)
+MAX_TRAINED_LABEL = 5
 
 
 def run_segmentation(
@@ -71,7 +89,7 @@ def run_segmentation(
 
     # --- 1. Preprocess volume ---
     _t1 = _time.time()
-    processed, orig_shape, orig_spacing = _preprocess(
+    processed, orig_shape, orig_spacing, foreground_bbox, resampled_shape = _preprocess(
         volume, spacing or (1.0, 1.0, 1.0), model_name
     )
     logger.info(
@@ -81,12 +99,13 @@ def run_segmentation(
 
     # --- 2. Run inference ---
     _t2 = _time.time()
+    patch_size = MODEL_PATCH_SIZES.get(model_name, DEFAULT_PATCH_SIZE)
+
     # processed shape: (1, 1, Z, Y, X) — batch, channel, spatial
     with torch.no_grad():
-        # Sliding-window inference for large volumes
-        if any(s > p for s, p in zip(processed.shape[2:], PATCH_SIZE)):
-            logger.info("[INFER] Using sliding-window inference (patch=%s)", PATCH_SIZE)
-            logits = _sliding_window_inference(model, processed)
+        if any(s > p for s, p in zip(processed.shape[2:], patch_size)):
+            logger.info("[INFER] Using sliding-window inference (patch=%s)", patch_size)
+            logits = _sliding_window_inference(model, processed, patch_size)
         else:
             logger.info("[INFER] Direct inference (volume fits in one pass)")
             device = next(model.parameters()).device
@@ -97,25 +116,40 @@ def run_segmentation(
 
     # --- 3. Postprocess ---
     _t3 = _time.time()
-    # logits shape: (1, C, Z, Y, X)
     probabilities = _softmax(logits)  # (1, C, Z, Y, X)
     label_map = np.argmax(probabilities, axis=1).astype(np.int32)  # (1, Z, Y, X)
     label_map = label_map[0]  # (Z, Y, X)
+
+    # Suppress untrained labels (classes 6+ were not trained in this model)
+    untrained = label_map > MAX_TRAINED_LABEL
+    n_suppressed = int(untrained.sum())
+    if n_suppressed:
+        label_map[untrained] = 0
+        logger.info("[INFER] Suppressed %d voxels with untrained labels (>%d) to background",
+                    n_suppressed, MAX_TRAINED_LABEL)
+
     unique_labels = np.unique(label_map)
     logger.info("[INFER] Softmax+argmax done, unique labels in result: %s (%.1fs)",
                 unique_labels, _time.time() - _t3)
 
-    # --- 4. Resample back to original spacing ---
+    # --- 4. Un-crop if foreground cropping was applied ---
     _t4 = _time.time()
+    if foreground_bbox is not None:
+        label_map = _uncrop_label_map(label_map, foreground_bbox, resampled_shape)
+        logger.info("[INFER] Un-cropped label map: %s -> %s (%.1fs)",
+                    label_map.shape, resampled_shape, _time.time() - _t4)
+
+    # --- 5. Resample back to original spacing ---
+    _t5 = _time.time()
     if orig_shape != label_map.shape:
         logger.info("[INFER] Resampling label_map from %s back to original %s...",
                     label_map.shape, orig_shape)
         label_map = _resample_label_map(label_map, orig_spacing, orig_shape)
         logger.info("[INFER] Resampled back to original shape=%s (%.1fs)",
-                    orig_shape, _time.time() - _t4)
+                    orig_shape, _time.time() - _t5)
 
-    # --- 5. Filter target organs ---
-    _t5 = _time.time()
+    # --- 6. Filter target organs ---
+    _t6 = _time.time()
     if target_organs:
         from app.ai.monai.model_loader import ORGAN_LABEL_MAP
         valid_indices = {0}  # always keep background
@@ -126,7 +160,7 @@ def run_segmentation(
         mask = np.isin(label_map, list(valid_indices))
         label_map = label_map * mask
         logger.info("[INFER] Filtered to target organs=%s, unique now=%s (%.1fs)",
-                    target_organs, np.unique(label_map), _time.time() - _t5)
+                    target_organs, np.unique(label_map), _time.time() - _t6)
 
     logger.info("[INFER] Final label_map shape=%s dtype=%s range=[%d, %d] unique=%s",
                 label_map.shape, label_map.dtype,
@@ -135,22 +169,92 @@ def run_segmentation(
     return label_map
 
 
+def _crop_to_foreground(
+    volume_3d: np.ndarray,
+    threshold: float = FOREGROUND_THRESHOLD,
+    margin: int = FOREGROUND_MARGIN,
+) -> Tuple[np.ndarray, Tuple[int, int, int, int, int, int]]:
+    """
+    Crop a 3D volume to the foreground (body) bounding box.
+
+    Finds the bounding box of all voxels above *threshold* in the
+    HU-windowed volume, pads by *margin*, and returns the cropped
+    region along with the bbox coordinates for later un-cropping.
+
+    Args:
+        volume_3d: 3D numpy array (Z, Y, X) in [0, 1] range (after HU windowing)
+        threshold: Voxels above this are considered foreground
+        margin: Extra voxels to pad around the bbox on each side
+
+    Returns:
+        (cropped_volume, bbox) where bbox = (z1, z2, y1, y2, x1, x2)
+    """
+    fg_mask = volume_3d > threshold
+    coords = np.array(np.where(fg_mask))
+
+    if coords.size == 0:
+        # No foreground found — return whole volume
+        Z, Y, X = volume_3d.shape
+        return volume_3d, (0, Z, 0, Y, 0, X)
+
+    z1, y1, x1 = coords.min(axis=1)
+    z2, y2, x2 = coords.max(axis=1) + 1
+
+    # Add margin, clamped to volume bounds
+    Z, Y, X = volume_3d.shape
+    z1 = max(0, z1 - margin)
+    y1 = max(0, y1 - margin)
+    x1 = max(0, x1 - margin)
+    z2 = min(Z, z2 + margin)
+    y2 = min(Y, y2 + margin)
+    x2 = min(X, x2 + margin)
+
+    bbox = (z1, z2, y1, y2, x1, x2)
+    cropped = volume_3d[z1:z2, y1:y2, x1:x2]
+    return cropped, bbox
+
+
+def _uncrop_label_map(
+    cropped_label_map: np.ndarray,
+    bbox: Tuple[int, int, int, int, int, int],
+    full_shape: Tuple[int, int, int],
+) -> np.ndarray:
+    """
+    Place a cropped label map back into the full-volume coordinates.
+
+    Args:
+        cropped_label_map: 3D array (Z_cr, Y_cr, X_cr) from cropped inference
+        bbox: (z1, z2, y1, y2, x1, x2) from the crop step
+        full_shape: (Z, Y, X) of the full resampled volume
+
+    Returns:
+        3D label map in the original full-volume space (zeros outside bbox)
+    """
+    z1, z2, y1, y2, x1, x2 = bbox
+    full = np.zeros(full_shape, dtype=np.int32)
+    full[z1:z2, y1:y2, x1:x2] = cropped_label_map
+    return full
+
+
 def _preprocess(
     volume: np.ndarray,
     spacing: Tuple[float, float, float],
     model_name: str,
-) -> Tuple[np.ndarray, Tuple[int, int, int], Tuple[float, float, float]]:
+) -> Tuple[np.ndarray, Tuple[int, int, int], Tuple[float, float, float],
+           Optional[Tuple[int, int, int, int, int, int]], Tuple[int, int, int]]:
     """
     Preprocess CT volume for MONAI model inference.
 
     Steps:
       1. Clip to abdomen CT window [-135, 215] HU and scale to [0, 1]
       2. Resample to isotropic ~1.5mm spacing
-      3. Normalize to zero-mean, unit-variance
-      4. Add batch and channel dims → (1, 1, Z, Y, X)
+      3. For models trained with foreground cropping: crop to body bbox
+      4. Normalize to zero-mean, unit-variance
+      5. Add batch and channel dims → (1, 1, Z, Y, X)
 
     Returns:
-        (processed_tensor, original_shape, original_spacing)
+        (processed_tensor, original_shape, original_spacing,
+         foreground_bbox_or_None, resampled_shape_before_crop)
     """
     orig_shape = volume.shape
     orig_spacing = spacing
@@ -166,15 +270,26 @@ def _preprocess(
     else:
         resampled = hu_normalized
 
-    # Step 3: Normalize
-    mean = resampled.mean()
-    std = resampled.std() + 1e-8
-    normalized = (resampled - mean) / std
+    resampled_shape = resampled.shape
 
-    # Step 4: Add batch/channel dimensions
+    # Step 3: Foreground crop (for models trained with cropping)
+    foreground_bbox: Optional[Tuple[int, int, int, int, int, int]] = None
+    if model_name and model_name.lower() == "unet":
+        cropped, foreground_bbox = _crop_to_foreground(resampled)
+        logger.info("[PREPROC] Foreground crop: %s → %s, bbox=%s",
+                    resampled.shape, cropped.shape, foreground_bbox)
+    else:
+        cropped = resampled
+
+    # Step 4: Normalize (zero-mean, unit-variance within the cropped region)
+    mean = cropped.mean()
+    std = cropped.std() + 1e-8
+    normalized = (cropped - mean) / std
+
+    # Step 5: Add batch/channel dimensions
     processed = normalized[np.newaxis, np.newaxis, ...].astype(np.float32)
 
-    return processed, orig_shape, orig_spacing
+    return processed, orig_shape, orig_spacing, foreground_bbox, resampled_shape
 
 
 def _get_target_spacing(model_name: str) -> Tuple[float, float, float]:
@@ -225,17 +340,26 @@ def _resample_label_map(
 def _sliding_window_inference(
     model: object,
     input_tensor: np.ndarray,
+    patch_size: Tuple[int, int, int] = DEFAULT_PATCH_SIZE,
 ) -> np.ndarray:
     """
-    Run sliding-window inference for volumes larger than PATCH_SIZE.
+    Run sliding-window inference for volumes larger than *patch_size*.
 
     Splits the input into overlapping patches, runs inference on each,
     and stitches results together with averaging in overlap regions.
+
+    Args:
+        model: PyTorch nn.Module
+        input_tensor: 5D numpy array (1, 1, Z, Y, X)
+        patch_size: (pz, py, px) — size of each inference patch
+
+    Returns:
+        5D numpy array (1, C, Z, Y, X) of logits
     """
     import torch
 
     _, _, Z, Y, X = input_tensor.shape
-    pz, py, px = PATCH_SIZE
+    pz, py, px = patch_size
     overlap_z = int(pz * PATCH_OVERLAP)
     overlap_y = int(py * PATCH_OVERLAP)
     overlap_x = int(px * PATCH_OVERLAP)

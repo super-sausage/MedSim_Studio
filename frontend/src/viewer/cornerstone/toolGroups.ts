@@ -23,10 +23,12 @@ import {
   PanTool,
   ZoomTool,
   StackScrollTool,
+  StackScrollMouseWheelTool,
   LengthTool,
   RectangleROITool,
   EllipticalROITool,
   ProbeTool,
+  SegmentationDisplayTool,
   Enums as ToolEnums,
 } from '@cornerstonejs/tools';
 
@@ -92,14 +94,11 @@ export function createToolGroup(
     mouseButtonMask: MouseBindings.Secondary,
   });
 
-  // StackScroll — scroll wheel (no mouse button binding needed)
-  toolGroup.addTool(StackScrollTool.toolName, {
-    configuration: {
-      // Ensure scroll events are captured on the viewport element
-      volumeScrolling: false,
-      invert: false,
-    },
-  });
+  // StackScroll — drag-based slice navigation (not wheel)
+  toolGroup.addTool(StackScrollTool.toolName);
+
+  // StackScrollMouseWheel — wheel-based slice scrolling for VolumeViewports
+  toolGroup.addTool(StackScrollMouseWheelTool.toolName);
 
   // ------------------------------------------------------------------
   // Measurement tools (passive — placed on click, no drag binding)
@@ -110,20 +109,41 @@ export function createToolGroup(
   toolGroup.addTool(ProbeTool.toolName);
 
   // ------------------------------------------------------------------
-  // Set default active tool — WindowLevel
+  // Segmentation display tool (passive — renders overlays, no interaction)
   // ------------------------------------------------------------------
-  toolGroup.setToolActive(WindowLevelTool.toolName, {
-    bindings: [
-      {
-        mouseButton: MouseBindings.Primary,
-      },
-    ],
+  toolGroup.addTool(SegmentationDisplayTool.toolName, {
+    configuration: {
+      // Re-render segmentation when the camera changes
+      suppressToolConfig: false,
+    },
   });
 
-  // Set other tools as passive (available but not active until selected)
-  toolGroup.setToolPassive(PanTool.toolName);
-  toolGroup.setToolPassive(ZoomTool.toolName);
-  toolGroup.setToolPassive(StackScrollTool.toolName);
+  // ------------------------------------------------------------------
+  // Activate tools — each on its own mouse button
+  // Multiple tools CAN be active simultaneously as long as they use
+  // different mouse buttons or event sources (e.g., scroll wheel).
+  // ------------------------------------------------------------------
+
+  // WindowLevel — left mouse button (Primary)
+  toolGroup.setToolActive(WindowLevelTool.toolName, {
+    bindings: [{ mouseButton: MouseBindings.Primary }],
+  });
+
+  // Pan — middle mouse button (bitmask 4)
+  toolGroup.setToolActive(PanTool.toolName, {
+    bindings: [{ mouseButton: 4 }],
+  });
+
+  // Zoom — right mouse button (Secondary)
+  toolGroup.setToolActive(ZoomTool.toolName, {
+    bindings: [{ mouseButton: MouseBindings.Secondary }],
+  });
+
+  // StackScroll — drag-based slice navigation
+  toolGroup.setToolActive(StackScrollTool.toolName);
+
+  // StackScrollMouseWheel — wheel-based scrolling for VolumeViewports
+  toolGroup.setToolActive(StackScrollMouseWheelTool.toolName);
 
   console.info(`[ToolGroup] Created: ${toolGroupId}`);
   return toolGroup;
@@ -162,17 +182,22 @@ export function addViewportToToolGroup(
     console.info(`[ToolGroup] Viewport "${viewportId}" added to group "${toolGroupId}"`);
   }
 
-  // Re-apply tool modes so they take effect on the viewport
+  // Re-apply tool modes so they take effect on the new viewport.
+  // Each tool is active on its own mouse button — they coexist safely
+  // because they don't conflict (different buttons / event sources).
   toolGroup.setToolActive(WindowLevelTool.toolName, {
     bindings: [{ mouseButton: MouseBindings.Primary }],
   });
-  toolGroup.setToolPassive(PanTool.toolName);
-  toolGroup.setToolPassive(ZoomTool.toolName);
-  toolGroup.setToolPassive(StackScrollTool.toolName);
-  toolGroup.setToolPassive(LengthTool.toolName);
-  toolGroup.setToolPassive(RectangleROITool.toolName);
-  toolGroup.setToolPassive(EllipticalROITool.toolName);
-  toolGroup.setToolPassive(ProbeTool.toolName);
+  toolGroup.setToolActive(PanTool.toolName, {
+    bindings: [{ mouseButton: 4 }],
+  });
+  toolGroup.setToolActive(ZoomTool.toolName, {
+    bindings: [{ mouseButton: MouseBindings.Secondary }],
+  });
+  // StackScroll — drag-based slice navigation
+  toolGroup.setToolActive(StackScrollTool.toolName);
+  // StackScrollMouseWheel — wheel-based scrolling for VolumeViewports
+  toolGroup.setToolActive(StackScrollMouseWheelTool.toolName);
 }
 
 // ---------------------------------------------------------------------------
@@ -205,10 +230,12 @@ export function setActiveTool(
   toolGroup.setToolPassive(PanTool.toolName);
   toolGroup.setToolPassive(ZoomTool.toolName);
   toolGroup.setToolPassive(StackScrollTool.toolName);
+  toolGroup.setToolPassive(StackScrollMouseWheelTool.toolName);
   toolGroup.setToolPassive(LengthTool.toolName);
   toolGroup.setToolPassive(RectangleROITool.toolName);
   toolGroup.setToolPassive(EllipticalROITool.toolName);
   toolGroup.setToolPassive(ProbeTool.toolName);
+  toolGroup.setToolPassive(SegmentationDisplayTool.toolName);
 
   // Then activate the requested tool
   toolGroup.setToolActive(toolName as any, {
