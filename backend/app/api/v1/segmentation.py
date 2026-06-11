@@ -675,6 +675,7 @@ async def list_available_models():
     """List available segmentation models and the organs they support."""
     from app.ai.totalsegmentator import is_available as ts_available
     from app.ai.nnunet_custom import is_available as nnunet_available
+    from app.ai.nnunet_custom_20 import is_available as nnunet20_available
     return [
         ModelInfoResponse(
             name="totalsegmentator",
@@ -689,6 +690,20 @@ async def list_available_models():
                         "lung, spleen, pancreas, bladder",
             organs=["liver", "kidney", "lung", "spleen", "pancreas", "bladder"],
             status="available" if nnunet_available() else "coming_soon",
+        ),
+        ModelInfoResponse(
+            name="nnunet702_20organs",
+            description="Custom nnUNet (Dataset702_TotalSegOrgans20) — 20 anatomical structures: "
+                        "liver, kidneys, lungs (5 lobes), spleen, pancreas, bladder, "
+                        "adrenal glands, GI tract, gallbladder, trachea",
+            organs=[
+                "left_adrenal_gland", "right_adrenal_gland", "colon", "duodenum",
+                "esophagus", "gallbladder", "left_kidney", "right_kidney", "liver",
+                "left_lung_lower_lobe", "right_lung_lower_lobe", "right_lung_middle_lobe",
+                "left_lung_upper_lobe", "right_lung_upper_lobe", "pancreas",
+                "small_bowel", "spleen", "stomach", "trachea", "urinary_bladder",
+            ],
+            status="available" if nnunet20_available() else "coming_soon",
         ),
         ModelInfoResponse(
             name="unet",

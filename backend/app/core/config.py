@@ -66,10 +66,14 @@ class Settings(BaseSettings):
 
     TOTALSEGMENTATOR_FAST: bool = True
 
-    # Custom nnUNet model (Dataset701_TotalSegOrgans6, user-trained)
+    # Custom nnUNet model — Dataset701 (6-class, user-trained)
     # Points to the nnUNetTrainer__nnUNetPlans__3d_fullres folder
     # containing dataset.json, plans.json, and fold_0/checkpoint_best.pth
     NNUNET_CUSTOM_MODEL_PATH: str = Field(default="/app/models/nnunet_handoff")
+
+    # Custom nnUNet 20-class model — Dataset702 (20 organs, user-trained)
+    # Same nnUNet results folder layout as above.
+    NNUNET_CUSTOM_20_MODEL_PATH: str = Field(default="/app/models/nnunet702_handoff")
 
     # Simulation
     SIMULATION_DEFAULT_SEED: int = 42

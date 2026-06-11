@@ -41,6 +41,20 @@ interface SegmentationLabelDef {
   color: [number, number, number]; // RGB 0-255
 }
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Default peak opacity for segmentation overlay (0..1).
+ *  Lower values make the overlay more transparent so underlying CT
+ *  anatomy (vessels, bronchi, texture) remains visible. */
+const DEFAULT_SEG_OPACITY = 0.25;
+
+/** Half-band width around integer label values in the opacity transfer
+ *  function.  Keeps the function sharp at each label while preventing
+ *  floating-point sampling misses. */
+const LABEL_HALF_BAND = 0.45;
+
 interface VolumeRendererProps {
   /** Render mode: synthetic phantom (default) or real DICOM series */
   mode?: 'synthetic' | 'dicom';
@@ -251,6 +265,7 @@ export function VolumeRenderer({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<PresetName>(initialPreset);
   const [clip, setClip] = useState<ClipState>({ x: 0, y: 0, z: 0 });
+  const [segmentationOpacity, setSegmentationOpacity] = useState(DEFAULT_SEG_OPACITY);
 
   // ------------------------------------------------------------------
   // 1. Initialise vtk.js pipeline
@@ -620,7 +635,6 @@ export function VolumeRenderer({
       // Each label gets its color and partial opacity.
       // Use narrow bands around integer label values so that
       // interpolation between labels stays transparent.
-      const HALF_BAND = 0.45; // sharp but avoids floating-point misses
       for (const label of segmentationLabels) {
         const [r, g, b] = label.color;
         const idx = label.index;
@@ -629,9 +643,9 @@ export function VolumeRenderer({
         segColor.addRGBPoint(idx, r / 255, g / 255, b / 255);
 
         // Opacity: transparent → visible → transparent
-        segOpacity.addPoint(idx - HALF_BAND, 0.0);
-        segOpacity.addPoint(idx, 0.35);        // peak opacity at exact label value
-        segOpacity.addPoint(idx + HALF_BAND, 0.0);
+        segOpacity.addPoint(idx - LABEL_HALF_BAND, 0.0);
+        segOpacity.addPoint(idx, segmentationOpacity);  // peak opacity
+        segOpacity.addPoint(idx + LABEL_HALF_BAND, 0.0);
       }
 
       // ------- segmentation volume actor -------
@@ -681,6 +695,42 @@ export function VolumeRenderer({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segmentationMask, segmentationLabels, isReady]);
+
+  // ------------------------------------------------------------------
+  // 4b. Segmentation opacity live update — when the slider is dragged,
+  //     rebuild only the opacity transfer function (no volume recreation).
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const seg = segRef.current;
+    const state = vtkRef.current;
+    if (!seg || !state || !isReady) return;
+
+    const labels = segmentationLabels;
+    if (!labels || labels.length === 0) return;
+
+    const newOpacity = vtkPiecewiseFunction.newInstance();
+
+    // Background — fully transparent
+    newOpacity.addPoint(-0.5, 0.0);
+    newOpacity.addPoint(0.0, 0.0);
+    newOpacity.addPoint(0.5, 0.0);
+
+    // Each label with the new opacity value
+    for (const label of labels) {
+      if (label.index === 0) continue;
+      newOpacity.addPoint(label.index - LABEL_HALF_BAND, 0.0);
+      newOpacity.addPoint(label.index, segmentationOpacity);
+      newOpacity.addPoint(label.index + LABEL_HALF_BAND, 0.0);
+    }
+
+    // Replace the opacity function on the volume property (live update)
+    seg.volume.getProperty().setScalarOpacity(0, newOpacity);
+    // Store for proper cleanup on next segmentation change
+    seg.piecewiseFunc = newOpacity;
+
+    state.renderWindow.render();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segmentationOpacity, isReady]);
 
   // ------------------------------------------------------------------
   // 5. Handle container resize
@@ -782,6 +832,16 @@ export function VolumeRenderer({
             />
           </div>
 
+          {/* Segmentation opacity slider — only when overlay is active */}
+          {segmentationMask && segmentationLabels && segmentationLabels.length > 0 && (
+            <div className="flex flex-col gap-0.5 rounded bg-black/60 px-2 py-1.5 min-w-[220px]">
+              <SegOpacitySlider
+                value={segmentationOpacity}
+                onChange={setSegmentationOpacity}
+              />
+            </div>
+          )}
+
           {/* Clipping plane sliders */}
           <div className="flex flex-col gap-0.5 rounded bg-black/60 px-2 py-1.5 min-w-[220px]">
             <ClipSlider
@@ -877,5 +937,34 @@ function PresetButton({
     >
       {label}
     </button>
+  );
+}
+
+/** Slider for adjusting segmentation overlay opacity. */
+function SegOpacitySlider({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="w-auto text-[10px] font-medium text-white/70 whitespace-nowrap">
+        Opacity
+      </span>
+      <input
+        type="range"
+        min={0}
+        max={1}
+        step={0.01}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="h-1 flex-1 cursor-pointer accent-primary"
+      />
+      <span className="w-8 text-right text-[10px] tabular-nums text-white/50">
+        {Math.round(value * 100)}%
+      </span>
+    </div>
   );
 }

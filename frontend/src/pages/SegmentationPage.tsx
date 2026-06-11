@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { Button } from '@components/ui/button';
 import { dicomService } from '@services/index';
 import { useSegmentationStore } from '@store/useSegmentationStore';
@@ -39,8 +39,12 @@ export default function SegmentationPage() {
   // ---- Backend data state ----
   const [studies, setStudies] = useState<DicomStudy[]>([]);
   const [seriesList, setSeriesList] = useState<DicomSeries[]>([]);
-  const [selectedStudyId, setSelectedStudyId] = useState<string>('');
-  const [selectedSeriesId, setSelectedSeriesId] = useState<string>('');
+  const [selectedStudyId, setSelectedStudyId] = useState<string>(
+    () => useSegmentationStore.getState().activeStudyId || '',
+  );
+  const [selectedSeriesId, setSelectedSeriesId] = useState<string>(
+    () => useSegmentationStore.getState().activeSeriesId || '',
+  );
   const [studiesLoading, setStudiesLoading] = useState(true);
 
   // ---- Cornerstone state ----
@@ -70,7 +74,10 @@ export default function SegmentationPage() {
     cancelJob,
   } = useSegmentationStore();
 
-  const [selectedModel, setSelectedModel] = useState('unet');
+  const [selectedModel, setSelectedModel] = useState(
+    () => useSegmentationStore.getState().persistedSelectedModel || 'unet'
+  );
+  const persisted = useSegmentationStore((s) => s.persistedMask);
   const [jobRunning, setJobRunning] = useState(false);
   const [activeJob, setActiveJob] = useState<SegmentationJob | null>(null);
 
@@ -84,6 +91,7 @@ export default function SegmentationPage() {
     segState: csSegState,
     loading: segLoading,
     loadMask,
+    restoreMaskFromCache,
     syncVisibilityFromSet,
     clearMask,
     maskData,
@@ -93,6 +101,8 @@ export default function SegmentationPage() {
   const [visibleLabels, setVisibleLabels] = useState<Set<number>>(new Set([1, 2, 3, 4, 5, 6, 7, 8, 9]));
   const [brushActive, setBrushActive] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  // Track which series we last restored from cache — prevents double-restore
+  const cachedSeriesRef = useRef<string | null>(null);
 
   // ==================================================================
   // Init Cornerstone3D once on mount
@@ -128,6 +138,24 @@ export default function SegmentationPage() {
   }, [fetchModels, fetchLabels]);
 
   // ==================================================================
+  // Persist model selection so it survives page navigation
+  // ==================================================================
+  useEffect(() => {
+    useSegmentationStore.getState().setPersistedSelectedModel(selectedModel);
+  }, [selectedModel]);
+
+  // ==================================================================
+  // Persist active study/series to store so they survive tab switches
+  // ==================================================================
+  useEffect(() => {
+    if (selectedStudyId) useSegmentationStore.getState().setActiveStudy(selectedStudyId);
+  }, [selectedStudyId]);
+
+  useEffect(() => {
+    if (selectedSeriesId) useSegmentationStore.getState().setActiveSeries(selectedSeriesId);
+  }, [selectedSeriesId]);
+
+  // ==================================================================
   // Refetch labels when model selection changes
   // ==================================================================
   useEffect(() => {
@@ -157,10 +185,35 @@ export default function SegmentationPage() {
   }, [visibleLabels, csSegState?.loaded, syncVisibilityFromSet]);
 
   // ==================================================================
-  // Clear segmentation mask when model or series changes
+  // Clear segmentation mask when model or series changes.
+  //
+  // IMPORTANT: Skips on first mount if there is cached segmentation
+  // data (surviving a tab switch), so the restoration effect below
+  // can re-create the overlay without a wasteful clear-redraw cycle.
   // ==================================================================
+  const prevModelRef = useRef(selectedModel);
   useEffect(() => {
+    const store = useSegmentationStore.getState();
+
+    // Skip on mount if we have cached data to restore
+    if (store.persistedMask && store.persistedMask.seriesId === selectedSeriesId) {
+      return;
+    }
+
     clearMask();
+
+    // Reset the cached-series guard so switching back will re-restore
+    if (cachedSeriesRef.current && cachedSeriesRef.current !== selectedSeriesId) {
+      cachedSeriesRef.current = null;
+    }
+
+    // On model change: also clear persisted mask because a different
+    // model produces different label indices / names
+    if (prevModelRef.current !== selectedModel) {
+      store.clearPersistedMask();
+      cachedSeriesRef.current = null;
+    }
+    prevModelRef.current = selectedModel;
   }, [selectedModel, selectedSeriesId, clearMask]);
 
   // ==================================================================
@@ -170,8 +223,14 @@ export default function SegmentationPage() {
     if (!selectedStudyId) {
       setSeriesList([]);
       setSelectedSeriesId('');
+      useSegmentationStore.getState().clearPersistedMask();
+      cachedSeriesRef.current = null;
       return;
     }
+
+    // Clear persisted mask when study changes — different anatomy
+    useSegmentationStore.getState().clearPersistedMask();
+    cachedSeriesRef.current = null;
 
     let mounted = true;
     const loadSeries = async () => {
@@ -262,9 +321,35 @@ export default function SegmentationPage() {
   // ==================================================================
   useEffect(() => {
     if (completedJob?.id && completedJob.status === 'completed' && volumeReady && volumeId) {
-      loadMask(completedJob.id, labels.length > 0 ? labels : DEFAULT_LABELS);
+      const maskLabels = labels.length > 0 ? labels : (persisted?.labels ?? DEFAULT_LABELS);
+      loadMask(completedJob.id, maskLabels, completedJob.seriesId);
     }
-  }, [completedJob?.id, completedJob?.status, volumeReady, volumeId, loadMask, labels]);
+  }, [completedJob?.id, completedJob?.status, volumeReady, volumeId, loadMask, labels, persisted]);
+
+  // ==================================================================
+  // Restore segmentation mask from cache when navigating back
+  //
+  // When the user switches away from the Segmentation page and comes
+  // back, the component re-mounts but the mask data (Float32Array)
+  // survives in zustand store. This effect re-creates the Cornerstone3D
+  // labelmap volume from that cached data — no backend download needed.
+  // ==================================================================
+  useEffect(() => {
+    if (!volumeReady || !volumeId) return;
+
+    const p = useSegmentationStore.getState().persistedMask;
+
+    // Only restore if the cached mask belongs to the current series
+    // and we haven't already restored it this mount cycle
+    if (p?.maskData && p.seriesId === selectedSeriesId && cachedSeriesRef.current !== p.seriesId) {
+      cachedSeriesRef.current = p.seriesId;
+      restoreMaskFromCache({
+        jobId: p.jobId,
+        maskData: p.maskData,
+        labels: p.labels.length > 0 ? p.labels : DEFAULT_LABELS,
+      });
+    }
+  }, [volumeReady, volumeId, selectedSeriesId, restoreMaskFromCache]);
 
   // ==================================================================
   // Handle cancel
@@ -274,6 +359,7 @@ export default function SegmentationPage() {
     setJobRunning(false);
     setActiveJob(null);
     clearMask();
+    useSegmentationStore.getState().clearPersistedMask();
   }, [cancelJob, clearMask]);
 
   // ==================================================================
@@ -498,8 +584,8 @@ export default function SegmentationPage() {
               seriesId={selectedSeriesId}
               showControls
               opacityPreset="ct-soft-tissue"
-              segmentationMask={maskData}
-              segmentationLabels={labels.length > 0 ? labels : DEFAULT_LABELS}
+              segmentationMask={maskData ?? persisted?.maskData ?? null}
+              segmentationLabels={(labels.length > 0 ? labels : persisted?.labels) ?? DEFAULT_LABELS}
             />
           ) : (
             <div className="grid h-full w-full grid-cols-2 grid-rows-[1fr_1fr] gap-0.5 bg-black">

@@ -7,6 +7,16 @@ import type {
 import { segmentationService } from '@/services/segmentationService';
 
 /**
+ * Persisted mask data that survives page navigation.
+ */
+interface PersistedMaskData {
+  jobId: string;
+  seriesId: string;
+  maskData: Float32Array | null;
+  labels: SegmentationLabel[];
+}
+
+/**
  * Segmentation Store
  *
  * Global state for AI-powered segmentation module.
@@ -36,6 +46,10 @@ interface SegmentationStore {
   // Polling
   pollIntervalId: number | null;
 
+  // Persisted state (survives page navigation)
+  persistedMask: PersistedMaskData | null;
+  persistedSelectedModel: string;
+
   // Actions
   setActiveStudy: (studyId: string) => void;
   setActiveSeries: (seriesId: string) => void;
@@ -56,6 +70,9 @@ interface SegmentationStore {
   stopPolling: () => void;
   cancelJob: (jobId: string) => Promise<void>;
   removeJob: (jobId: string) => void;
+  setPersistedMask: (data: PersistedMaskData) => void;
+  clearPersistedMask: () => void;
+  setPersistedSelectedModel: (model: string) => void;
   reset: () => void;
 }
 
@@ -73,6 +90,8 @@ export const useSegmentationStore = create<SegmentationStore>((set, get) => ({
   activeJobs: [],
   completedJobs: [],
   pollIntervalId: null,
+  persistedMask: null,
+  persistedSelectedModel: 'unet',
 
   setActiveStudy: (studyId) => set({ activeStudyId: studyId }),
   setActiveSeries: (seriesId) => set({ activeSeriesId: seriesId }),
@@ -206,6 +225,12 @@ export const useSegmentationStore = create<SegmentationStore>((set, get) => ({
       activeJobs: state.activeJobs.filter((j) => j.id !== jobId),
       completedJobs: state.completedJobs.filter((j) => j.id !== jobId),
     })),
+
+  setPersistedMask: (data) => set({ persistedMask: data }),
+
+  clearPersistedMask: () => set({ persistedMask: null }),
+
+  setPersistedSelectedModel: (model) => set({ persistedSelectedModel: model }),
 
   reset: () => {
     get().stopPolling();

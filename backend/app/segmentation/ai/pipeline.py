@@ -106,6 +106,30 @@ def run_full_segmentation(
         # This model does not do lesion detection
         detect_lesions = False
 
+    elif model_name and model_name.lower() in ("nnunet702_20organs",):
+        # --- Custom nnUNet 20-class path (Dataset702_TotalSegOrgans20, 20 organs) ---
+        logger.info("[PIPELINE] Job %s: calling custom nnUNet 20-class (model=%s)...", job_id, model_name)
+        try:
+            from app.ai.nnunet_custom_20 import run_nnunet_custom_20, is_available as nnunet20_available
+            if not nnunet20_available():
+                raise RuntimeError(
+                    f"Custom nnUNet 20-class model not found at "
+                    f"{settings.NNUNET_CUSTOM_20_MODEL_PATH}. "
+                    "Verify the model directory is mounted in Docker."
+                )
+            # Use merge_to_6=False to keep all 20 classes for the frontend;
+            # set to True if the frontend expects the old 6-class scheme.
+            label_map = run_nnunet_custom_20(
+                volume=volume,
+                spacing=spacing,
+                merge_to_6=False,
+            )
+        except Exception as e:
+            logger.error("[PIPELINE] Job %s: custom nnUNet 20-class FAILED: %s", job_id, e, exc_info=True)
+            raise
+
+        detect_lesions = False
+
     elif model_name and model_name.lower() == "totalsegmentator":
         # --- TotalSegmentator path (pretrained, 117 structures) ---
         logger.info("[PIPELINE] Job %s: calling TotalSegmentator (model=%s)...", job_id, model_name)

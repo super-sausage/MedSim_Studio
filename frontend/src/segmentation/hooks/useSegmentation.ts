@@ -30,6 +30,7 @@ import {
 import { segmentationService } from '@/services/segmentationService';
 import { parseNrrd, type NrrdVolume } from '../utils/nrrdParser';
 import type { SegmentationLabel } from '@/types/segmentation';
+import { useSegmentationStore } from '@/store/useSegmentationStore';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -94,7 +95,7 @@ export function useSegmentation(ctVolumeId: string | undefined) {
    * 4. Register with Cornerstone3D segmentation system
    */
   const loadMask = useCallback(
-    async (jobId: string, labels: SegmentationLabel[]) => {
+    async (jobId: string, labels: SegmentationLabel[], seriesId?: string) => {
       if (!ctVolumeId) {
         setError('No CT volume ID available — cannot load segmentation');
         return;
@@ -145,8 +146,11 @@ export function useSegmentation(ctVolumeId: string | undefined) {
         }
 
         // ---- Step 4: Create labelmap volume ----
-        const segmentationId = `${SEGMENTATION_ID_PREFIX}-${jobId}`;
-        const labelmapVolumeId = `labelmap-${segmentationId}`;
+        // Use a unique ID per load (timestamp suffix) to avoid conflicts with
+        // any lingering Cornerstone3D state from a previous page visit.
+        const segLoadId = `${SEGMENTATION_ID_PREFIX}-${jobId}-${Date.now()}`;
+        const segmentationId = segLoadId;
+        const labelmapVolumeId = `labelmap-${segLoadId}`;
 
         // Create a derived volume with same geometry as the CT volume
         const labelmapVolume = await volumeLoader.createAndCacheDerivedVolume(
@@ -233,13 +237,22 @@ export function useSegmentation(ctVolumeId: string | undefined) {
         // Convert Int32Array → Float32Array for VTK 3D volume rendering
         const maskFloat = new Float32Array(nrrd.data);
 
-        setSegState({
+        const segStateVal = {
           segmentationId,
           labelmapVolumeId,
           representationUID,
           labels,
           loaded: true,
           maskData: maskFloat,
+        };
+        setSegState(segStateVal);
+
+        // Persist to zustand store so mask data survives page navigation
+        useSegmentationStore.getState().setPersistedMask({
+          jobId,
+          seriesId: seriesId ?? useSegmentationStore.getState().activeSeriesId ?? '',
+          maskData: maskFloat,
+          labels,
         });
 
         setLoading(false);
@@ -250,6 +263,163 @@ export function useSegmentation(ctVolumeId: string | undefined) {
       } catch (err: any) {
         if (!cancelledRef.current) {
           const msg = err?.message ?? 'Failed to load segmentation mask';
+          setError(msg);
+          setLoading(false);
+          console.error('[useSegmentation]', msg);
+        }
+      }
+    },
+    [ctVolumeId],
+  );
+
+  /**
+   * Restore a segmentation mask from cached data in the zustand store.
+   *
+   * This is identical to `loadMask` but uses previously-downloaded mask data
+   * (Float32Array) instead of re-fetching the NRRD from the backend.
+   * Called when the user navigates back to the Segmentation page after
+   * having already completed a segmentation run.
+   */
+  const restoreMaskFromCache = useCallback(
+    async (cached: {
+      jobId: string;
+      maskData: Float32Array;
+      labels: SegmentationLabel[];
+    }) => {
+      if (!ctVolumeId) {
+        setError('No CT volume ID available — cannot restore segmentation');
+        return;
+      }
+
+      // Clear any previous segmentation first
+      const prevState = segStateRef.current;
+      if (prevState) {
+        await clearSegmentation(prevState.representationUID);
+      }
+
+      cancelledRef.current = false;
+      setLoading(true);
+      setError(null);
+
+      try {
+        // ---- Step 1: Check the source volume exists ----
+        const sourceVolume = cache.getVolume(ctVolumeId);
+        if (!sourceVolume) {
+          throw new Error(
+            `CT volume "${ctVolumeId}" not found in cache. ` +
+            'Ensure the volume is loaded before calling restoreMaskFromCache().'
+          );
+        }
+
+        const dimensions = sourceVolume.dimensions;
+
+        const numVoxels = cached.maskData.length;
+        const expectedVoxels = dimensions[0] * dimensions[1] * dimensions[2];
+        if (numVoxels !== expectedVoxels) {
+          console.warn(
+            `[useSegmentation] Cached mask data size mismatch: ` +
+            `${numVoxels} voxels, CT volume has ${expectedVoxels}. ` +
+            `Attempting to proceed, but alignment may be incorrect.`
+          );
+        }
+
+        // ---- Step 2: Create labelmap volume ----
+        const segLoadId = `${SEGMENTATION_ID_PREFIX}-cached-${cached.jobId}-${Date.now()}`;
+        const segmentationId = segLoadId;
+        const labelmapVolumeId = `labelmap-${segLoadId}`;
+
+        const labelmapVolume = await volumeLoader.createAndCacheDerivedVolume(
+          ctVolumeId,
+          { volumeId: labelmapVolumeId }
+        );
+        if (cancelledRef.current) {
+          cache.removeVolumeLoadObject(labelmapVolumeId);
+          return;
+        }
+
+        // Fill with cached label data
+        const scalarData = labelmapVolume.getScalarData();
+        if (scalarData) {
+          scalarData.set(cached.maskData);
+        }
+        labelmapVolume.modified();
+
+        // ---- Step 3: Register with Cornerstone3D segmentation system ----
+        csSegmentation.addSegmentations([
+          {
+            segmentationId,
+            representation: {
+              type: csToolsEnums.SegmentationRepresentations.Labelmap,
+              data: {
+                volumeId: labelmapVolumeId,
+              },
+            },
+          },
+        ]);
+
+        const representationUIDs =
+          await csSegmentation.addSegmentationRepresentations(
+            TOOL_GROUP_ID,
+            [
+              {
+                segmentationId,
+                type: csToolsEnums.SegmentationRepresentations.Labelmap,
+              },
+            ],
+          );
+
+        const representationUID = representationUIDs?.[0] ?? '';
+
+        // ---- Step 4: Apply label colors ----
+        for (const label of cached.labels) {
+          const [r, g, b] = label.color;
+          csSegmentation.config.color.setColorForSegmentIndex(
+            TOOL_GROUP_ID,
+            representationUID,
+            label.index,
+            [r, g, b, 255],
+          );
+        }
+        csSegmentation.config.color.setColorForSegmentIndex(
+          TOOL_GROUP_ID,
+          representationUID,
+          0,
+          [0, 0, 0, 0],
+        );
+
+        // ---- Step 5: Set initial segment visibility ----
+        for (const label of cached.labels) {
+          csSegmentation.config.visibility.setSegmentVisibility(
+            TOOL_GROUP_ID,
+            representationUID,
+            label.index,
+            true,
+          );
+        }
+
+        if (cancelledRef.current) {
+          csSegmentation.removeSegmentationsFromToolGroup(TOOL_GROUP_ID, [representationUID]);
+          return;
+        }
+
+        const segStateVal = {
+          segmentationId,
+          labelmapVolumeId,
+          representationUID,
+          labels: cached.labels,
+          loaded: true,
+          maskData: cached.maskData,
+        };
+        setSegState(segStateVal);
+
+        setLoading(false);
+        console.info(
+          `[useSegmentation] Restored mask for job ${cached.jobId} from cache: ` +
+          `${cached.labels.length} segments, ${numVoxels} voxels`
+        );
+      } catch (err: any) {
+        if (!cancelledRef.current) {
+          const msg = err?.message ?? 'Failed to restore segmentation from cache';
           setError(msg);
           setLoading(false);
           console.error('[useSegmentation]', msg);
@@ -318,6 +488,12 @@ export function useSegmentation(ctVolumeId: string | undefined) {
 
   /**
    * Remove the segmentation from Cornerstone3D and free resources.
+   *
+   * NOTE: Does NOT clear the persisted mask in the zustand store —
+   *       that is left to the component so the data survives page
+   *       navigation / tab switches. Call clearPersistedMask() from
+   *       the store directly when the user explicitly clears or picks
+   *       a different series.
    */
   const clearMask = useCallback(async () => {
     const state = segStateRef.current;
@@ -344,6 +520,8 @@ export function useSegmentation(ctVolumeId: string | undefined) {
     error,
     /** Load a completed job's mask */
     loadMask,
+    /** Restore a previously cached mask (survives tab switches) */
+    restoreMaskFromCache,
     /** Toggle a single label index on/off */
     setSegmentVisibility,
     /** Make all segments visible or hidden */

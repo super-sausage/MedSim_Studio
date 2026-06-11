@@ -64,6 +64,10 @@ htmlcov/
 # TotalSegmentator pretrained weights (~2GB) — auto-downloaded
 models/totalsegmentator/
 
+# Custom nnUNet model weights (large binary files, not tracked in git)
+models/nnunet702_handoff/
+models/nnunet702_organs20_teammate_handoff/
+
 # Claude Code project settings
 .claude/
 
