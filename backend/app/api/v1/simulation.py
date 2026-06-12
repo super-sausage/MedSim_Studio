@@ -3,17 +3,21 @@ Simulation API
 
 RESTful endpoints for lesion and organ simulation management.
 Provides job creation, status tracking, preview generation,
-and result export for synthetic medical image generation.
+CT phantom generation, and result export for synthetic medical image generation.
 """
 
 import os
+import base64
 import uuid
 import tempfile
 import logging
 from typing import List, Optional
 from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+
+import numpy as np
 
 from app.database.session import get_db, SessionLocal
 from app.models.simulation import SimulationJob, LesionConfig, OrganConfig
@@ -28,6 +32,10 @@ from app.simulation.lesion.generator import LesionGenerator
 from app.simulation.organ.simulator import OrganSimulator
 from app.simulation.volume_builder import build_volume_from_dicom, build_synthetic_volume
 from app.simulation.exporter import export_nrrd, export_nifti, export_dicom_zip
+from app.simulation.phantom_generator import (
+    generate_upper_body_ct_phantom,
+    generate_atlas_ct_phantom,
+)
 from app.dicom.storage import get_storage_backend
 
 logger = logging.getLogger(__name__)
@@ -424,6 +432,110 @@ async def preview_lesion(config: dict):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Preview generation failed: {str(e)}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# CT Phantom — synthetic upper-body CT volume for frontend demo
+# ---------------------------------------------------------------------------
+
+
+@router.get("/phantom")
+async def generate_ct_phantom(
+    source: str = Query("procedural", description="Phantom source: 'procedural' or 'atlas'"),
+    size: int = Query(192, ge=64, le=320, description="Volume max edge size in voxels"),
+    case_id: str = Query("s0001", description="Atlas case ID (only used when source='atlas')"),
+    scan_direction: str = Query(
+        "head_to_feet",
+        description="Z-axis scan direction: 'head_to_feet' (z=0=head/chest) or 'feet_to_head'",
+    ),
+):
+    """
+    Generate a CT phantom and return it as base64-encoded volume data.
+
+    Two sources are supported:
+
+    - **procedural** (default):
+      Synthetic upper-body CT phantom built from geometric primitives
+      (ellipses, arcs).  NOT a real medical image — suitable for UI
+      development and demo.
+
+    - **atlas**:
+      Loads a real CT volume from models/phantom_atlas/{case_id}/.
+      The CT is resampled so its largest dimension ≤ size.  If an
+      organs_label.nii.gz file is present it is converted to a uint8
+      label map and returned alongside the CT volume.
+
+      The z-axis direction is auto-detected from the NIfTI affine header.
+      If it doesn't match `scan_direction` (default: head_to_feet), the
+      volume is flipped so z=0 corresponds to the head/chest.
+
+    Returns:
+        JSON with:
+        - volumeBase64:  base64-encoded raw Float32 bytes (little-endian)
+        - labelBase64:   base64-encoded raw Uint8 bytes (optional, atlas only)
+        - metadata:      {width, height, depth, spacing, source, case_id?,
+                          originalShape, outputShape, originalSpacing,
+                          outputSpacing, scanAxis, scanDirection, flippedZ,
+                          labelNonzeroCounts?, sliceLabelPresence?,
+                          label_map?, windowPresets, bodyThresholdHU}
+    """
+    try:
+        if source == "atlas":
+            ct_volume, label_volume, metadata = generate_atlas_ct_phantom(
+                case_id=case_id,
+                size=size,
+                scan_direction=scan_direction,
+            )
+
+            # Encode CT volume
+            raw_bytes = ct_volume.astype(np.float32).tobytes()
+            volume_b64 = base64.b64encode(raw_bytes).decode("ascii")
+
+            response_content: dict = {
+                "volume_base64": volume_b64,
+                "metadata": metadata,
+            }
+
+            # Encode label volume (if present)
+            if label_volume is not None:
+                label_bytes = label_volume.astype(np.uint8).tobytes()
+                label_b64 = base64.b64encode(label_bytes).decode("ascii")
+                response_content["label_base64"] = label_b64
+            else:
+                response_content["label_base64"] = None
+
+            return JSONResponse(content=response_content)
+
+        else:
+            # --- procedural (default) ---
+            shape = (size, size, size)
+            volume, metadata = generate_upper_body_ct_phantom(shape=shape)
+
+            raw_bytes = volume.astype(np.float32).tobytes()
+            volume_b64 = base64.b64encode(raw_bytes).decode("ascii")
+
+            metadata["source"] = "procedural"
+
+            return JSONResponse(
+                content={
+                    "volume_base64": volume_b64,
+                    "label_base64": None,
+                    "metadata": metadata,
+                }
+            )
+
+    except FileNotFoundError as e:
+        logger.warning("Phantom generation — file not found: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.exception("Failed to generate CT phantom")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Phantom generation failed: {str(e)}",
         )
 
 

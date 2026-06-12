@@ -68,6 +68,43 @@ interface VolumeRendererProps {
   segmentationMask?: Float32Array | null;
   /** Label definitions for coloring the segmentation mask */
   segmentationLabels?: SegmentationLabelDef[] | null;
+  /**
+   * External volume data for synthetic mode.
+   * When provided with mode='synthetic', this replaces the built-in
+   * 64³ phantom. scalarData must be a Float32Array of HU values
+   * in [x, y, z] fast-axis order (x fastest).
+   */
+  syntheticData?: Float32Array | null;
+  /** Dimensions [x, y, z] for syntheticData (required if syntheticData given) */
+  syntheticDims?: [number, number, number] | null;
+  /** Spacing [x, y, z] in mm for syntheticData */
+  syntheticSpacing?: [number, number, number] | null;
+  /**
+   * Progressive-scan clip index (0-based).
+   * When set, only voxels along the scan axis at indices 0..clipIndex
+   * are visible; indices beyond are clipped away.  Used to simulate
+   * a CT scan that builds up slice-by-slice from top to bottom.
+   * Undefined / -1 disables scan clipping (full volume shown).
+   */
+  syntheticClipIndex?: number;
+  /**
+   * Axis along which the progressive scan proceeds.
+   * 'x', 'y', or 'z' — defaults to 'z' (superior→inferior for CT phantom).
+   */
+  syntheticScanAxis?: 'x' | 'y' | 'z';
+  /**
+   * Enable head-to-feet scan view mode.
+   * When true, the camera is oriented so the Z axis (head→feet direction)
+   * points downward on screen, making the progressive scan appear to build
+   * from top (head/chest) to bottom (abdomen/pelvis).
+   * Also enables the scan-plane overlay and direction labels.
+   */
+  scanView?: boolean;
+  /**
+   * Scan direction label — used for the overlay text.
+   * 'head_to_feet' (default) or 'feet_to_head'.
+   */
+  scanDirection?: 'head_to_feet' | 'feet_to_head';
 }
 
 /** Shape of a transfer function preset */
@@ -233,6 +270,13 @@ export function VolumeRenderer({
   showControls = false,
   segmentationMask,
   segmentationLabels,
+  syntheticData,
+  syntheticDims,
+  syntheticSpacing,
+  syntheticClipIndex,
+  syntheticScanAxis = 'z',
+  scanView = false,
+  scanDirection = 'head_to_feet',
 }: VolumeRendererProps) {
   // ---- DOM ref ----
   const containerRef = useRef<HTMLDivElement>(null);
@@ -303,13 +347,29 @@ export function VolumeRenderer({
             origin: dicomVol.origin,
           };
         } else {
-          // ---- synthetic phantom (Phase 1) ----
-          volData = {
-            scalarData: generateSyntheticVolume(),
-            dimensions: [64, 64, 64],
-            spacing: [1, 1, 1],
-            origin: [-32, -32, -32],
-          };
+          // ---- synthetic phantom ----
+          if (syntheticData && syntheticDims) {
+            // External phantom data provided (e.g. from backend CT phantom API)
+            const sp = syntheticSpacing || [1, 1, 1];
+            volData = {
+              scalarData: syntheticData,
+              dimensions: syntheticDims,
+              spacing: sp,
+              origin: [
+                -(syntheticDims[0] * sp[0]) / 2,
+                -(syntheticDims[1] * sp[1]) / 2,
+                -(syntheticDims[2] * sp[2]) / 2,
+              ],
+            };
+          } else {
+            // Built-in 64³ phantom (legacy / demo)
+            volData = {
+              scalarData: generateSyntheticVolume(),
+              dimensions: [64, 64, 64],
+              spacing: [1, 1, 1],
+              origin: [-32, -32, -32],
+            };
+          }
         }
 
         if (cancelled) return;
@@ -367,6 +427,27 @@ export function VolumeRenderer({
 
         renderer.addVolume(volume);
         renderer.resetCamera();
+
+        // ------- Scan-view camera orientation -------
+        // When scanView is enabled, orient the camera so the progressive
+        // scan builds from TOP (head/chest) to BOTTOM (abdomen/pelvis).
+        // We position the camera in +Y (anterior) and set viewUp to -Z,
+        // which makes +Z (the head→feet axis) point downward on screen.
+        if (scanView) {
+          const camera = renderer.getActiveCamera();
+          const fp = camera.getFocalPoint();
+          const pos = camera.getPosition();
+          const dist = Math.sqrt(
+            (pos[0] - fp[0]) ** 2 +
+            (pos[1] - fp[1]) ** 2 +
+            (pos[2] - fp[2]) ** 2,
+          );
+          // Camera from anterior (+Y), looking at volume center
+          camera.setPosition(fp[0], fp[1] + dist, fp[2]);
+          // -Z is screen-up → +Z (head→feet) is screen-down
+          camera.setViewUp(0, 0, -1);
+          renderer.resetCameraClippingRange();
+        }
 
         // ------- mouse interaction -------
         const interactor = vtkRenderWindowInteractor.newInstance();
@@ -477,7 +558,7 @@ export function VolumeRenderer({
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, seriesId]);
+  }, [mode, seriesId, syntheticData, syntheticDims, syntheticSpacing]);
 
   // ------------------------------------------------------------------
   // 2. Handle preset changes (update transfer functions in-place)
@@ -501,7 +582,7 @@ export function VolumeRenderer({
   }, [activePreset, isReady]);
 
   // ------------------------------------------------------------------
-  // 3. Clipping plane management — rebuild planes when clip state changes
+  // 3. Clipping plane management — user clips + progressive scan clip
   // ------------------------------------------------------------------
   useEffect(() => {
     const state = vtkRef.current;
@@ -514,7 +595,8 @@ export function VolumeRenderer({
     // bounds: [xMin, xMax, yMin, yMax, zMin, zMax]
     const activePlanes: any[] = [];
 
-    // ---- X axis (normal points +X, clip negative side) ----
+    // ---- User clipping planes (slider-controlled) ----
+    // X axis (normal points +X, clip negative side)
     if (clip.x > 0) {
       const xPos = bounds[0] + clip.x * (bounds[1] - bounds[0]);
       activePlanes.push(
@@ -522,7 +604,7 @@ export function VolumeRenderer({
       );
     }
 
-    // ---- Y axis (normal points +Y, clip negative side) ----
+    // Y axis (normal points +Y, clip negative side)
     if (clip.y > 0) {
       const yPos = bounds[2] + clip.y * (bounds[3] - bounds[2]);
       activePlanes.push(
@@ -530,12 +612,47 @@ export function VolumeRenderer({
       );
     }
 
-    // ---- Z axis (normal points +Z, clip negative side) ----
+    // Z axis (normal points +Z, clip negative side)
     if (clip.z > 0) {
       const zPos = bounds[4] + clip.z * (bounds[5] - bounds[4]);
       activePlanes.push(
         vtkPlane.newInstance({ normal: [0, 0, 1], origin: [0, 0, zPos] }),
       );
+    }
+
+    // ---- Progressive scan clipping ----
+    // Hides voxels with data-index > clipIndex along the scan axis.
+    // A plane whose normal points NEGATIVE clips the POSITIVE side,
+    // so voxels after the clip position are hidden.
+    if (
+      syntheticClipIndex !== undefined &&
+      syntheticClipIndex >= 0 &&
+      syntheticScanAxis
+    ) {
+      const dims = imageData.getDimensions();   // [x, y, z]
+      const spacing = imageData.getSpacing();   // [x, y, z]
+      const origin = imageData.getOrigin();      // [x, y, z]
+
+      const axisIdx = syntheticScanAxis === 'x' ? 0
+        : syntheticScanAxis === 'y' ? 1 : 2;
+      const axisDim = dims[axisIdx];
+
+      // Only add plane when we haven't reached the final slice yet
+      if (syntheticClipIndex < axisDim - 1) {
+        // Position the plane just past the last visible slice
+        const clipWorld =
+          origin[axisIdx] + (syntheticClipIndex + 0.5) * spacing[axisIdx];
+
+        const normal: [number, number, number] = [0, 0, 0];
+        normal[axisIdx] = -1; // negative normal → clips positive side
+
+        const planeOrigin: [number, number, number] = [0, 0, 0];
+        planeOrigin[axisIdx] = clipWorld;
+
+        activePlanes.push(
+          vtkPlane.newInstance({ normal, origin: planeOrigin }),
+        );
+      }
     }
 
     mapper.removeAllClippingPlanes();
@@ -544,7 +661,7 @@ export function VolumeRenderer({
     }
     renderWindow.render();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clip, isReady]);
+  }, [clip, syntheticClipIndex, syntheticScanAxis, isReady]);
 
   // ------------------------------------------------------------------
   // 4. Segmentation overlay — add/remove a second volume for mask
@@ -804,6 +921,49 @@ export function VolumeRenderer({
         className="h-full w-full"
         style={{ opacity: isReady ? 1 : 0 }}
       />
+
+      {/* ---- Scan-view overlays (scan plane + direction labels) ---- */}
+      {scanView && isReady && syntheticDims && syntheticClipIndex !== undefined && syntheticClipIndex >= 0 && (() => {
+        const axisIdx = syntheticScanAxis === 'x' ? 0 : syntheticScanAxis === 'y' ? 1 : 2;
+        const totalDepth = syntheticDims[axisIdx];
+        const scanFraction = totalDepth > 1
+          ? (syntheticClipIndex + 0.5) / totalDepth
+          : 0;
+        const topPct = scanFraction * 100;
+        const isHeadFirst = scanDirection === 'head_to_feet';
+        const topLabel = isHeadFirst ? 'TOP / Head-Chest' : 'TOP / Abdomen-Pelvis';
+        const bottomLabel = isHeadFirst ? 'BOTTOM / Abdomen-Pelvis' : 'BOTTOM / Head-Chest';
+        return (
+          <>
+            {/* Direction labels */}
+            <div className="pointer-events-none absolute inset-x-0 top-1 z-10 flex justify-center">
+              <span className="rounded bg-black/60 px-2 py-0.5 text-[10px] font-medium text-cyan-300/80">
+                ▲ {topLabel}
+              </span>
+            </div>
+            <div className="pointer-events-none absolute inset-x-0 bottom-1 z-10 flex justify-center">
+              <span className="rounded bg-black/60 px-2 py-0.5 text-[10px] font-medium text-cyan-300/80">
+                ▼ {bottomLabel}
+              </span>
+            </div>
+
+            {/* Scan plane — horizontal cyan line at current clip position */}
+            <div
+              className="pointer-events-none absolute inset-x-0 z-10"
+              style={{ top: `${topPct}%` }}
+            >
+              {/* Glow line */}
+              <div className="h-px w-full bg-cyan-400/60 shadow-[0_0_8px_2px_rgba(34,211,238,0.4)]" />
+              {/* Scan arrow indicator on the right side */}
+              <div className="absolute right-2 -translate-y-1/2">
+                <span className="text-[9px] text-cyan-300/70 tabular-nums">
+                  slice {syntheticClipIndex + 1}/{totalDepth}
+                </span>
+              </div>
+            </div>
+          </>
+        );
+      })()}
 
       {/* Controls overlay */}
       {showControls && isReady && (

@@ -62,6 +62,8 @@ services:
       - TOTALSEGMENTATOR_DIR=/app/models/totalsegmentator
       # TOTALSEGMENTATOR_FAST: true = 3mm fast model, false = 1.5mm full model (5 models, higher accuracy, slower)
       - TOTALSEGMENTATOR_FAST=false
+      # Atlas phantom root — so the backend can find models/phantom_atlas/
+      - MEDSIM_PROJECT_ROOT=/app
     volumes:
       - backend_uploads:/tmp/uploads
       - backend_models:/app/ai-models
@@ -72,6 +74,8 @@ services:
       - ./models/nnunet701_full_handoff/nnunet_handoff/model/Dataset701_TotalSegOrgans6/nnUNetTrainer__nnUNetPlans__3d_fullres:/app/models/nnunet_handoff
       # Mount custom-trained nnUNet 20-class model (Dataset702_TotalSegOrgans20)
       - ./models/nnunet702_handoff:/app/models/nnunet702_handoff
+      # Mount phantom atlas data (real CT volumes for demo, not tracked in git)
+      - ./models/phantom_atlas:/app/models/phantom_atlas
     # TotalSegmentator uses PyTorch DataLoader multiprocessing workers
     # which require large /dev/shm for inter-process communication.
     # Default 64MB is far too small; allocate 8GB.

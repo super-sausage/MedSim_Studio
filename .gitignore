@@ -68,6 +68,9 @@ models/totalsegmentator/
 models/nnunet702_handoff/
 models/nnunet702_organs20_teammate_handoff/
 
+# Phantom atlas data (real CT volumes for demo, not tracked in git)
+models/phantom_atlas/
+
 # Claude Code project settings
 .claude/
 
