@@ -71,3 +71,25 @@ class SimulationPreviewResponse(BaseModel):
     preview_data: dict
     voxel_count: int
     hu_range: tuple
+
+
+class DicomLesionPreviewRequest(BaseModel):
+    """Request to preview a lesion on a real DICOM series."""
+    series_id: str
+    lesion: LesionConfigCreate
+    window_center: float = 40
+    window_width: float = 400
+
+
+class DicomLesionPreviewResponse(BaseModel):
+    """Response with base64-encoded preview image and HU stats."""
+    image_base64: str
+    slice_index: int
+    total_slices: int
+    lesion_center_voxel: list
+    hu_min: float
+    hu_max: float
+    hu_mean: float
+    hu_std: float
+    voxel_count: int
+    volume_mm3: float

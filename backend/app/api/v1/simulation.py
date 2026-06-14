@@ -7,6 +7,7 @@ CT phantom generation, and result export for synthetic medical image generation.
 """
 
 import os
+import io
 import base64
 import uuid
 import tempfile
@@ -16,6 +17,7 @@ from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from PIL import Image
 
 import numpy as np
 
@@ -27,6 +29,8 @@ from app.schemas.simulation import (
     SimulationJobCreate,
     LesionConfigResponse,
     SimulationPreviewResponse,
+    DicomLesionPreviewRequest,
+    DicomLesionPreviewResponse,
 )
 from app.simulation.lesion.generator import LesionGenerator
 from app.simulation.organ.simulator import OrganSimulator
@@ -136,13 +140,20 @@ def run_simulation_job(job_id: str) -> None:
         )
         if lesion_configs:
             lesion_gen = LesionGenerator()
+            spacing = metadata.get("spacing")
             for lc in lesion_configs:
+                # Normalize center: if all zeros (frontend default), place at volume center
+                cz, cy, cx = lc.center_z, lc.center_y, lc.center_x
+                if cz == 0.0 and cy == 0.0 and cx == 0.0:
+                    cz = float(result_volume.shape[0] // 2)
+                    cy = float(result_volume.shape[1] // 2)
+                    cx = float(result_volume.shape[2] // 2)
                 config_dict = {
                     "lesion_type": lc.lesion_type,
                     "shape": lc.shape,
-                    "center_x": lc.center_x,
-                    "center_y": lc.center_y,
-                    "center_z": lc.center_z,
+                    "center_x": cx,
+                    "center_y": cy,
+                    "center_z": cz,
                     "radius_x": lc.radius_x,
                     "radius_y": lc.radius_y,
                     "radius_z": lc.radius_z,
@@ -156,6 +167,7 @@ def run_simulation_job(job_id: str) -> None:
                 lesion_vol = lesion_gen.generate_lesion(
                     volume_shape=result_volume.shape,
                     config=config_dict,
+                    spacing=spacing,
                 )
                 result_volume = result_volume + lesion_vol
                 logger.info(
@@ -422,6 +434,169 @@ async def preview_lesion(config: dict):
     try:
         generator = LesionGenerator()
         preview = generator.generate_preview(config)
+        return SimulationPreviewResponse(
+            job_id=str(uuid.uuid4()),
+            preview_data=preview,
+            voxel_count=preview.get("voxel_count", 0),
+            hu_range=(preview.get("hu_min", 0), preview.get("hu_max", 0)),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Preview generation failed: {str(e)}",
+        )
+
+
+@router.post("/preview/lesion-on-dicom", response_model=DicomLesionPreviewResponse)
+async def preview_lesion_on_dicom(
+    request: DicomLesionPreviewRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Preview a lesion overlaid on a real DICOM series.
+
+    Loads the DICOM series from storage, generates the lesion on it,
+    and returns a base64-encoded side-by-side PNG (original | with lesion)
+    of the axial slice through the lesion center.
+
+    Synchronous — intended for interactive parameter tuning.
+    """
+    try:
+        # ── 1. Load DICOM instances ──
+        instances = (
+            db.query(DicomInstance)
+            .filter(DicomInstance.series_id == request.series_id)
+            .order_by(DicomInstance.instance_number.asc().nulls_last())
+            .all()
+        )
+        if not instances:
+            raise HTTPException(status_code=404, detail=f"Series {request.series_id} not found")
+
+        storage = get_storage_backend()
+        volume, metadata = build_volume_from_dicom(storage, instances)
+
+        # ── 2. Generate lesion ──
+        generator = LesionGenerator()
+        lesion_cfg = request.lesion
+
+        # Normalize center: if all zeros (frontend default), place at volume center
+        cz, cy, cx = lesion_cfg.center_z, lesion_cfg.center_y, lesion_cfg.center_x
+        if cz == 0.0 and cy == 0.0 and cx == 0.0:
+            cz = float(volume.shape[0] // 2)
+            cy = float(volume.shape[1] // 2)
+            cx = float(volume.shape[2] // 2)
+
+        config_dict = {
+            "lesion_type": lesion_cfg.lesion_type,
+            "shape": lesion_cfg.shape,
+            "center_x": cx,
+            "center_y": cy,
+            "center_z": cz,
+            "radius_x": lesion_cfg.radius_x,
+            "radius_y": lesion_cfg.radius_y,
+            "radius_z": lesion_cfg.radius_z,
+            "hu_mean": lesion_cfg.hu_mean,
+            "hu_std": lesion_cfg.hu_std,
+            "margin_sharpness": lesion_cfg.margin_sharpness,
+            "calcification_fraction": lesion_cfg.calcification_fraction,
+            "necrosis_fraction": lesion_cfg.necrosis_fraction,
+            "spiculation_degree": lesion_cfg.spiculation_degree,
+        }
+        spacing = metadata.get("spacing")
+        lesion_vol = generator.generate_lesion(
+            volume_shape=volume.shape,
+            config=config_dict,
+            spacing=spacing,
+        )
+        result_volume = volume + lesion_vol
+
+        # ── 3. Compute lesion region stats ──
+        lesion_mask = lesion_vol != 0
+        if lesion_mask.any():
+            hu_values = result_volume[lesion_mask]
+            stats_voxels = int(np.sum(lesion_mask))
+            stats_hu_min = float(np.min(hu_values))
+            stats_hu_max = float(np.max(hu_values))
+            stats_hu_mean = float(np.mean(hu_values))
+            stats_hu_std = float(np.std(hu_values))
+            spacing = metadata.get("spacing", (1.0, 1.0, 1.0))
+            voxel_vol_mm3 = spacing[0] * spacing[1] * spacing[2]
+            stats_volume_mm3 = float(stats_voxels * voxel_vol_mm3)
+        else:
+            stats_voxels = 0
+            stats_hu_min = stats_hu_max = stats_hu_mean = stats_hu_std = 0.0
+            stats_volume_mm3 = 0.0
+
+        # ── 4. Find the slice closest to the lesion center ──
+        cz_idx = int(round(cz))
+        cz_idx = max(0, min(cz_idx, volume.shape[0] - 1))
+
+        # ── 5. Render side-by-side preview PNG ──
+        wc = request.window_center
+        ww = request.window_width
+        half = ww / 2.0
+        lower = wc - half
+        upper = wc + half
+
+        def slice_to_8bit(slice_2d: np.ndarray) -> np.ndarray:
+            return np.clip((slice_2d - lower) / ww * 255, 0, 255).astype(np.uint8)
+
+        before_slice = slice_to_8bit(volume[cz_idx, :, :])
+        after_slice = slice_to_8bit(result_volume[cz_idx, :, :])
+
+        # Side-by-side
+        h, w = before_slice.shape
+        combined = np.zeros((h, w * 2 + 4), dtype=np.uint8)
+        combined[:, :w] = before_slice
+        # Divider (light gray line)
+        combined[:, w:w + 4] = 160
+        combined[:, w + 4:] = after_slice
+
+        # Add labels (original / with lesion) — simple pixel-based label
+        # "Original" label at top-left
+        combined[4:10, 6:6 + 8 * 6] = 200  # placeholder bar
+        # "With Lesion" label at top-right
+        combined[4:10, w + 10:w + 10 + 11 * 6] = 200
+
+        img = Image.fromarray(combined, mode="L")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        return DicomLesionPreviewResponse(
+            image_base64=b64,
+            slice_index=cz_idx,
+            total_slices=volume.shape[0],
+            lesion_center_voxel=[cz_idx, int(round(cy)), int(round(cx))],
+            hu_min=stats_hu_min,
+            hu_max=stats_hu_max,
+            hu_mean=stats_hu_mean,
+            hu_std=stats_hu_std,
+            voxel_count=stats_voxels,
+            volume_mm3=stats_volume_mm3,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("DICOM lesion preview failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"DICOM lesion preview failed: {str(e)[:300]}",
+        )
+
+
+@router.post("/preview/organ", response_model=SimulationPreviewResponse)
+async def preview_organ(config: dict):
+    """
+    Generate a fast preview of an organ configuration.
+
+    Synchronous endpoint for real-time preview of organ parameters
+    without creating a full simulation job.
+    """
+    try:
+        simulator = OrganSimulator()
+        preview = simulator.generate_preview(config)
         return SimulationPreviewResponse(
             job_id=str(uuid.uuid4()),
             preview_data=preview,

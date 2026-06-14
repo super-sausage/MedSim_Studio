@@ -2,8 +2,11 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@components/ui/button';
 import { useSimulationStore } from '@store/useSimulationStore';
 import { simulationService } from '@/services/simulationService';
-import type { PhantomResponse } from '@/services/simulationService';
+import type { PhantomResponse, DicomLesionPreviewResponse } from '@/services/simulationService';
 import { VolumeRenderer } from '@vtk/volumeRendering/VolumeRenderer';
+import { dicomService } from '@/services/dicomService';
+import type { LesionConfig, LesionType, LesionShape } from '@/types/simulation';
+import type { DicomStudy, DicomSeries } from '@/types/dicom';
 
 // ---------------------------------------------------------------------------
 // Window/Level presets (WL, WW in HU)
@@ -83,6 +86,44 @@ function decodeBase64ToFloat32(base64: string): Float32Array {
 }
 
 // ---------------------------------------------------------------------------
+// Default form values
+// ---------------------------------------------------------------------------
+
+const DEFAULT_FORM: {
+  lesionType: LesionType;
+  shape: LesionShape;
+  huMean: number;
+  huStd: number;
+  diameter: number;
+  marginSharpness: number;
+  spiculationDegree: number;
+} = {
+  lesionType: 'tumor',
+  shape: 'spherical',
+  huMean: 40,
+  huStd: 20,
+  diameter: 20,
+  marginSharpness: 0.8,
+  spiculationDegree: 0,
+};
+
+const lesionTypeLabel: Record<LesionType, string> = {
+  tumor: 'Tumor',
+  nodule: 'Nodule',
+  cyst: 'Cyst',
+  calcification: 'Calcification',
+  metastasis: 'Metastasis',
+};
+
+const shapeLabel: Record<LesionShape, string> = {
+  spherical: 'Spherical',
+  ellipsoidal: 'Ellipsoidal',
+  irregular: 'Irregular',
+  lobulated: 'Lobulated',
+  spiculated: 'Spiculated',
+};
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -97,64 +138,73 @@ function decodeBase64ToFloat32(base64: string): Float32Array {
  *    shows a 3D volume preview via vtk.js.
  */
 export default function SimulationPage() {
-  const { lesions, organs, addLesion, completedJobs } = useSimulationStore();
+  const { lesions, organs, addLesion, removeLesion, activeJobs, completedJobs, addJob } =
+    useSimulationStore();
 
   // ---- Tab state ----
   const [activeTab, setActiveTab] = useState<
     'lesion' | 'organ' | 'deformation' | 'phantom'
   >('lesion');
 
-  // ---- Export state (lesion/organ mode) ----
-  const [exportFormat, setExportFormat] = useState<'dicom' | 'nifti' | 'nrrd'>(
-    'dicom',
-  );
+  // ---- Source volume state ----
+  const [sourceType, setSourceType] = useState<'synthetic' | 'dicom'>('synthetic');
+  const [studies, setStudies] = useState<DicomStudy[]>([]);
+  const [seriesList, setSeriesList] = useState<DicomSeries[]>([]);
+  const [selectedStudyId, setSelectedStudyId] = useState<string | null>(null);
+  const [selectedSeriesId, setSelectedSeriesId] = useState<string | null>(null);
+  const [loadingStudies, setLoadingStudies] = useState(false);
+  const [loadingSeries, setLoadingSeries] = useState(false);
+
+  // ---- Form state ----
+  const [form, setForm] = useState(DEFAULT_FORM);
+
+  // ---- Preview state ----
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewResult, setPreviewResult] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  // ---- DICOM preview state ----
+  const [dicomPreviewLoading, setDicomPreviewLoading] = useState(false);
+  const [dicomPreviewImage, setDicomPreviewImage] = useState<string | null>(null);
+  const [dicomPreviewStats, setDicomPreviewStats] = useState<string | null>(null);
+  const [dicomPreviewError, setDicomPreviewError] = useState<string | null>(null);
+
+  // ---- Job running state ----
+  const [jobLoading, setJobLoading] = useState(false);
+  const [jobError, setJobError] = useState<string | null>(null);
+
+  // ---- Export state ----
+  const [exportFormat, setExportFormat] = useState<'dicom' | 'nifti' | 'nrrd'>('dicom');
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportError, setExportError] = useState<string | null>(null);
+
   const latestCompletedJob = completedJobs[completedJobs.length - 1];
 
-  // -----------------------------------------------------------------------
-  // CT Phantom state
-  // -----------------------------------------------------------------------
-
+  // ---- CT Phantom state ----
   const [phantom, setPhantom] = useState<PhantomResponse | null>(null);
   const [phantomLoading, setPhantomLoading] = useState(false);
   const [phantomError, setPhantomError] = useState<string | null>(null);
-  const [phantomSource, setPhantomSource] = useState<'procedural' | 'atlas'>(
-    'procedural',
-  );
-  const [phantomSize, setPhantomSize] = useState(192); // default 192 for detail
+  const [phantomSource, setPhantomSource] = useState<'procedural' | 'atlas'>('procedural');
+  const [phantomSize, setPhantomSize] = useState(192);
   const [sliceIndex, setSliceIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [playSpeed, setPlaySpeed] = useState(10); // slices per second
-  const [activePreset, setActivePreset] = useState<WindowPreset>(
-    WINDOW_PRESETS[0],
-  );
+  const [activePreset, setActivePreset] = useState<WindowPreset>(WINDOW_PRESETS[0]);
   const [showLabelOverlay, setShowLabelOverlay] = useState(true);
 
   // ---- vtk.js volume data (decoded once from phantom) ----
   const [vtkVolumeData, setVtkVolumeData] = useState<Float32Array | null>(null);
   const [vtkDims, setVtkDims] = useState<[number, number, number] | null>(null);
-  const [vtkSpacing, setVtkSpacing] = useState<[number, number, number] | null>(
-    null,
-  );
+  const [vtkSpacing, setVtkSpacing] = useState<[number, number, number] | null>(null);
 
-  // ---- Canvas ref for axial slice rendering ----
+  // ---- Refs ----
   const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  // ---- Cached decoded volume data (avoids re-decoding base64 on every
-  //      slice / preset change) ----
   const cachedPhantomDataRef = useRef<Float32Array | null>(null);
-
-  // ---- Cached decoded label data (uint8, same [z,y,x] ordering as CT) ----
   const cachedLabelDataRef = useRef<Uint8Array | null>(null);
-
-  // ---- Playback timer ref ----
   const playTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ---- Reset slice index to 0 when a new phantom is loaded ----
-  // This ensures we always start at the head/chest (first slice)
-  // rather than showing the last-viewed slice from a previous phantom.
   useEffect(() => {
     if (phantom) {
       setSliceIndex(0);
@@ -162,10 +212,7 @@ export default function SimulationPage() {
     }
   }, [phantom]);
 
-  // -----------------------------------------------------------------------
-  // Decode vtk.js data when phantom changes
-  // -----------------------------------------------------------------------
-
+  // ---- Decode vtk.js data when phantom changes ----
   useEffect(() => {
     if (!phantom) {
       setVtkVolumeData(null);
@@ -226,10 +273,7 @@ export default function SimulationPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phantom?.volumeBase64, phantom?.labelBase64]);
 
-  // -----------------------------------------------------------------------
-  // Axial slice canvas rendering
-  // -----------------------------------------------------------------------
-
+  // ---- Axial slice canvas rendering ----
   const renderSlice = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !phantom) return;
@@ -298,10 +342,7 @@ export default function SimulationPage() {
     renderSlice();
   }, [renderSlice]);
 
-  // -----------------------------------------------------------------------
-  // Playback effect
-  // -----------------------------------------------------------------------
-
+  // ---- Playback effect ----
   useEffect(() => {
     if (!playing || !phantom) return;
 
@@ -326,8 +367,52 @@ export default function SimulationPage() {
     };
   }, [playing, playSpeed, phantom]);
 
+  // ---- Load available DICOM studies on mount ----
+  useEffect(() => {
+    let mounted = true;
+    const loadStudies = async () => {
+      setLoadingStudies(true);
+      try {
+        const res = await dicomService.getStudies(1, 50);
+        if (mounted) setStudies(res.items ?? []);
+      } catch {
+        // Silently ignore — studies fetch is non-critical
+      } finally {
+        if (mounted) setLoadingStudies(false);
+      }
+    };
+    loadStudies();
+    return () => { mounted = false; };
+  }, []);
+
+  // ---- Load series when a study is selected ----
+  useEffect(() => {
+    if (!selectedStudyId) {
+      setSeriesList([]);
+      setSelectedSeriesId(null);
+      return;
+    }
+    let mounted = true;
+    const loadSeries = async () => {
+      setLoadingSeries(true);
+      setSelectedSeriesId(null);
+      try {
+        const series = await dicomService.getSeries(selectedStudyId);
+        // Filter to CT/MR imaging modalities only
+        const IMAGE_MODALITIES = ['CT', 'MR', 'PT', 'NM', 'US', 'XA', 'CR'];
+        if (mounted) setSeriesList(series.filter((s) => IMAGE_MODALITIES.includes(s.modality)));
+      } catch {
+        // Silently ignore
+      } finally {
+        if (mounted) setLoadingSeries(false);
+      }
+    };
+    loadSeries();
+    return () => { mounted = false; };
+  }, [selectedStudyId]);
+
   // -----------------------------------------------------------------------
-  // Handlers
+  // Handlers: phantom
   // -----------------------------------------------------------------------
 
   const handleGeneratePhantom = async () => {
@@ -373,32 +458,167 @@ export default function SimulationPage() {
   };
 
   // -----------------------------------------------------------------------
-  // Export helpers (lesion mode)
+  // Handlers: lesion form
   // -----------------------------------------------------------------------
 
-  const parseFilename = (headers: any, fallback: string): string => {
-    const disposition = headers['content-disposition'];
-    if (disposition) {
-      const match = disposition.match(/filename\*?=['"]?([^'";]+)['"]?/);
-      if (match && match[1]) {
-        return decodeURIComponent(match[1]);
-      }
+  /** Update a single form field */
+  const updateForm = useCallback(
+    <K extends keyof typeof form>(key: K, value: (typeof form)[K]) =>
+      setForm((prev) => ({ ...prev, [key]: value })),
+    [],
+  );
+
+  /** Add a lesion from the current form values */
+  const handleAddLesion = useCallback(() => {
+    const radius = form.diameter / 2;
+    const lesion: LesionConfig = {
+      type: form.lesionType,
+      shape: form.shape,
+      center: [0, 0, 0], // backend will center in the volume
+      radiusMm: [radius, radius, radius],
+      huMean: form.huMean,
+      huStd: form.huStd,
+      marginSharpness: form.marginSharpness,
+      calcificationFraction: 0,
+      necrosisFraction: 0,
+      spiculationDegree: form.spiculationDegree,
+    };
+    addLesion(lesion);
+  }, [form, addLesion]);
+
+  /** Run simulation with all configured lesions */
+  const handleRunSimulation = useCallback(async () => {
+    if (lesions.length === 0 && organs.length === 0) {
+      setJobError('Add at least one lesion or organ before running simulation');
+      return;
     }
-    return fallback;
-  };
 
-  const triggerDownload = (blob: Blob, filename: string) => {
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    window.URL.revokeObjectURL(url);
-    document.body.removeChild(a);
-  };
+    if (sourceType === 'dicom' && !selectedSeriesId) {
+      setJobError('Select a DICOM series to use as the base volume');
+      return;
+    }
 
-  const handleExport = async () => {
+    setJobLoading(true);
+    setJobError(null);
+
+    try {
+      const jobConfig: Record<string, unknown> = {
+        lesions,
+        organs,
+        outputFormat: 'dicom',
+      };
+      if (sourceType === 'dicom' && selectedStudyId && selectedSeriesId) {
+        jobConfig.studyId = selectedStudyId;
+        jobConfig.seriesId = selectedSeriesId;
+      }
+      const job = await simulationService.createJob(jobConfig);
+      addJob(job);
+    } catch (err: any) {
+      setJobError(err?.message || 'Failed to create simulation job');
+    } finally {
+      setJobLoading(false);
+    }
+  }, [lesions, organs, addJob, sourceType, selectedStudyId, selectedSeriesId]);
+
+  /** Preview current lesion configuration */
+  const handlePreview = useCallback(async () => {
+    const radius = form.diameter / 2;
+    const lesion: LesionConfig = {
+      type: form.lesionType,
+      shape: form.shape,
+      center: [0, 0, 0],
+      radiusMm: [radius, radius, radius],
+      huMean: form.huMean,
+      huStd: form.huStd,
+      marginSharpness: form.marginSharpness,
+      calcificationFraction: 0,
+      necrosisFraction: 0,
+      spiculationDegree: form.spiculationDegree,
+    };
+
+    setPreviewLoading(true);
+    setPreviewResult(null);
+    setPreviewError(null);
+
+    try {
+      const result = await simulationService.previewLesion(lesion);
+      const pd = result.previewData;
+      const meanHu = typeof pd.huMean === 'number' ? pd.huMean.toFixed(0) : '?';
+      const volMm3 = typeof pd.volumeMm3 === 'number' ? pd.volumeMm3.toFixed(0) : '?';
+      setPreviewResult(
+        `HU range: [${result.huRange[0].toFixed(0)}, ${result.huRange[1].toFixed(0)}] · ` +
+        `Mean: ${meanHu} · Volume: ${volMm3} mm³ · Voxels: ${result.voxelCount}`,
+      );
+    } catch (err: any) {
+      setPreviewError(err?.message || 'Preview failed');
+    } finally {
+      setPreviewLoading(false);
+    }
+  }, [form]);
+
+  /** Remove a lesion by index */
+  const handleRemoveLesion = useCallback(
+    (index: number) => removeLesion(index),
+    [removeLesion],
+  );
+
+  /** Preview current lesion on the selected DICOM series */
+  const handleDicomPreview = useCallback(async () => {
+    if (!selectedSeriesId) {
+      setDicomPreviewError('No DICOM series selected');
+      return;
+    }
+
+    const radius = form.diameter / 2;
+    const lesion: LesionConfig = {
+      type: form.lesionType,
+      shape: form.shape,
+      center: [0, 0, 0],
+      radiusMm: [radius, radius, radius],
+      huMean: form.huMean,
+      huStd: form.huStd,
+      marginSharpness: form.marginSharpness,
+      calcificationFraction: 0,
+      necrosisFraction: 0,
+      spiculationDegree: form.spiculationDegree,
+    };
+
+    setDicomPreviewLoading(true);
+    setDicomPreviewImage(null);
+    setDicomPreviewStats(null);
+    setDicomPreviewError(null);
+
+    try {
+      const res = await simulationService.previewLesionOnDicom(
+        selectedSeriesId,
+        lesion,
+        40,
+        400,
+      );
+      // Combine stats into a summary string
+      const stats = `HU: ${res.huMean.toFixed(0)} ± ${res.huStd.toFixed(0)} · Range: [${res.huMin.toFixed(0)}, ${res.huMax.toFixed(0)}] · Volume: ${res.volumeMm3.toFixed(0)} mm³ · Slice ${res.sliceIndex + 1}/${res.totalSlices}`;
+      setDicomPreviewImage(`data:image/png;base64,${res.imageBase64}`);
+      setDicomPreviewStats(stats);
+    } catch (err: any) {
+      setDicomPreviewError(err?.message || 'DICOM preview failed');
+    } finally {
+      setDicomPreviewLoading(false);
+    }
+  }, [form, selectedSeriesId]);
+
+  /** Close the DICOM preview modal */
+  const closeDicomPreview = useCallback(() => {
+    setDicomPreviewImage(null);
+    setDicomPreviewStats(null);
+    setDicomPreviewError(null);
+  }, []);
+
+  // -----------------------------------------------------------------------
+  // Handlers: export
+  // -----------------------------------------------------------------------
+
+  /** Export simulation results */
+  const handleExport = useCallback(async () => {
     if (!latestCompletedJob) {
       setExportError('No completed simulation jobs available for export');
       return;
@@ -424,7 +644,7 @@ export default function SimulationPage() {
         },
       );
 
-      const fallbackNames = {
+      const fallbackNames: Record<string, string> = {
         dicom: `simulation_${latestCompletedJob.id}_dicom.zip`,
         nifti: `simulation_${latestCompletedJob.id}.nii.gz`,
         nrrd: `simulation_${latestCompletedJob.id}.nrrd`,
@@ -445,7 +665,7 @@ export default function SimulationPage() {
       setExporting(false);
       setTimeout(() => setExportProgress(0), 1000);
     }
-  };
+  }, [latestCompletedJob, exportFormat]);
 
   // -----------------------------------------------------------------------
   // Render
@@ -491,64 +711,181 @@ export default function SimulationPage() {
       {/* ---- Tab Content ---- */}
       {activeTab !== 'phantom' ? (
         /* ================================================================ */
-        /*  Lesion / Organ / Deformation  (existing UI, preserved)           */
+        /*  Lesion / Organ / Deformation                                     */
         /* ================================================================ */
         <div className="flex-1 overflow-y-auto p-6">
+          {/* Source Volume Selection */}
+          <div className="mb-4 rounded-lg border border-border bg-card p-4">
+            <h3 className="mb-3 text-sm font-medium">Source Volume</h3>
+            <div className="flex gap-6">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="radio"
+                  name="sourceType"
+                  checked={sourceType === 'synthetic'}
+                  onChange={() => setSourceType('synthetic')}
+                  className="text-primary"
+                />
+                Synthetic (empty volume)
+              </label>
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="radio"
+                  name="sourceType"
+                  checked={sourceType === 'dicom'}
+                  onChange={() => setSourceType('dicom')}
+                  className="text-primary"
+                />
+                Imported DICOM
+              </label>
+            </div>
+
+            {sourceType === 'dicom' && (
+              <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                {/* Study selector */}
+                <div>
+                  <label className="mb-1 block text-xs text-muted-foreground">Study</label>
+                  <select
+                    value={selectedStudyId ?? ''}
+                    onChange={(e) => {
+                      setSelectedStudyId(e.target.value || null);
+                      setSelectedSeriesId(null);
+                    }}
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                    disabled={loadingStudies}
+                  >
+                    <option value="">{loadingStudies ? 'Loading studies...' : '— Select a study —'}</option>
+                    {studies.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.studyDescription || `Study ${s.studyDate}`} ({s.modalities?.join(', ') || '?'})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Series selector */}
+                <div>
+                  <label className="mb-1 block text-xs text-muted-foreground">Series</label>
+                  <select
+                    value={selectedSeriesId ?? ''}
+                    onChange={(e) => setSelectedSeriesId(e.target.value || null)}
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                    disabled={!selectedStudyId || loadingSeries}
+                  >
+                    <option value="">
+                      {!selectedStudyId
+                        ? '— Select a study first —'
+                        : loadingSeries
+                          ? 'Loading series...'
+                          : '— Select a series —'}
+                    </option>
+                    {seriesList.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.seriesDescription || `Series ${s.seriesNumber}`} ({s.modality}, {s.imageCount} slices)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Configuration panel */}
           <div className="mb-6 grid gap-6 lg:grid-cols-2">
             {/* Lesion parameters */}
             <div className="rounded-lg border border-border bg-card p-4">
               <h3 className="mb-4 text-sm font-medium">Lesion Parameters</h3>
               <div className="space-y-4">
+                {/* Lesion Type */}
                 <div>
-                  <label className="text-xs text-muted-foreground">
-                    Lesion Type
-                  </label>
-                  <select className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm">
-                    <option value="tumor">Tumor</option>
-                    <option value="nodule">Nodule</option>
-                    <option value="cyst">Cyst</option>
-                    <option value="calcification">Calcification</option>
-                    <option value="metastasis">Metastasis</option>
+                  <label className="text-xs text-muted-foreground">Lesion Type</label>
+                  <select
+                    value={form.lesionType}
+                    onChange={(e) => updateForm('lesionType', e.target.value as LesionType)}
+                    className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                  >
+                    {Object.entries(lesionTypeLabel).map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
                   </select>
                 </div>
+
+                {/* Shape */}
                 <div>
-                  <label className="text-xs text-muted-foreground">
-                    Shape
-                  </label>
-                  <select className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm">
-                    <option value="spherical">Spherical</option>
-                    <option value="ellipsoidal">Ellipsoidal</option>
-                    <option value="irregular">Irregular</option>
-                    <option value="lobulated">Lobulated</option>
-                    <option value="spiculated">Spiculated</option>
+                  <label className="text-xs text-muted-foreground">Shape</label>
+                  <select
+                    value={form.shape}
+                    onChange={(e) => updateForm('shape', e.target.value as LesionShape)}
+                    className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                  >
+                    {Object.entries(shapeLabel).map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
                   </select>
                 </div>
+
+                {/* Mean HU */}
                 <div>
                   <label className="text-xs text-muted-foreground">
-                    Mean HU Value: <span className="text-primary">40</span>
+                    Mean HU Value: <span className="text-primary font-mono">{form.huMean}</span>
                   </label>
                   <input
                     type="range"
-                    min="-1000"
-                    max="1000"
-                    defaultValue={40}
+                    min={-1000}
+                    max={1000}
+                    value={form.huMean}
+                    onChange={(e) => updateForm('huMean', Number(e.target.value))}
                     className="mt-1 w-full"
                   />
                 </div>
+
+                {/* HU Std */}
                 <div>
                   <label className="text-xs text-muted-foreground">
-                    Diameter (mm): <span className="text-primary">20</span>
+                    HU Heterogeneity (Std): <span className="text-primary font-mono">{form.huStd}</span>
                   </label>
                   <input
                     type="range"
-                    min="2"
-                    max="100"
-                    defaultValue={20}
+                    min={0}
+                    max={200}
+                    value={form.huStd}
+                    onChange={(e) => updateForm('huStd', Number(e.target.value))}
                     className="mt-1 w-full"
                   />
                 </div>
-                <Button onClick={() => addLesion({} as any)} className="w-full">
+
+                {/* Diameter */}
+                <div>
+                  <label className="text-xs text-muted-foreground">
+                    Diameter (mm): <span className="text-primary font-mono">{form.diameter}</span>
+                  </label>
+                  <input
+                    type="range"
+                    min={2}
+                    max={100}
+                    value={form.diameter}
+                    onChange={(e) => updateForm('diameter', Number(e.target.value))}
+                    className="mt-1 w-full"
+                  />
+                </div>
+
+                {/* Margin Sharpness (for advanced shapes) */}
+                <div>
+                  <label className="text-xs text-muted-foreground">
+                    Margin Sharpness: <span className="text-primary font-mono">{form.marginSharpness.toFixed(2)}</span>
+                  </label>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={Math.round(form.marginSharpness * 100)}
+                    onChange={(e) => updateForm('marginSharpness', Number(e.target.value) / 100)}
+                    className="mt-1 w-full"
+                  />
+                </div>
+
+                {/* Add Lesion button */}
+                <Button onClick={handleAddLesion} className="w-full">
                   Add Lesion
                 </Button>
               </div>
@@ -556,21 +893,36 @@ export default function SimulationPage() {
 
             {/* Lesion list */}
             <div className="rounded-lg border border-border bg-card p-4">
-              <h3 className="mb-4 text-sm font-medium">
-                Lesion List ({lesions.length})
-              </h3>
+              <h3 className="mb-4 text-sm font-medium">Lesion List ({lesions.length})</h3>
               {lesions.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  No lesions configured. Add lesions using the parameters panel.
+                  No lesions configured. Adjust parameters above and click <strong>Add Lesion</strong>.
                 </p>
               ) : (
-                <div className="space-y-2">
+                <div className="space-y-2 max-h-[420px] overflow-y-auto">
                   {lesions.map((lesion, index) => (
                     <div
                       key={index}
-                      className="rounded border border-border p-2 text-sm"
+                      className="group flex items-start justify-between rounded border border-border p-2 text-sm"
                     >
-                      Lesion {index + 1}
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium">
+                          Lesion {index + 1}: {lesionTypeLabel[lesion.type]} ({shapeLabel[lesion.shape]})
+                        </div>
+                        <div className="mt-0.5 text-xs text-muted-foreground">
+                          HU: {lesion.huMean} ± {lesion.huStd} · Ø {Math.round(lesion.radiusMm[0] * 2)} mm
+                          {lesion.spiculationDegree > 0 && ` · Spic: ${lesion.spiculationDegree.toFixed(1)}`}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleRemoveLesion(index)}
+                        className="ml-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+                        title="Remove lesion"
+                      >
+                        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -579,9 +931,49 @@ export default function SimulationPage() {
           </div>
 
           {/* Action buttons */}
-          <div className="flex gap-2 border-t border-border pt-4">
-            <Button variant="default">Run Simulation</Button>
-            <Button variant="outline">Preview</Button>
+          <div className="mt-auto flex flex-wrap items-center gap-2 border-t border-border pt-4">
+            {/* Run Simulation */}
+            <Button
+              variant="default"
+              onClick={handleRunSimulation}
+              disabled={jobLoading || (lesions.length === 0 && organs.length === 0)}
+            >
+              {jobLoading ? 'Creating Job...' : 'Run Simulation'}
+            </Button>
+
+            {/* Preview */}
+            <Button
+              variant="outline"
+              onClick={handlePreview}
+              disabled={previewLoading}
+            >
+              {previewLoading ? 'Previewing...' : 'Preview'}
+            </Button>
+
+            {/* Preview on CT — only when DICOM source is selected */}
+            {sourceType === 'dicom' && selectedSeriesId && (
+              <Button
+                variant="outline"
+                onClick={handleDicomPreview}
+                disabled={dicomPreviewLoading}
+              >
+                {dicomPreviewLoading ? 'Loading CT Preview...' : 'Preview on CT'}
+              </Button>
+            )}
+
+            {/* Preview result */}
+            {previewResult && (
+              <span className="ml-2 text-xs text-green-600">{previewResult}</span>
+            )}
+            {previewError && (
+              <span className="ml-2 text-xs text-destructive">{previewError}</span>
+            )}
+            {dicomPreviewError && (
+              <span className="ml-2 text-xs text-destructive">{dicomPreviewError}</span>
+            )}
+
+            {/* Spacer */}
+            <div className="flex-1" />
 
             {/* Export section */}
             <div className="flex items-center gap-2">
@@ -601,7 +993,7 @@ export default function SimulationPage() {
               <Button
                 variant="ghost"
                 onClick={handleExport}
-                disabled={exporting}
+                disabled={exporting || !latestCompletedJob}
               >
                 {exporting
                   ? exportProgress === -1
@@ -617,6 +1009,20 @@ export default function SimulationPage() {
           {/* Export error */}
           {exportError && (
             <div className="mt-2 text-sm text-destructive">{exportError}</div>
+          )}
+
+          {/* Active / completed job summary */}
+          {(activeJobs.length > 0 || completedJobs.length > 0) && (
+            <div className="mt-4 border-t border-border pt-3 text-xs text-muted-foreground">
+              {activeJobs.length > 0 && (
+                <div>
+                  Active jobs: {activeJobs.map((j) => `${j.id.slice(0, 8)} (${j.status})`).join(', ')}
+                </div>
+              )}
+              {completedJobs.length > 0 && (
+                <div>Completed jobs: {completedJobs.length}</div>
+              )}
+            </div>
           )}
         </div>
       ) : (
@@ -997,6 +1403,79 @@ export default function SimulationPage() {
           </div>
         </div>
       )}
+
+      {/* ---- DICOM Preview Modal ---- */}
+      {dicomPreviewImage && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          onClick={closeDicomPreview}
+        >
+          <div
+            className="relative max-h-[90vh] max-w-[90vw] rounded-lg bg-card p-4 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              onClick={closeDicomPreview}
+              className="absolute -right-3 -top-3 flex h-7 w-7 items-center justify-center rounded-full bg-destructive text-sm text-destructive-foreground hover:bg-destructive/90"
+              title="Close"
+            >
+              ✕
+            </button>
+            <h3 className="mb-3 text-sm font-medium">CT Preview — Lesion on DICOM</h3>
+            <p className="mb-2 text-xs text-muted-foreground">
+              Left: Original · Right: With lesion (center slice, WW/WC: 400/40)
+            </p>
+            <img
+              src={dicomPreviewImage}
+              alt="DICOM lesion preview"
+              className="max-h-[65vh] w-auto rounded border border-border"
+            />
+            {dicomPreviewStats && (
+              <p className="mt-2 text-xs text-green-600">{dicomPreviewStats}</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ---- Error messages ---- */}
+      {jobError && (
+        <div className="mt-2 text-sm text-destructive">{jobError}</div>
+      )}
+      {exportError && (
+        <div className="mt-2 text-sm text-destructive">{exportError}</div>
+      )}
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse filename from Content-Disposition header
+ */
+function parseFilename(headers: any, fallback: string): string {
+  const disposition = headers['content-disposition'];
+  if (disposition) {
+    const match = disposition.match(/filename\*?=['"]?([^'";]+)['"]?/);
+    if (match && match[1]) {
+      return decodeURIComponent(match[1]);
+    }
+  }
+  return fallback;
+}
+
+/**
+ * Trigger browser download
+ */
+function triggerDownload(blob: Blob, filename: string) {
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
 }

@@ -52,12 +52,31 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {__app_name__} v{__version__}")
 
     # --- Startup ---
-    # Create all database tables if they don't exist
+    # Run Alembic migrations to create/upgrade database tables.
+    # Falls back to create_all + stamp if Alembic is not yet configured
+    # (e.g., first run after switching from create_all to Alembic).
     try:
-        Base.metadata.create_all(bind=engine)
-        logger.info("Database tables created/verified")
-    except Exception:
-        logger.exception("Failed to create database tables; continuing startup")
+        from alembic.config import Config
+        from alembic import command
+        alembic_cfg = Config("alembic.ini")
+        command.upgrade(alembic_cfg, "head")
+        logger.info("Alembic migrations up to date")
+    except Exception as e:
+        logger.warning("Alembic migration failed (%s); falling back to create_all", e)
+        try:
+            Base.metadata.create_all(bind=engine)
+            logger.info("Database tables created/verified via create_all")
+            # Stamp as head so Alembic is in sync for next startup
+            try:
+                from alembic.config import Config
+                from alembic import command
+                alembic_cfg = Config("alembic.ini")
+                command.stamp(alembic_cfg, "head")
+                logger.info("Alembic stamped at head")
+            except Exception as stamp_err:
+                logger.warning("Failed to stamp Alembic head (%s); manual stamp may be needed", stamp_err)
+        except Exception as create_err:
+            logger.exception("Failed to create database tables; continuing startup (%s)", create_err)
 
     # Initialize storage backend and ensure it is ready.
     # Failure here does NOT crash the app — the backend still starts,

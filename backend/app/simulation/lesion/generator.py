@@ -62,10 +62,10 @@ class LesionGenerator:
             config.get("radius_z", 10),
         )
 
-        # Generate small preview volume (32x32x32)
+        # Generate small preview volume (32×32×32)
         preview_size = 32
         preview = self._generate_lesion_volume(
-            shape=preview_size,
+            shape=(preview_size, preview_size, preview_size),
             center=(preview_size // 2,) * 3,
             radii=(radii[0] * 0.3, radii[1] * 0.3, radii[2] * 0.3),
             hu_mean=config.get("hu_mean", 40),
@@ -91,6 +91,7 @@ class LesionGenerator:
         self,
         volume_shape: Tuple[int, int, int],
         config: Dict[str, Any],
+        spacing: Optional[Tuple[float, float, float]] = None,
     ) -> np.ndarray:
         """
         Generate a lesion within a volume of the given shape.
@@ -98,6 +99,8 @@ class LesionGenerator:
         Args:
             volume_shape: Shape of the target volume (z, y, x)
             config: Lesion configuration dictionary
+            spacing: Voxel spacing (z, y, x) in mm. Used to convert mm radii
+                     to voxel counts. Falls back to SIMULATION_VOXEL_SIZE if None.
 
         Returns:
             numpy array of HU values matching volume_shape
@@ -110,10 +113,15 @@ class LesionGenerator:
             config.get("center_y", volume_shape[1] // 2),
             config.get("center_x", volume_shape[2] // 2),
         )
+        # Convert mm radii to voxel counts using actual spacing
+        if spacing is not None:
+            vz, vy, vx = spacing
+        else:
+            vz = vy = vx = settings.SIMULATION_VOXEL_SIZE
         radii = (
-            config.get("radius_z", 10) / settings.SIMULATION_VOXEL_SIZE,
-            config.get("radius_y", 10) / settings.SIMULATION_VOXEL_SIZE,
-            config.get("radius_x", 10) / settings.SIMULATION_VOXEL_SIZE,
+            config.get("radius_z", 10) / vz,
+            config.get("radius_y", 10) / vy,
+            config.get("radius_x", 10) / vx,
         )
 
         hu_mean = config.get("hu_mean", hu_defaults["mean"])

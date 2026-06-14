@@ -19,6 +19,9 @@ nibabel==5.2.0
 numpy==1.26.2
 scipy==1.11.4
 
+# Image generation for previews
+Pillow>=10.0.0
+
 # Visualization Toolkit
 vtk==9.3.0
 

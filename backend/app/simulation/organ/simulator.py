@@ -39,6 +39,35 @@ class OrganSimulator:
     def __init__(self, seed: Optional[int] = None):
         self.rng = np.random.default_rng(seed or settings.SIMULATION_DEFAULT_SEED)
 
+    def generate_preview(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate a fast preview of an organ configuration.
+
+        Returns summary statistics without generating the full volume.
+        """
+        organ_type = config.get("organ_type", "liver")
+        hu_defaults = self.ORGAN_HU_RANGES.get(organ_type, self.ORGAN_HU_RANGES["liver"])
+        hu_mean = config.get("hu_mean", hu_defaults["mean"])
+        hu_std = config.get("hu_std", hu_defaults["std"])
+
+        # Generate small preview volume (32x32x32)
+        preview_size = 32
+        preview_shape = (preview_size, preview_size, preview_size)
+        preview = self.generate_organ(
+            volume_shape=preview_shape,
+            config=config,
+        )
+
+        return {
+            "voxel_count": int(np.sum(preview > -500)),
+            "hu_min": float(np.min(preview)),
+            "hu_max": float(np.max(preview)),
+            "hu_mean": float(np.mean(preview)),
+            "hu_std": float(np.std(preview)),
+            "organ_type": organ_type,
+            "preview_shape": list(preview.shape),
+        }
+
     def generate_organ(
         self,
         volume_shape: Tuple[int, int, int],
