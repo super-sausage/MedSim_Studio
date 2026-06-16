@@ -97,6 +97,12 @@ const DEFAULT_FORM: {
   diameter: number;
   marginSharpness: number;
   spiculationDegree: number;
+  centerX: number;
+  centerY: number;
+  centerZ: number;
+  normalizedCenterX: number;
+  normalizedCenterY: number;
+  normalizedCenterZ: number;
 } = {
   lesionType: 'tumor',
   shape: 'spherical',
@@ -105,6 +111,12 @@ const DEFAULT_FORM: {
   diameter: 20,
   marginSharpness: 0.8,
   spiculationDegree: 0,
+  centerX: 0,
+  centerY: 0,
+  centerZ: 0,
+  normalizedCenterX: 0,
+  normalizedCenterY: 0,
+  normalizedCenterZ: 0,
 };
 
 const lesionTypeLabel: Record<LesionType, string> = {
@@ -192,6 +204,8 @@ export default function SimulationPage() {
   const [playSpeed, setPlaySpeed] = useState(10); // slices per second
   const [activePreset, setActivePreset] = useState<WindowPreset>(WINDOW_PRESETS[0]);
   const [showLabelOverlay, setShowLabelOverlay] = useState(true);
+  const [pickingMode, setPickingMode] = useState(false);
+  const [pickedPosition, setPickedPosition] = useState<{ x: number; y: number; z: number } | null>(null);
 
   // ---- vtk.js volume data (decoded once from phantom) ----
   const [vtkVolumeData, setVtkVolumeData] = useState<Float32Array | null>(null);
@@ -334,8 +348,39 @@ export default function SimulationPage() {
     }
 
     ctx.putImageData(imageData, 0, 0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phantom, sliceIndex, activePreset, showLabelOverlay]);
+
+    // Draw crosshair at picked position
+    if (pickedPosition && pickedPosition.z === sliceIndex) {
+      const cx = pickedPosition.x;
+      const cy = pickedPosition.y;
+      const size = 12;
+
+      ctx.save();
+      ctx.strokeStyle = '#ff3333';
+      ctx.lineWidth = 2;
+      ctx.shadowColor = 'rgba(0,0,0,0.8)';
+      ctx.shadowBlur = 3;
+
+      // Horizontal line
+      ctx.beginPath();
+      ctx.moveTo(cx - size, cy);
+      ctx.lineTo(cx + size, cy);
+      ctx.stroke();
+
+      // Vertical line
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - size);
+      ctx.lineTo(cx, cy + size);
+      ctx.stroke();
+
+      // Circle
+      ctx.beginPath();
+      ctx.arc(cx, cy, size + 4, 0, 2 * Math.PI);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+  }, [phantom, sliceIndex, activePreset, showLabelOverlay, pickedPosition]);
 
   // Re-render on slice/preset change
   useEffect(() => {
@@ -416,6 +461,8 @@ export default function SimulationPage() {
   // -----------------------------------------------------------------------
 
   const handleGeneratePhantom = async () => {
+    setPickedPosition(null);
+    setPickingMode(false);
     setPhantomLoading(true);
     setPhantomError(null);
     setPhantom(null);
@@ -468,13 +515,78 @@ export default function SimulationPage() {
     [],
   );
 
+  /** Handle click on CT phantom canvas to pick lesion position */
+  const handleCanvasClick = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!pickingMode || !phantom) return;
+
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+
+      const x = Math.round((e.clientX - rect.left) * scaleX);
+      const y = Math.round((e.clientY - rect.top) * scaleY);
+
+      // Clamp to volume bounds
+      const { width, height, depth } = phantom.metadata;
+      const clampedX = Math.max(0, Math.min(x, width - 1));
+      const clampedY = Math.max(0, Math.min(y, height - 1));
+      const clampedZ = Math.max(0, Math.min(sliceIndex, depth - 1));
+
+      // Store absolute phantom coords (for crosshair display)
+      setPickedPosition({ x: clampedX, y: clampedY, z: clampedZ });
+
+      // Store absolute phantom coords (for display in number inputs, works for same-volume synthetic)
+      updateForm('centerX', clampedX);
+      updateForm('centerY', clampedY);
+      updateForm('centerZ', clampedZ);
+
+      // Store normalized coords (0-1) for cross-volume scaling (e.g., phantom → DICOM)
+      const normX = width > 0 ? clampedX / width : 0;
+      const normY = height > 0 ? clampedY / height : 0;
+      const normZ = depth > 0 ? clampedZ / depth : 0;
+      updateForm('normalizedCenterX', normX);
+      updateForm('normalizedCenterY', normY);
+      updateForm('normalizedCenterZ', normZ);
+      setPickingMode(false);
+      setActiveTab('lesion');
+    },
+    [pickingMode, phantom, sliceIndex, updateForm],
+  );
+
   /** Add a lesion from the current form values */
   const handleAddLesion = useCallback(() => {
     const radius = form.diameter / 2;
+
+    // Compute center coords based on target volume
+    let cx = form.centerX;
+    let cy = form.centerY;
+    let cz = form.centerZ;
+
+    // When normalized coords are set (from phantom pick) and target is DICOM,
+    // scale to DICOM volume dimensions.
+    // Skip if user manually cleared center values (wanting auto-center: 0→backend).
+    if (
+      sourceType === 'dicom' &&
+      form.normalizedCenterX > 0 &&
+      selectedSeriesId &&
+      form.centerX !== 0 && form.centerY !== 0 && form.centerZ !== 0
+    ) {
+      const series = seriesList.find((s) => s.id === selectedSeriesId);
+      if (series) {
+        cx = form.normalizedCenterX * series.columns;
+        cy = form.normalizedCenterY * series.rows;
+        cz = form.normalizedCenterZ * series.imageCount;
+      }
+    }
+
     const lesion: LesionConfig = {
       type: form.lesionType,
       shape: form.shape,
-      center: [0, 0, 0], // backend will center in the volume
+      center: [cx, cy, cz],
       radiusMm: [radius, radius, radius],
       huMean: form.huMean,
       huStd: form.huStd,
@@ -484,7 +596,7 @@ export default function SimulationPage() {
       spiculationDegree: form.spiculationDegree,
     };
     addLesion(lesion);
-  }, [form, addLesion]);
+  }, [form, addLesion, sourceType, selectedSeriesId, seriesList]);
 
   /** Run simulation with all configured lesions */
   const handleRunSimulation = useCallback(async () => {
@@ -526,7 +638,7 @@ export default function SimulationPage() {
     const lesion: LesionConfig = {
       type: form.lesionType,
       shape: form.shape,
-      center: [0, 0, 0],
+      center: [form.centerX, form.centerY, form.centerZ],
       radiusMm: [radius, radius, radius],
       huMean: form.huMean,
       huStd: form.huStd,
@@ -569,11 +681,34 @@ export default function SimulationPage() {
       return;
     }
 
+    // Find the selected series to get DICOM volume dimensions
+    const selectedSeries = seriesList.find((s) => s.id === selectedSeriesId);
+
+    // Compute center: if normalized coords are available (from phantom pick),
+    // scale them to the DICOM volume dimensions. Otherwise use centerX/Y/Z
+    // as-is (manual entry, or 0 → auto-center in backend).
+    let centerX = form.centerX;
+    let centerY = form.centerY;
+    let centerZ = form.centerZ;
+
+    if (
+      selectedSeries &&
+      form.normalizedCenterX > 0 &&
+      form.normalizedCenterY > 0 &&
+      form.normalizedCenterZ > 0 &&
+      form.centerX !== 0 && form.centerY !== 0 && form.centerZ !== 0
+    ) {
+      // Scale normalized phantom coords to DICOM volume space
+      centerX = form.normalizedCenterX * selectedSeries.columns;
+      centerY = form.normalizedCenterY * selectedSeries.rows;
+      centerZ = form.normalizedCenterZ * selectedSeries.imageCount;
+    }
+
     const radius = form.diameter / 2;
     const lesion: LesionConfig = {
       type: form.lesionType,
       shape: form.shape,
-      center: [0, 0, 0],
+      center: [centerX, centerY, centerZ],
       radiusMm: [radius, radius, radius],
       huMean: form.huMean,
       huStd: form.huStd,
@@ -604,7 +739,7 @@ export default function SimulationPage() {
     } finally {
       setDicomPreviewLoading(false);
     }
-  }, [form, selectedSeriesId]);
+  }, [form, selectedSeriesId, seriesList]);
 
   /** Close the DICOM preview modal */
   const closeDicomPreview = useCallback(() => {
@@ -884,6 +1019,60 @@ export default function SimulationPage() {
                   />
                 </div>
 
+                {/* --- Position controls --- */}
+                <div className="border-t border-border pt-3">
+                  <h4 className="mb-2 text-xs font-medium text-muted-foreground">
+                    Position (voxel coordinates)
+                  </h4>
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="text-xs text-muted-foreground">X</label>
+                      <input
+                        type="number"
+                        value={form.centerX}
+                        onChange={(e) => updateForm('centerX', Number(e.target.value))}
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1 text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground">Y</label>
+                      <input
+                        type="number"
+                        value={form.centerY}
+                        onChange={(e) => updateForm('centerY', Number(e.target.value))}
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1 text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground">Z (Slice)</label>
+                      <input
+                        type="number"
+                        value={form.centerZ}
+                        onChange={(e) => updateForm('centerZ', Number(e.target.value))}
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1 text-sm"
+                      />
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setPickedPosition(null);
+                      setPickingMode(true);
+                      setActiveTab('phantom');
+                    }}
+                    className="mt-2 w-full"
+                    disabled={!phantom}
+                  >
+                    Pick from Phantom
+                  </Button>
+                  {!phantom && (
+                    <p className="mt-1 text-[10px] text-muted-foreground">
+                      Generate a CT phantom first to use position picking
+                    </p>
+                  )}
+                </div>
+
                 {/* Add Lesion button */}
                 <Button onClick={handleAddLesion} className="w-full">
                   Add Lesion
@@ -1048,6 +1237,16 @@ export default function SimulationPage() {
                 {phantom && (
                   <span className="text-xs tabular-nums text-white/50">
                     Slice {sliceIndex + 1} / {totalSlices}
+                    {pickedPosition && (
+                      <span className="ml-2 text-red-400/80">
+                        · Pick: ({pickedPosition.x}, {pickedPosition.y}, z={pickedPosition.z})
+                      </span>
+                    )}
+                    {pickingMode && (
+                      <span className="ml-2 text-amber-400 animate-pulse">
+                        · Click canvas to set position
+                      </span>
+                    )}
                   </span>
                 )}
               </div>
@@ -1083,7 +1282,10 @@ export default function SimulationPage() {
                 ) : (
                   <canvas
                     ref={canvasRef}
-                    className="max-h-full max-w-full border border-white/10 object-contain"
+                    onClick={handleCanvasClick}
+                    className={`max-h-full max-w-full border border-white/10 object-contain ${
+                      pickingMode ? 'cursor-crosshair' : 'cursor-default'
+                    }`}
                     style={{ imageRendering: 'pixelated' }}
                   />
                 )}
@@ -1264,6 +1466,17 @@ export default function SimulationPage() {
                   WL={activePreset.windowLevel} WW={activePreset.windowWidth}
                 </span>
               )}
+
+              {/* Pick Position toggle */}
+              <div className="h-5 w-px bg-border" />
+              <Button
+                variant={pickingMode ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setPickingMode((prev) => !prev)}
+                disabled={!phantom}
+              >
+                {pickingMode ? 'Cancel Pick' : 'Pick Position'}
+              </Button>
 
               {/* Label overlay toggle (only when labels available) */}
               {phantom?.labelBase64 && (
