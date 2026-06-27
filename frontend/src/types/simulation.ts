@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Simulation Type Definitions
  *
  * Types for lesion/organ simulation and Hounsfield Unit (HU)
@@ -62,7 +62,7 @@ export interface HUModifier {
   regionId: string;
   originalHU: number;
   modifiedHU: number;
-  maskVolume: number; // cm³
+  maskVolume: number; // cm鲁
   operation: 'add' | 'subtract' | 'replace' | 'scale';
 }
 
@@ -79,3 +79,121 @@ export interface SimulationJob {
   createdAt: string;
   progress: number;
 }
+
+export type CtDoseLevel = 'low' | 'standard' | 'high';
+export type CtKernel = 'smooth' | 'soft' | 'standard' | 'lung' | 'bone' | 'sharp';
+export type CtContrastPhase = 'noncontrast' | 'arterial' | 'venous' | 'delayed';
+export type CtScanDirection = 'head_to_feet' | 'feet_to_head';
+export type CtPhantomSource = 'procedural' | 'atlas';
+export type CtSliceThickness = 0.625 | 1.0 | 2.5 | 5.0 | 10.0;
+export type CtKvp = 80 | 100 | 120 | 140;
+export type CtPitch = 0.5 | 0.8 | 1.0 | 1.2 | 1.5;
+export type CtFovMm = 150 | 250 | 350 | 500;
+export type CtMatrixSize = 256 | 512 | 1024;
+
+export interface CtParamsPreviewParams {
+  sliceThicknessMm: CtSliceThickness;
+  doseLevel: CtDoseLevel;
+  mAs: number;
+  kVp: CtKvp;
+  pitch: CtPitch;
+  fovMm: CtFovMm;
+  matrixSize: CtMatrixSize;
+  kernel: CtKernel;
+  contrastPhase: CtContrastPhase;
+}
+
+export interface CtParamsPreviewRequest {
+  source: CtPhantomSource;
+  caseId: string;
+  size: number;
+  scanDirection: CtScanDirection;
+  params: CtParamsPreviewParams;
+}
+
+export interface CtCenterSliceStats {
+  sliceIndex: number;
+  min: number;
+  max: number;
+  mean: number;
+  std: number;
+}
+
+export interface CtParamsPreviewMetadata {
+  shape: number[];
+  spacing: number[];
+  huRange: [number, number];
+  effectiveSliceThicknessMm: number;
+  algorithmNotes?: string[];
+  warnings?: string[];
+  source?: CtPhantomSource;
+  caseId?: string;
+  scanDirection?: CtScanDirection;
+  previewStats?: {
+    originalCenterSliceStats?: CtCenterSliceStats;
+    simulatedCenterSliceStats?: CtCenterSliceStats;
+  };
+  phantomMetadata?: {
+    originalShape?: number[];
+    outputShape?: number[];
+    originalSpacing?: number[];
+    outputSpacing?: number[];
+    flippedZ?: boolean;
+  };
+}
+
+export interface CtParamsJson {
+  requestedParams: Record<string, unknown>;
+  resolvedParams: Record<string, unknown>;
+  algorithmSteps: Array<Record<string, unknown>>;
+  approximationNotes?: string[];
+  warnings?: string[];
+  inputShape?: number[];
+  outputShape?: number[];
+  inputSpacing?: number[];
+  outputSpacing?: number[];
+  huRangeBefore?: [number, number];
+  huRangeAfter?: [number, number];
+}
+
+export interface StandardizedCtCaseVolume {
+  encoding: 'base64';
+  dtype: 'float32';
+  byteOrder: 'little_endian';
+  axisOrder: 'zyx';
+  shape: [number, number, number];
+  spacing: [number, number, number];
+  origin: [number, number, number];
+  direction: [
+    [number, number, number],
+    [number, number, number],
+    [number, number, number],
+  ];
+  huRange: [number, number];
+  sliceCount: number;
+  modality: 'CT';
+  bodyPart: string;
+  imageKind: 'simulated_ct';
+  imageDataField: 'simulatedVolumeBase64';
+}
+export interface StandardizedCtCaseSimulation {
+  type: 'ct_scan_params';
+  paramsJson: CtParamsJson;
+  algorithm: 'image_domain_approximation';
+  approximationWarning: string;
+}
+export interface StandardizedCtCase {
+  caseId: string;
+  source: CtPhantomSource;
+  sourceCaseId: string;
+  volume: StandardizedCtCaseVolume;
+  simulation: StandardizedCtCaseSimulation;
+  metadata: CtParamsPreviewMetadata;
+}
+export interface CtParamsPreviewResponse {
+  simulatedVolumeBase64: string;
+  metadata: CtParamsPreviewMetadata;
+  paramsJson: CtParamsJson;
+  standardizedCase: StandardizedCtCase;
+}
+

@@ -5,7 +5,13 @@ import { simulationService } from '@/services/simulationService';
 import type { PhantomResponse, DicomLesionPreviewResponse } from '@/services/simulationService';
 import { VolumeRenderer } from '@vtk/volumeRendering/VolumeRenderer';
 import { dicomService } from '@/services/dicomService';
-import type { LesionConfig, LesionType, LesionShape } from '@/types/simulation';
+import type {
+  CtParamsPreviewParams,
+  CtParamsPreviewResponse,
+  LesionConfig,
+  LesionType,
+  LesionShape,
+} from '@/types/simulation';
 import type { DicomStudy, DicomSeries } from '@/types/dicom';
 
 // ---------------------------------------------------------------------------
@@ -85,6 +91,105 @@ function decodeBase64ToFloat32(base64: string): Float32Array {
   return new Float32Array(bytes.buffer);
 }
 
+function renderVolumeSliceToCanvas({
+  canvas,
+  width,
+  height,
+  depth,
+  volumeData,
+  sliceIndex,
+  windowLevel,
+  windowWidth,
+  labelData,
+  showLabelOverlay = false,
+  pickedPosition,
+}: {
+  canvas: HTMLCanvasElement;
+  width: number;
+  height: number;
+  depth: number;
+  volumeData: Float32Array;
+  sliceIndex: number;
+  windowLevel: number;
+  windowWidth: number;
+  labelData?: Uint8Array | null;
+  showLabelOverlay?: boolean;
+  pickedPosition?: { x: number; y: number; z: number } | null;
+}): void {
+  if (sliceIndex < 0 || sliceIndex >= depth) return;
+
+  const sliceSize = width * height;
+  const offset = sliceIndex * sliceSize;
+  const slice = volumeData.subarray(offset, offset + sliceSize);
+  const labelSlice =
+    labelData && showLabelOverlay
+      ? labelData.subarray(offset, offset + sliceSize)
+      : null;
+
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  const imageData = ctx.createImageData(width, height);
+
+  for (let i = 0; i < sliceSize; i++) {
+    const gray = applyWindowLevel(slice[i], windowLevel, windowWidth);
+    const pixelIdx = i * 4;
+
+    if (labelSlice && labelSlice[i] > 0) {
+      const organColor = ORGAN_COLORS[labelSlice[i]];
+      if (organColor) {
+        const alpha = LABEL_OVERLAY_ALPHA;
+        imageData.data[pixelIdx] = gray * (1 - alpha) + organColor[0] * alpha;
+        imageData.data[pixelIdx + 1] = gray * (1 - alpha) + organColor[1] * alpha;
+        imageData.data[pixelIdx + 2] = gray * (1 - alpha) + organColor[2] * alpha;
+        imageData.data[pixelIdx + 3] = 255;
+      } else {
+        imageData.data[pixelIdx] = gray;
+        imageData.data[pixelIdx + 1] = gray;
+        imageData.data[pixelIdx + 2] = gray;
+        imageData.data[pixelIdx + 3] = 255;
+      }
+    } else {
+      imageData.data[pixelIdx] = gray;
+      imageData.data[pixelIdx + 1] = gray;
+      imageData.data[pixelIdx + 2] = gray;
+      imageData.data[pixelIdx + 3] = 255;
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+
+  if (pickedPosition && pickedPosition.z === sliceIndex) {
+    const cx = pickedPosition.x;
+    const cy = pickedPosition.y;
+    const size = 12;
+
+    ctx.save();
+    ctx.strokeStyle = '#ff3333';
+    ctx.lineWidth = 2;
+    ctx.shadowColor = 'rgba(0,0,0,0.8)';
+    ctx.shadowBlur = 3;
+
+    ctx.beginPath();
+    ctx.moveTo(cx - size, cy);
+    ctx.lineTo(cx + size, cy);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - size);
+    ctx.lineTo(cx, cy + size);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, size + 4, 0, 2 * Math.PI);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Default form values
 // ---------------------------------------------------------------------------
@@ -118,6 +223,22 @@ const DEFAULT_FORM: {
   normalizedCenterY: 0,
   normalizedCenterZ: 0,
 };
+
+const DEFAULT_CT_PARAMS: CtParamsPreviewParams = {
+  sliceThicknessMm: 5.0,
+  doseLevel: 'standard',
+  mAs: 150,
+  kVp: 120,
+  pitch: 1.2,
+  fovMm: 250,
+  matrixSize: 256,
+  kernel: 'bone',
+  contrastPhase: 'venous',
+};
+
+const DEFAULT_MAS = 150;
+const MIN_MAS = 30;
+const MAX_MAS = 300;
 
 const lesionTypeLabel: Record<LesionType, string> = {
   tumor: 'Tumor',
@@ -211,6 +332,7 @@ export default function SimulationPage() {
   const [phantomError, setPhantomError] = useState<string | null>(null);
   const [phantomSource, setPhantomSource] = useState<'procedural' | 'atlas'>('procedural');
   const [phantomSize, setPhantomSize] = useState(192);
+  const [loadedPhantomSize, setLoadedPhantomSize] = useState<number | null>(null);
   const [sliceIndex, setSliceIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [playSpeed, setPlaySpeed] = useState(10); // slices per second
@@ -218,6 +340,15 @@ export default function SimulationPage() {
   const [showLabelOverlay, setShowLabelOverlay] = useState(true);
   const [pickingMode, setPickingMode] = useState(false);
   const [pickedPosition, setPickedPosition] = useState<{ x: number; y: number; z: number } | null>(null);
+  const [ctParams, setCtParams] = useState<CtParamsPreviewParams>(DEFAULT_CT_PARAMS);
+  const [mAsInput, setMAsInput] = useState(String(DEFAULT_CT_PARAMS.mAs));
+  const [ctParamsLoading, setCtParamsLoading] = useState(false);
+  const [ctParamsError, setCtParamsError] = useState<string | null>(null);
+  const [ctParamsResult, setCtParamsResult] = useState<CtParamsPreviewResponse | null>(null);
+  const [ctParamsCopyState, setCtParamsCopyState] = useState<string | null>(null);
+  const [ctParamsDownloadState, setCtParamsDownloadState] = useState<string | null>(null);
+  const [standardizedCaseCopyState, setStandardizedCaseCopyState] = useState<string | null>(null);
+  const [standardizedCaseDownloadState, setStandardizedCaseDownloadState] = useState<string | null>(null);
 
   // ---- vtk.js volume data (decoded once from phantom) ----
   const [vtkVolumeData, setVtkVolumeData] = useState<Float32Array | null>(null);
@@ -226,6 +357,8 @@ export default function SimulationPage() {
 
   // ---- Refs ----
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const originalCompareCanvasRef = useRef<HTMLCanvasElement>(null);
+  const simulatedCompareCanvasRef = useRef<HTMLCanvasElement>(null);
   const cachedPhantomDataRef = useRef<Float32Array | null>(null);
   const cachedLabelDataRef = useRef<Uint8Array | null>(null);
   const playTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -238,12 +371,37 @@ export default function SimulationPage() {
     }
   }, [phantom]);
 
+  useEffect(() => {
+    if (!ctParamsCopyState) return;
+    const timer = window.setTimeout(() => setCtParamsCopyState(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [ctParamsCopyState]);
+
+  useEffect(() => {
+    if (!ctParamsDownloadState) return;
+    const timer = window.setTimeout(() => setCtParamsDownloadState(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [ctParamsDownloadState]);
+
+  useEffect(() => {
+    if (!standardizedCaseCopyState) return;
+    const timer = window.setTimeout(() => setStandardizedCaseCopyState(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [standardizedCaseCopyState]);
+
+  useEffect(() => {
+    if (!standardizedCaseDownloadState) return;
+    const timer = window.setTimeout(() => setStandardizedCaseDownloadState(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [standardizedCaseDownloadState]);
+
   // ---- Decode vtk.js data when phantom changes ----
   useEffect(() => {
     if (!phantom) {
       setVtkVolumeData(null);
       setVtkDims(null);
       setVtkSpacing(null);
+      setLoadedPhantomSize(null);
       cachedPhantomDataRef.current = null;
       cachedLabelDataRef.current = null;
       return;
@@ -386,105 +544,77 @@ export default function SimulationPage() {
     return { mask, labels };
   }, [lesions, phantom]);
 
+  const simulatedVolumeData = useMemo(() => {
+    if (!ctParamsResult?.simulatedVolumeBase64) return null;
+    try {
+      return decodeBase64ToFloat32(ctParamsResult.simulatedVolumeBase64);
+    } catch (err) {
+      console.error('[SimulationPage] Failed to decode simulated CT volume:', err);
+      return null;
+    }
+  }, [ctParamsResult?.simulatedVolumeBase64]);
+
   // ---- Axial slice canvas rendering ----
   const renderSlice = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !phantom) return;
 
     const { width, height, depth } = phantom.metadata;
-    // Use cached data to avoid re-decoding base64 on every render
     const data = cachedPhantomDataRef.current;
     if (!data) return;
-
-    if (sliceIndex < 0 || sliceIndex >= depth) return;
-
-    // Extract slice at sliceIndex (z-coordinate)
-    const sliceSize = width * height;
-    const offset = sliceIndex * sliceSize;
-    const slice = data.subarray(offset, offset + sliceSize);
-
-    // Extract label slice if available
-    const labelData = cachedLabelDataRef.current;
-    const labelSlice =
-      labelData && showLabelOverlay
-        ? labelData.subarray(offset, offset + sliceSize)
-        : null;
-
-    // Render to canvas
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const imageData = ctx.createImageData(width, height);
     const { windowLevel, windowWidth } = activePreset;
-
-    for (let i = 0; i < sliceSize; i++) {
-      const gray = applyWindowLevel(slice[i], windowLevel, windowWidth);
-      const pixelIdx = i * 4;
-
-      if (labelSlice && labelSlice[i] > 0) {
-        const organColor = ORGAN_COLORS[labelSlice[i]];
-        if (organColor) {
-          // Blend organ color with grayscale CT
-          const alpha = LABEL_OVERLAY_ALPHA;
-          imageData.data[pixelIdx] = gray * (1 - alpha) + organColor[0] * alpha;     // R
-          imageData.data[pixelIdx + 1] = gray * (1 - alpha) + organColor[1] * alpha; // G
-          imageData.data[pixelIdx + 2] = gray * (1 - alpha) + organColor[2] * alpha; // B
-          imageData.data[pixelIdx + 3] = 255;  // A
-        } else {
-          imageData.data[pixelIdx] = gray;
-          imageData.data[pixelIdx + 1] = gray;
-          imageData.data[pixelIdx + 2] = gray;
-          imageData.data[pixelIdx + 3] = 255;
-        }
-      } else {
-        imageData.data[pixelIdx] = gray;     // R
-        imageData.data[pixelIdx + 1] = gray; // G
-        imageData.data[pixelIdx + 2] = gray; // B
-        imageData.data[pixelIdx + 3] = 255;  // A
-      }
-    }
-
-    ctx.putImageData(imageData, 0, 0);
-
-    // Draw crosshair at picked position
-    if (pickedPosition && pickedPosition.z === sliceIndex) {
-      const cx = pickedPosition.x;
-      const cy = pickedPosition.y;
-      const size = 12;
-
-      ctx.save();
-      ctx.strokeStyle = '#ff3333';
-      ctx.lineWidth = 2;
-      ctx.shadowColor = 'rgba(0,0,0,0.8)';
-      ctx.shadowBlur = 3;
-
-      // Horizontal line
-      ctx.beginPath();
-      ctx.moveTo(cx - size, cy);
-      ctx.lineTo(cx + size, cy);
-      ctx.stroke();
-
-      // Vertical line
-      ctx.beginPath();
-      ctx.moveTo(cx, cy - size);
-      ctx.lineTo(cx, cy + size);
-      ctx.stroke();
-
-      // Circle
-      ctx.beginPath();
-      ctx.arc(cx, cy, size + 4, 0, 2 * Math.PI);
-      ctx.stroke();
-
-      ctx.restore();
-    }
+    renderVolumeSliceToCanvas({
+      canvas,
+      width,
+      height,
+      depth,
+      volumeData: data,
+      sliceIndex,
+      windowLevel,
+      windowWidth,
+      labelData: cachedLabelDataRef.current,
+      showLabelOverlay,
+      pickedPosition,
+    });
   }, [phantom, sliceIndex, activePreset, showLabelOverlay, pickedPosition]);
 
   // Re-render on slice/preset change
   useEffect(() => {
     renderSlice();
   }, [renderSlice]);
+
+  useEffect(() => {
+    const canvas = originalCompareCanvasRef.current;
+    const data = cachedPhantomDataRef.current;
+    if (!canvas || !phantom || !data) return;
+    const { width, height, depth } = phantom.metadata;
+    renderVolumeSliceToCanvas({
+      canvas,
+      width,
+      height,
+      depth,
+      volumeData: data,
+      sliceIndex,
+      windowLevel: activePreset.windowLevel,
+      windowWidth: activePreset.windowWidth,
+    });
+  }, [phantom, sliceIndex, activePreset]);
+
+  useEffect(() => {
+    const canvas = simulatedCompareCanvasRef.current;
+    if (!canvas || !phantom || !simulatedVolumeData) return;
+    const { width, height, depth } = phantom.metadata;
+    renderVolumeSliceToCanvas({
+      canvas,
+      width,
+      height,
+      depth,
+      volumeData: simulatedVolumeData,
+      sliceIndex,
+      windowLevel: activePreset.windowLevel,
+      windowWidth: activePreset.windowWidth,
+    });
+  }, [phantom, simulatedVolumeData, sliceIndex, activePreset]);
 
   // ---- Playback effect ----
   useEffect(() => {
@@ -564,6 +694,10 @@ export default function SimulationPage() {
     setPickingMode(false);
     setPhantomLoading(true);
     setPhantomError(null);
+    setCtParamsError(null);
+    setCtParamsResult(null);
+    setCtParamsCopyState(null);
+    setCtParamsDownloadState(null);
     setPhantom(null);
     setSliceIndex(0);
     setPlaying(false);
@@ -576,6 +710,7 @@ export default function SimulationPage() {
         'head_to_feet',
       );
       setPhantom(response);
+      setLoadedPhantomSize(size);
     } catch (err: any) {
       console.error('[SimulationPage] Phantom generation failed:', err);
       const detail =
@@ -602,6 +737,111 @@ export default function SimulationPage() {
   const handleSliceChange = (value: number) => {
     setSliceIndex(value);
   };
+
+  const normalizeMAsInput = useCallback(() => {
+    const trimmed = mAsInput.trim();
+    const parsed = Number(trimmed);
+    const normalized = !trimmed || Number.isNaN(parsed)
+      ? DEFAULT_MAS
+      : Math.max(MIN_MAS, Math.min(MAX_MAS, Math.round(parsed)));
+
+    setCtParams((prev) => ({ ...prev, mAs: normalized }));
+    setMAsInput(String(normalized));
+    return normalized;
+  }, [mAsInput]);
+
+  const handleRunCtParamsSimulation = async () => {
+    if (!phantom) {
+      setCtParamsError('Please generate a Real CT Atlas first.');
+      return;
+    }
+
+    const currentSource = phantom.metadata.source ?? phantomSource;
+    if (currentSource !== 'atlas') {
+      setCtParamsError('CT parameter simulation currently supports atlas source only.');
+      return;
+    }
+
+    const normalizedMAs = normalizeMAsInput();
+    const normalizedParams: CtParamsPreviewParams = {
+      ...ctParams,
+      mAs: normalizedMAs,
+    };
+
+    setCtParamsLoading(true);
+    setCtParamsError(null);
+    setCtParamsCopyState(null);
+    setCtParamsDownloadState(null);
+    setStandardizedCaseCopyState(null);
+    setStandardizedCaseDownloadState(null);
+    try {
+      const response = await simulationService.runCtParamsPreview({
+        source: 'atlas',
+        caseId: phantom.metadata.caseId || 's0001',
+        size: loadedPhantomSize ?? phantomSize,
+        scanDirection: 'head_to_feet',
+        params: normalizedParams,
+      });
+      setCtParamsResult(response);
+    } catch (err: any) {
+      console.error('[SimulationPage] CT parameter simulation failed:', err);
+      setCtParamsError(err?.message || 'Failed to run CT parameter simulation.');
+    } finally {
+      setCtParamsLoading(false);
+    }
+  };
+
+  const handleCopyCtParamsJson = async () => {
+    if (!ctParamsResult) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(ctParamsResult.paramsJson, null, 2));
+      setCtParamsCopyState('Copied');
+    } catch {
+      setCtParamsCopyState('Copy failed');
+    }
+  };
+
+  const handleDownloadCtParamsJson = useCallback(() => {
+    if (!ctParamsResult) return;
+    try {
+      const caseId = phantom?.metadata.caseId || 's0001';
+      const filename = `ct_params_simulation_${caseId}_${formatTimestampForFilename(new Date())}.json`;
+      const blob = new Blob([JSON.stringify(ctParamsResult.paramsJson, null, 2)], {
+        type: 'application/json;charset=utf-8',
+      });
+      triggerDownload(blob, filename);
+      setCtParamsDownloadState('Downloaded');
+    } catch (err) {
+      console.error('[SimulationPage] CT params JSON download failed:', err);
+      setCtParamsDownloadState('Download failed');
+    }
+  }, [ctParamsResult, phantom?.metadata.caseId]);
+
+  const handleCopyStandardizedCaseJson = async () => {
+    if (!ctParamsResult?.standardizedCase) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(ctParamsResult.standardizedCase, null, 2));
+      setStandardizedCaseCopyState('Copied');
+    } catch {
+      setStandardizedCaseCopyState('Copy failed');
+    }
+  };
+
+  const handleDownloadStandardizedCaseJson = useCallback(() => {
+    if (!ctParamsResult?.standardizedCase) return;
+    try {
+      const caseId = ctParamsResult.standardizedCase.caseId;
+      const filename = `standardized_ct_case_${caseId}.json`;
+      const blob = new Blob([JSON.stringify(ctParamsResult.standardizedCase, null, 2)], {
+        type: 'application/json;charset=utf-8',
+      });
+      triggerDownload(blob, filename);
+      setStandardizedCaseDownloadState('Downloaded');
+    } catch (err) {
+      console.error('[SimulationPage] Standardized case JSON download failed:', err);
+      setStandardizedCaseDownloadState('Download failed');
+    }
+  }, [ctParamsResult]);
 
   // -----------------------------------------------------------------------
   // Handlers: lesion form
@@ -906,6 +1146,12 @@ export default function SimulationPage() {
   // -----------------------------------------------------------------------
 
   const totalSlices = phantom ? phantom.metadata.depth : 0;
+  const ctParamsWarnings = ctParamsResult?.metadata.warnings ?? ctParamsResult?.paramsJson.warnings ?? [];
+  const huRangeBefore = ctParamsResult?.paramsJson.huRangeBefore;
+  const huRangeAfter = ctParamsResult?.paramsJson.huRangeAfter ?? ctParamsResult?.metadata.huRange;
+  const inputShape = ctParamsResult?.paramsJson.inputShape;
+  const outputShape = ctParamsResult?.paramsJson.outputShape ?? ctParamsResult?.metadata.shape;
+  const standardizedCase = ctParamsResult?.standardizedCase;
 
   return (
     <div className="flex h-full flex-col">
@@ -1438,6 +1684,54 @@ export default function SimulationPage() {
             </div>
           </div>
 
+          <div className="grid flex-shrink-0 grid-cols-1 gap-3 border-t border-border bg-zinc-950 px-4 py-3 lg:grid-cols-2">
+            <div className="flex min-h-[280px] flex-col rounded border border-white/10 bg-black">
+              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
+                <span className="text-xs font-medium text-white/70">Original CT Slice</span>
+                {phantom && (
+                  <span className="text-[10px] text-white/50">
+                    Slice {sliceIndex + 1} / {totalSlices}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-1 items-center justify-center p-2">
+                {phantom ? (
+                  <canvas
+                    ref={originalCompareCanvasRef}
+                    className="max-h-full max-w-full border border-white/10 object-contain"
+                    style={{ imageRendering: 'pixelated' }}
+                  />
+                ) : (
+                  <p className="text-sm text-white/35">Generate a CT phantom to preview original slices.</p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex min-h-[280px] flex-col rounded border border-white/10 bg-black">
+              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
+                <span className="text-xs font-medium text-white/70">Simulated CT Slice</span>
+                {ctParamsLoading && (
+                  <span className="text-[10px] text-cyan-400/80">Running CT parameter simulation...</span>
+                )}
+              </div>
+              <div className="flex flex-1 items-center justify-center p-2">
+                {ctParamsResult && simulatedVolumeData ? (
+                  <canvas
+                    ref={simulatedCompareCanvasRef}
+                    className="max-h-full max-w-full border border-white/10 object-contain"
+                    style={{ imageRendering: 'pixelated' }}
+                  />
+                ) : (
+                  <div className="px-6 text-center text-sm text-white/35">
+                    {ctParamsError && !ctParamsResult
+                      ? ctParamsError
+                      : 'Run CT Parameter Simulation to preview simulated CT.'}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
           {/* ---- Bottom: Controls bar ---- */}
           <div className="flex-shrink-0 border-t border-border bg-card px-4 py-3">
             <div className="flex items-center gap-4 flex-wrap">
@@ -1451,6 +1745,10 @@ export default function SimulationPage() {
                     setPhantomSource(src);
                     setPhantom(null);
                     setPhantomError(null);
+                    setCtParamsResult(null);
+                    setCtParamsError(null);
+                    setCtParamsCopyState(null);
+                    setCtParamsDownloadState(null);
                     // Reset size to sensible default for each mode
                     setPhantomSize(src === 'atlas' ? 192 : 128);
                   }}
@@ -1467,7 +1765,13 @@ export default function SimulationPage() {
                 <span className="text-xs text-muted-foreground">Size:</span>
                 <select
                   value={phantomSize}
-                  onChange={(e) => setPhantomSize(Number(e.target.value))}
+                  onChange={(e) => {
+                    setPhantomSize(Number(e.target.value));
+                    setCtParamsResult(null);
+                    setCtParamsError(null);
+                    setCtParamsCopyState(null);
+                    setCtParamsDownloadState(null);
+                  }}
                   disabled={phantomLoading}
                   className="rounded border border-border bg-background px-2 py-1 text-xs"
                 >
@@ -1641,6 +1945,321 @@ export default function SimulationPage() {
               )}
             </div>
 
+            <div className="mt-3 grid gap-3 border-t border-border/60 pt-3 xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
+              <div className="rounded border border-border bg-background/60 p-3">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-medium">CT Scan Params Simulation</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Runs on the loaded CT Phantom atlas and updates the simulated slice preview only.
+                    </p>
+                  </div>
+                  <Button
+                    variant="default"
+                    size="sm"
+                    onClick={handleRunCtParamsSimulation}
+                    disabled={ctParamsLoading}
+                  >
+                    {ctParamsLoading ? 'Running...' : 'Run CT Parameter Simulation'}
+                  </Button>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    Slice Thickness (mm)
+                    <select
+                      value={ctParams.sliceThicknessMm}
+                      onChange={(e) =>
+                        setCtParams((prev) => ({
+                          ...prev,
+                          sliceThicknessMm: Number(e.target.value) as CtParamsPreviewParams['sliceThicknessMm'],
+                        }))
+                      }
+                      className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                    >
+                      {[0.625, 1.0, 2.5, 5.0, 10.0].map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    Dose Level
+                    <select
+                      value={ctParams.doseLevel}
+                      onChange={(e) =>
+                        setCtParams((prev) => ({
+                          ...prev,
+                          doseLevel: e.target.value as CtParamsPreviewParams['doseLevel'],
+                        }))
+                      }
+                      className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                    >
+                      {['low', 'standard', 'high'].map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    mAs
+                    <input
+                      type="number"
+                      min={MIN_MAS}
+                      max={MAX_MAS}
+                      step={1}
+                      value={mAsInput}
+                      onChange={(e) => setMAsInput(e.target.value)}
+                      onBlur={normalizeMAsInput}
+                      className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                    />
+                    <span className="text-[11px] text-muted-foreground/80">mAs range: 30-300</span>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    kVp
+                    <select
+                      value={ctParams.kVp}
+                      onChange={(e) =>
+                        setCtParams((prev) => ({
+                          ...prev,
+                          kVp: Number(e.target.value) as CtParamsPreviewParams['kVp'],
+                        }))
+                      }
+                      className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                    >
+                      {[80, 100, 120, 140].map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    Pitch
+                    <select
+                      value={ctParams.pitch}
+                      onChange={(e) =>
+                        setCtParams((prev) => ({
+                          ...prev,
+                          pitch: Number(e.target.value) as CtParamsPreviewParams['pitch'],
+                        }))
+                      }
+                      className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                    >
+                      {[0.5, 0.8, 1.0, 1.2, 1.5].map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    FOV (mm)
+                    <select
+                      value={ctParams.fovMm}
+                      onChange={(e) =>
+                        setCtParams((prev) => ({
+                          ...prev,
+                          fovMm: Number(e.target.value) as CtParamsPreviewParams['fovMm'],
+                        }))
+                      }
+                      className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                    >
+                      {[150, 250, 350, 500].map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    Matrix Size
+                    <select
+                      value={ctParams.matrixSize}
+                      onChange={(e) =>
+                        setCtParams((prev) => ({
+                          ...prev,
+                          matrixSize: Number(e.target.value) as CtParamsPreviewParams['matrixSize'],
+                        }))
+                      }
+                      className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                    >
+                      {[256, 512, 1024].map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    Kernel
+                    <select
+                      value={ctParams.kernel}
+                      onChange={(e) =>
+                        setCtParams((prev) => ({
+                          ...prev,
+                          kernel: e.target.value as CtParamsPreviewParams['kernel'],
+                        }))
+                      }
+                      className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                    >
+                      {['smooth', 'soft', 'standard', 'lung', 'bone', 'sharp'].map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    Contrast Phase
+                    <select
+                      value={ctParams.contrastPhase}
+                      onChange={(e) =>
+                        setCtParams((prev) => ({
+                          ...prev,
+                          contrastPhase: e.target.value as CtParamsPreviewParams['contrastPhase'],
+                        }))
+                      }
+                      className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                    >
+                      {['noncontrast', 'arterial', 'venous', 'delayed'].map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+
+                {ctParamsError && (
+                  <p className="mt-3 text-xs text-red-500">{ctParamsError}</p>
+                )}
+              </div>
+
+              <div className="rounded border border-border bg-background/60 p-3">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-medium">Simulation Result</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Preview metadata and the exact parameter payload returned by the backend.
+                    </p>
+                  </div>
+                  {ctParamsResult && (
+                    <div className="flex items-center gap-2">
+                      <Button variant="outline" size="sm" onClick={handleCopyCtParamsJson}>
+                        {ctParamsCopyState || 'Copy Params JSON'}
+                      </Button>
+                      <Button variant="outline" size="sm" onClick={handleDownloadCtParamsJson}>
+                        {ctParamsDownloadState || 'Download Params JSON'}
+                      </Button>
+                    </div>
+                  )}
+                </div>
+
+                {ctParamsResult ? (
+                  <div className="space-y-3 text-sm">
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <div className="rounded border border-border/70 bg-card px-3 py-2">
+                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">HU Range</div>
+                        <div className="mt-1 text-xs text-foreground">
+                          Before: {huRangeBefore ? `${huRangeBefore[0].toFixed(1)} to ${huRangeBefore[1].toFixed(1)}` : '—'}
+                        </div>
+                        <div className="text-xs text-foreground">
+                          After: {huRangeAfter ? `${huRangeAfter[0].toFixed(1)} to ${huRangeAfter[1].toFixed(1)}` : '—'}
+                        </div>
+                      </div>
+
+                      <div className="rounded border border-border/70 bg-card px-3 py-2">
+                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Shape</div>
+                        <div className="mt-1 text-xs text-foreground">
+                          Input: {inputShape ? inputShape.join(' × ') : '—'}
+                        </div>
+                        <div className="text-xs text-foreground">
+                          Output: {outputShape ? outputShape.join(' × ') : '—'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <div className="rounded border border-border/70 bg-card px-3 py-2">
+                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                          Effective Slice Thickness
+                        </div>
+                        <div className="mt-1 text-xs text-foreground">
+                          {ctParamsResult.metadata.effectiveSliceThicknessMm.toFixed(3)} mm
+                        </div>
+                      </div>
+
+                      <div className="rounded border border-border/70 bg-card px-3 py-2">
+                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Warnings</div>
+                        <div className="mt-1 text-xs text-foreground">
+                          {ctParamsWarnings.length > 0 ? ctParamsWarnings.join(' | ') : 'None'}
+                        </div>
+                      </div>
+                    </div>
+
+                    {standardizedCase && (
+                      <div className="rounded border border-border/70 bg-card px-3 py-2">
+                        <div className="mb-2 flex items-center justify-between gap-3">
+                          <div>
+                            <div className="text-xs font-medium text-foreground">
+                              Standardized Output for Downstream Modules
+                            </div>
+                            <div className="text-[11px] text-muted-foreground">
+                              Lightweight standardized case metadata for downstream artifact or lesion modules.
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Button variant="outline" size="sm" onClick={handleCopyStandardizedCaseJson}>
+                              {standardizedCaseCopyState || 'Copy Standardized Case JSON'}
+                            </Button>
+                            <Button variant="outline" size="sm" onClick={handleDownloadStandardizedCaseJson}>
+                              {standardizedCaseDownloadState || 'Download Standardized Case JSON'}
+                            </Button>
+                          </div>
+                        </div>
+
+                        <div className="grid gap-2 text-xs text-foreground sm:grid-cols-2 xl:grid-cols-3">
+                          <div><span className="text-muted-foreground">case_id:</span> {standardizedCase.caseId}</div>
+                          <div><span className="text-muted-foreground">source:</span> {standardizedCase.source}</div>
+                          <div><span className="text-muted-foreground">shape:</span> {standardizedCase.volume.shape.join(' x ')}</div>
+                          <div><span className="text-muted-foreground">spacing:</span> {standardizedCase.volume.spacing.join(', ')}</div>
+                          <div><span className="text-muted-foreground">hu_range:</span> {standardizedCase.volume.huRange[0].toFixed(1)} to {standardizedCase.volume.huRange[1].toFixed(1)}</div>
+                          <div><span className="text-muted-foreground">slice_count:</span> {standardizedCase.volume.sliceCount}</div>
+                          <div><span className="text-muted-foreground">dtype:</span> {standardizedCase.volume.dtype}</div>
+                          <div><span className="text-muted-foreground">axis_order:</span> {standardizedCase.volume.axisOrder}</div>
+                          <div><span className="text-muted-foreground">image_data_field:</span> {standardizedCase.volume.imageDataField}</div>
+                        </div>
+                      </div>
+                    )}
+
+                    <details className="rounded border border-border/70 bg-card px-3 py-2">
+                      <summary className="cursor-pointer text-xs font-medium text-foreground">
+                        Params JSON
+                      </summary>
+                      <pre className="mt-2 overflow-auto whitespace-pre-wrap break-all text-[11px] text-muted-foreground">
+                        {JSON.stringify(ctParamsResult.paramsJson, null, 2)}
+                      </pre>
+                    </details>
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    Run CT Parameter Simulation to populate preview metadata and params JSON.
+                  </p>
+                )}
+              </div>
+            </div>
+
             {/* ---- Label legend (compact, shown when labels available) ---- */}
             {phantom?.labelBase64 && showLabelOverlay && (
               <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 border-t border-border/50 pt-2">
@@ -1792,4 +2411,17 @@ function triggerDownload(blob: Blob, filename: string) {
   a.click();
   window.URL.revokeObjectURL(url);
   document.body.removeChild(a);
+}
+
+function formatTimestampForFilename(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+  ].join('') + '_' + [
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join('');
 }

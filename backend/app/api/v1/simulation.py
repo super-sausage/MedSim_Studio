@@ -1,4 +1,4 @@
-"""
+﻿"""
 Simulation API
 
 RESTful endpoints for lesion and organ simulation management.
@@ -12,7 +12,7 @@ import base64
 import uuid
 import tempfile
 import logging
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
@@ -35,11 +35,14 @@ from app.schemas.simulation import (
     DebugLesionResponse,
     LesionAnalysisRequest,
     LesionAnalysisResponse,
+    CTParamsPreviewRequest,
+    CTParamsPreviewResponse,
 )
 from app.simulation.lesion.generator import LesionGenerator
 from app.simulation.organ.simulator import OrganSimulator
 from app.simulation.volume_builder import build_volume_from_dicom, build_synthetic_volume
 from app.simulation.exporter import export_nrrd, export_nifti, export_dicom_zip
+from app.simulation.ct_params_simulator import simulate_ct_scan_params
 from app.simulation.phantom_generator import (
     generate_upper_body_ct_phantom,
     generate_atlas_ct_phantom,
@@ -301,6 +304,59 @@ def _debug_log_spacing(
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/simulation", tags=["Simulation"])
+DEFAULT_STANDARDIZED_NOTES = [
+    "axis_order = zyx",
+    "dtype = float32",
+    "spacing order = z,y,x",
+    "volume data is stored in top-level simulated_volume_base64",
+    "standardized_case is intended for downstream artifact/lesion modules",
+]
+def _build_standardized_ct_case(
+    *,
+    source: str,
+    source_case_id: str,
+    simulated_volume: np.ndarray,
+    spacing: tuple[float, float, float],
+    params_json: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    hu_range = metadata.get("hu_range") or [
+        float(np.min(simulated_volume)),
+        float(np.max(simulated_volume)),
+    ]
+    return {
+        "case_id": f"sim_{source}_{source_case_id}_{timestamp}",
+        "source": source,
+        "source_case_id": source_case_id,
+        "volume": {
+            "encoding": "base64",
+            "dtype": "float32",
+            "byte_order": "little_endian",
+            "axis_order": "zyx",
+            "shape": [int(v) for v in simulated_volume.shape],
+            "spacing": [float(v) for v in spacing],
+            "origin": [0.0, 0.0, 0.0],
+            "direction": [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "hu_range": [float(hu_range[0]), float(hu_range[1])],
+            "slice_count": int(simulated_volume.shape[0]),
+            "modality": "CT",
+            "body_part": "upper_body",
+            "image_kind": "simulated_ct",
+            "image_data_field": "simulated_volume_base64",
+        },
+        "simulation": {
+            "type": "ct_scan_params",
+            "params_json": params_json,
+            "algorithm": "image_domain_approximation",
+            "approximation_warning": "This is an educational image-domain approximation, not a scanner-physics simulation.",
+        },
+        "metadata": metadata,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +433,7 @@ def run_simulation_job(job_id: str) -> None:
                     volume, metadata = None, None
 
         if volume is None:
-            # No source DICOM or read failed — generate synthetic base volume
+            # No source DICOM or read failed 鈥?generate synthetic base volume
             volume, metadata = build_synthetic_volume()
             logger.info("Job %s: using synthetic base volume", job_id)
 
@@ -583,7 +639,7 @@ def run_simulation_job(job_id: str) -> None:
                 job.status = "failed"
                 job.error_message = f"{type(e).__name__}: {str(e)[:200]}"
                 job.updated_at = datetime.utcnow()
-                # output_path stays None on failure — never write a fake value
+                # output_path stays None on failure 鈥?never write a fake value
                 db.commit()
                 logger.info("Job %s marked as failed", job_id)
         except Exception:
@@ -668,7 +724,7 @@ async def create_simulation_job(
     db.commit()
     db.refresh(job)
 
-    # Enqueue background execution — job_id is a plain string,
+    # Enqueue background execution 鈥?job_id is a plain string,
     # the background task creates its own DB session.
     background_tasks.add_task(run_simulation_job, job_id)
 
@@ -767,10 +823,10 @@ async def preview_lesion_on_dicom(
     and returns a base64-encoded side-by-side PNG (original | with lesion)
     of the axial slice through the lesion center.
 
-    Synchronous — intended for interactive parameter tuning.
+    Synchronous 鈥?intended for interactive parameter tuning.
     """
     try:
-        # ── 1. Load DICOM instances ──
+        # 鈹€鈹€ 1. Load DICOM instances 鈹€鈹€
         instances = (
             db.query(DicomInstance)
             .filter(DicomInstance.series_id == request.series_id)
@@ -783,7 +839,7 @@ async def preview_lesion_on_dicom(
         storage = get_storage_backend()
         volume, metadata = build_volume_from_dicom(storage, instances)
 
-        # ── 2. Generate lesion ──
+        # 鈹€鈹€ 2. Generate lesion 鈹€鈹€
         generator = LesionGenerator()
         lesion_cfg = request.lesion
 
@@ -829,7 +885,7 @@ async def preview_lesion_on_dicom(
         result_volume = volume.copy()
         result_volume[lesion_mask] = lesion_vol[lesion_mask]
 
-        # ── 3. Compute lesion region stats ──
+        # Compute lesion region stats.
         if lesion_mask.any():
             hu_values = result_volume[lesion_mask]
             stats_voxels = int(np.sum(lesion_mask))
@@ -845,11 +901,11 @@ async def preview_lesion_on_dicom(
             stats_hu_min = stats_hu_max = stats_hu_mean = stats_hu_std = 0.0
             stats_volume_mm3 = 0.0
 
-        # ── 4. Find the slice closest to the lesion center ──
+        # 鈹€鈹€ 4. Find the slice closest to the lesion center 鈹€鈹€
         cz_idx = int(round(cz))
         cz_idx = max(0, min(cz_idx, volume.shape[0] - 1))
 
-        # ── 5. Render side-by-side preview PNG ──
+        # 鈹€鈹€ 5. Render side-by-side preview PNG 鈹€鈹€
         wc = request.window_center
         ww = request.window_width
         half = ww / 2.0
@@ -870,7 +926,7 @@ async def preview_lesion_on_dicom(
         combined[:, w:w + 4] = 160
         combined[:, w + 4:] = after_slice
 
-        # Add labels (original / with lesion) — simple pixel-based label
+        # Add labels (original / with lesion) 鈥?simple pixel-based label
         # "Original" label at top-left
         combined[4:10, 6:6 + 8 * 6] = 200  # placeholder bar
         # "With Lesion" label at top-right
@@ -1215,8 +1271,105 @@ async def preview_organ(config: dict):
 
 
 # ---------------------------------------------------------------------------
-# CT Phantom — synthetic upper-body CT volume for frontend demo
+# CT Phantom 鈥?synthetic upper-body CT volume for frontend demo
 # ---------------------------------------------------------------------------
+
+
+@router.post("/ct-params/preview", response_model=CTParamsPreviewResponse)
+async def preview_ct_scan_params(request: CTParamsPreviewRequest):
+    """
+    Generate an atlas CT parameter preview for the Phase 1 MVP.
+
+    The frontend already has access to the original phantom volume, so this
+    endpoint returns only the simulated volume plus metadata and params_json.
+    """
+    try:
+        if request.source != "atlas":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Phase 1 ct-params preview currently supports source='atlas' only. "
+                    "Procedural phantom integration is deferred to Phase 2."
+                ),
+            )
+
+        ct_volume, label_volume, phantom_metadata = generate_atlas_ct_phantom(
+            case_id=request.case_id,
+            size=request.size,
+            scan_direction=request.scan_direction,
+        )
+
+        simulation_result = simulate_ct_scan_params(
+            volume=ct_volume,
+            spacing=tuple(phantom_metadata.get("spacing", (1.0, 1.0, 1.0))),
+            params=request.params.model_dump(),
+            label_volume=label_volume,
+        )
+
+        simulated_volume = simulation_result["simulated_volume"]
+        simulated_spacing = tuple(
+            simulation_result.get(
+                "simulated_spacing",
+                phantom_metadata.get("output_spacing", (1.0, 1.0, 1.0)),
+            )
+        )
+        standardized_notes = [
+            *DEFAULT_STANDARDIZED_NOTES,
+            "origin uses default [0, 0, 0] because atlas origin is not propagated in this preview response.",
+            "direction uses identity matrix because atlas direction is not propagated in this preview response.",
+        ]
+        metadata = {
+            **simulation_result["metadata"],
+            "source": request.source,
+            "case_id": request.case_id,
+            "scan_direction": request.scan_direction,
+            "preview_stats": simulation_result["preview_stats"],
+            "phantom_metadata": {
+                "original_shape": phantom_metadata.get("original_shape"),
+                "output_shape": phantom_metadata.get("output_shape"),
+                "original_spacing": phantom_metadata.get("original_spacing"),
+                "output_spacing": phantom_metadata.get("output_spacing"),
+                "flipped_z": phantom_metadata.get("flipped_z"),
+            },
+            "notes": standardized_notes,
+        }
+        params_json = {
+            **simulation_result["params_json"],
+            "notes": standardized_notes,
+        }
+        standardized_case = _build_standardized_ct_case(
+            source=request.source,
+            source_case_id=request.case_id,
+            simulated_volume=simulated_volume,
+            spacing=simulated_spacing,
+            params_json=params_json,
+            metadata=metadata,
+        )
+
+        volume_b64 = base64.b64encode(
+            np.asarray(simulated_volume, dtype="<f4").tobytes()
+        ).decode("ascii")
+
+        return CTParamsPreviewResponse(
+            simulated_volume_base64=volume_b64,
+            metadata=metadata,
+            params_json=params_json,
+            standardized_case=standardized_case,
+        )
+
+    except HTTPException:
+        raise
+    except FileNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.exception("CT parameter preview failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"CT parameter preview failed: {str(e)[:300]}",
+        )
 
 
 @router.get("/phantom")
@@ -1236,12 +1389,12 @@ async def generate_ct_phantom(
 
     - **procedural** (default):
       Synthetic upper-body CT phantom built from geometric primitives
-      (ellipses, arcs).  NOT a real medical image — suitable for UI
+      (ellipses, arcs).  NOT a real medical image 鈥?suitable for UI
       development and demo.
 
     - **atlas**:
       Loads a real CT volume from models/phantom_atlas/{case_id}/.
-      The CT is resampled so its largest dimension ≤ size.  If an
+      The CT is resampled so its largest dimension 鈮?size.  If an
       organs_label.nii.gz file is present it is converted to a uint8
       label map and returned alongside the CT volume.
 
@@ -1305,7 +1458,7 @@ async def generate_ct_phantom(
             )
 
     except FileNotFoundError as e:
-        logger.warning("Phantom generation — file not found: %s", e)
+        logger.warning("Phantom generation 鈥?file not found: %s", e)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
@@ -1319,7 +1472,7 @@ async def generate_ct_phantom(
 
 
 # ---------------------------------------------------------------------------
-# Export (placeholder — Phase 3 will implement real logic)
+# Export (placeholder 鈥?Phase 3 will implement real logic)
 # ---------------------------------------------------------------------------
 
 
@@ -1354,7 +1507,7 @@ async def export_simulation_results(
     if not job.output_path:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Job output_path is empty — simulation did not complete successfully",
+            detail="Job output_path is empty 鈥?simulation did not complete successfully",
         )
 
     allowed_formats = ("dicom", "nifti", "nrrd")
@@ -1381,3 +1534,5 @@ async def export_simulation_results(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Export failed: {str(e)[:200]}",
         )
+
+
