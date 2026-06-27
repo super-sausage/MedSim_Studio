@@ -1,5 +1,10 @@
 import { api } from './api';
-import type { LesionConfig, SimulationJob } from '@/types/simulation';
+import type {
+  CtParamsPreviewRequest,
+  CtParamsPreviewResponse,
+  LesionConfig,
+  SimulationJob,
+} from '@/types/simulation';
 import type { AxiosProgressEvent, AxiosResponse } from 'axios';
 
 /**
@@ -247,6 +252,10 @@ export const simulationService = {
     api.get<PhantomResponse>(
       `/simulation/phantom?source=${source}&size=${size}&case_id=${caseId}&scan_direction=${scanDirection}`,
     ),
+
+  /** Run CT scan parameter simulation preview for the current phantom */
+  runCtParamsPreview: (request: CtParamsPreviewRequest): Promise<CtParamsPreviewResponse> =>
+    api.post<CtParamsPreviewResponse>('/simulation/ct-params/preview', request),
 };
 
 export type { PreviewResponse };

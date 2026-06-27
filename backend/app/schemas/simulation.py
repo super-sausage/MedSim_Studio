@@ -1,12 +1,13 @@
 """
 Simulation Pydantic Schemas
 
-Request/response schemas for lesion and organ simulation APIs.
+Request/response schemas for lesion, organ, and CT parameter simulation APIs.
 """
 
 from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
+
 from pydantic import BaseModel, Field
-from typing import Optional, List
 
 
 class LesionConfigCreate(BaseModel):
@@ -93,3 +94,36 @@ class DicomLesionPreviewResponse(BaseModel):
     hu_std: float
     voxel_count: int
     volume_mm3: float
+
+
+class CTParamsPreviewParams(BaseModel):
+    """CT scan parameter simulation controls for preview."""
+
+    slice_thickness_mm: Literal[0.625, 1.0, 2.5, 5.0, 10.0] = 1.0
+    dose_level: Literal["low", "standard", "high"] = "standard"
+    mAs: int = Field(150, ge=30, le=300)
+    kVp: Literal[80, 100, 120, 140] = 120
+    pitch: Literal[0.5, 0.8, 1.0, 1.2, 1.5] = 1.0
+    fov_mm: Literal[150, 250, 350, 500] = 350
+    matrix_size: Literal[256, 512, 1024] = 512
+    kernel: Literal["soft", "standard", "lung", "bone", "sharp", "smooth"] = "standard"
+    contrast_phase: Literal["noncontrast", "arterial", "venous", "delayed"] = "noncontrast"
+
+
+class CTParamsPreviewRequest(BaseModel):
+    """Request payload for atlas CT parameter preview."""
+
+    source: Literal["atlas", "procedural"] = "atlas"
+    case_id: str = "s0001"
+    size: int = Field(160, ge=64, le=192)
+    scan_direction: Literal["head_to_feet", "feet_to_head"] = "head_to_feet"
+    params: CTParamsPreviewParams
+
+
+class CTParamsPreviewResponse(BaseModel):
+    """Preview response for CT scan parameter simulation."""
+
+    simulated_volume_base64: str
+    metadata: Dict[str, Any]
+    params_json: Dict[str, Any]
+    standardized_case: Dict[str, Any]
