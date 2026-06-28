@@ -40,8 +40,8 @@ from app.simulation.volume_builder import build_volume_from_dicom, build_synthet
 from app.simulation.exporter import export_nrrd, export_nifti, export_dicom_zip
 from app.simulation.ct_params_simulator import simulate_ct_scan_params
 from app.simulation.phantom_generator import (
-    generate_upper_body_ct_phantom,
     generate_atlas_ct_phantom,
+    generate_procedural_ct_phantom,
 )
 from app.dicom.storage import get_storage_backend
 
@@ -58,7 +58,7 @@ DEFAULT_STANDARDIZED_NOTES = [
 def _build_standardized_ct_case(
     *,
     source: str,
-    source_case_id: str,
+    source_case_id: Optional[str],
     simulated_volume: np.ndarray,
     spacing: tuple[float, float, float],
     params_json: Dict[str, Any],
@@ -69,8 +69,13 @@ def _build_standardized_ct_case(
         float(np.min(simulated_volume)),
         float(np.max(simulated_volume)),
     ]
+    case_id = (
+        f"sim_{source}_{source_case_id}_{timestamp}"
+        if source_case_id
+        else f"sim_{source}_{timestamp}"
+    )
     return {
-        "case_id": f"sim_{source}_{source_case_id}_{timestamp}",
+        "case_id": case_id,
         "source": source,
         "source_case_id": source_case_id,
         "volume": {
@@ -674,26 +679,30 @@ async def preview_organ(config: dict):
 @router.post("/ct-params/preview", response_model=CTParamsPreviewResponse)
 async def preview_ct_scan_params(request: CTParamsPreviewRequest):
     """
-    Generate an atlas CT parameter preview for the Phase 1 MVP.
+    Generate a CT parameter preview for atlas or procedural phantoms.
 
     The frontend already has access to the original phantom volume, so this
     endpoint returns only the simulated volume plus metadata and params_json.
     """
     try:
-        if request.source != "atlas":
+        if request.source not in {"atlas", "procedural"}:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "Phase 1 ct-params preview currently supports source='atlas' only. "
-                    "Procedural phantom integration is deferred to Phase 2."
-                ),
+                detail=f"Unsupported source for CT parameter preview: {request.source}",
             )
 
-        ct_volume, label_volume, phantom_metadata = generate_atlas_ct_phantom(
-            case_id=request.case_id,
-            size=request.size,
-            scan_direction=request.scan_direction,
-        )
+        if request.source == "atlas":
+            source_case_id = request.case_id or "s0001"
+            ct_volume, label_volume, phantom_metadata = generate_atlas_ct_phantom(
+                case_id=source_case_id,
+                size=request.size,
+                scan_direction=request.scan_direction,
+            )
+        else:
+            source_case_id = "procedural"
+            ct_volume, label_volume, phantom_metadata = generate_procedural_ct_phantom(
+                size=request.size,
+            )
 
         simulation_result = simulate_ct_scan_params(
             volume=ct_volume,
@@ -717,7 +726,7 @@ async def preview_ct_scan_params(request: CTParamsPreviewRequest):
         metadata = {
             **simulation_result["metadata"],
             "source": request.source,
-            "case_id": request.case_id,
+            "case_id": request.case_id if request.source == "atlas" else None,
             "scan_direction": request.scan_direction,
             "preview_stats": simulation_result["preview_stats"],
             "phantom_metadata": {
@@ -735,7 +744,7 @@ async def preview_ct_scan_params(request: CTParamsPreviewRequest):
         }
         standardized_case = _build_standardized_ct_case(
             source=request.source,
-            source_case_id=request.case_id,
+            source_case_id=source_case_id,
             simulated_volume=simulated_volume,
             spacing=simulated_spacing,
             params_json=params_json,
@@ -837,13 +846,10 @@ async def generate_ct_phantom(
 
         else:
             # --- procedural (default) ---
-            shape = (size, size, size)
-            volume, metadata = generate_upper_body_ct_phantom(shape=shape)
+            volume, _, metadata = generate_procedural_ct_phantom(size=size)
 
             raw_bytes = volume.astype(np.float32).tobytes()
             volume_b64 = base64.b64encode(raw_bytes).decode("ascii")
-
-            metadata["source"] = "procedural"
 
             return JSONResponse(
                 content={

@@ -653,13 +653,13 @@ export default function SimulationPage() {
 
   const handleRunCtParamsSimulation = async () => {
     if (!phantom) {
-      setCtParamsError('Please generate a Real CT Atlas first.');
+      setCtParamsError('Please generate a CT phantom first.');
       return;
     }
 
     const currentSource = phantom.metadata.source ?? phantomSource;
-    if (currentSource !== 'atlas') {
-      setCtParamsError('CT parameter simulation currently supports atlas source only.');
+    if (currentSource !== 'atlas' && currentSource !== 'procedural') {
+      setCtParamsError(`Unsupported source for CT parameter simulation: ${String(currentSource)}`);
       return;
     }
 
@@ -677,9 +677,9 @@ export default function SimulationPage() {
     setStandardizedCaseDownloadState(null);
     try {
       const response = await simulationService.runCtParamsPreview({
-        source: 'atlas',
-        caseId: phantom.metadata.caseId || 's0001',
-        size: loadedPhantomSize ?? phantomSize,
+        source: currentSource,
+        caseId: currentSource === 'atlas' ? (phantom.metadata.caseId || 's0001') : null,
+        size: phantom.metadata.width,
         scanDirection: 'head_to_feet',
         params: normalizedParams,
       });
@@ -1850,7 +1850,7 @@ export default function SimulationPage() {
                   <div>
                     <h3 className="text-sm font-medium">CT Scan Params Simulation</h3>
                     <p className="text-xs text-muted-foreground">
-                      Runs on the loaded CT Phantom atlas and updates the simulated slice preview only.
+                      CT parameter simulation supports Real CT Atlas and Procedural Phantom.
                     </p>
                   </div>
                   <Button

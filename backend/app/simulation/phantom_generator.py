@@ -378,6 +378,20 @@ def generate_upper_body_ct_phantom(
 
     return volume, metadata
 
+def generate_procedural_ct_phantom(
+    size: int = 192,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+    """
+    Generate a procedural CT phantom using the existing synthetic volume logic.
+
+    This mirrors the `/simulation/phantom` procedural branch so other callers
+    can reuse the same output contract without duplicating generation code.
+    """
+    shape = (size, size, size)
+    volume, metadata = generate_upper_body_ct_phantom(shape=shape)
+    metadata["source"] = "procedural"
+    return volume, None, metadata
+
 
 # ---------------------------------------------------------------------------
 # Atlas-based CT phantom — real CT volume from disk
