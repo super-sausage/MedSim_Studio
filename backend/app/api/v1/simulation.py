@@ -23,7 +23,7 @@ import numpy as np
 
 from app.database.session import get_db, SessionLocal
 from app.models.simulation import SimulationJob, LesionConfig, OrganConfig
-from app.models.dicom import DicomInstance
+from app.models.dicom import DicomInstance, DicomSeries
 from app.schemas.simulation import (
     SimulationJobResponse,
     SimulationJobCreate,
@@ -311,6 +311,41 @@ DEFAULT_STANDARDIZED_NOTES = [
     "volume data is stored in top-level simulated_volume_base64",
     "standardized_case is intended for downstream artifact/lesion modules",
 ]
+
+
+def _identity_direction_matrix() -> List[List[float]]:
+    return [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+
+
+def _normalize_origin(origin: Optional[Any]) -> List[float]:
+    if isinstance(origin, (list, tuple)) and len(origin) >= 3:
+        try:
+            return [float(origin[0]), float(origin[1]), float(origin[2])]
+        except (TypeError, ValueError):
+            pass
+    return [0.0, 0.0, 0.0]
+
+
+def _normalize_direction(direction: Optional[Any]) -> List[List[float]]:
+    if isinstance(direction, (list, tuple)):
+        if len(direction) == 9:
+            try:
+                values = [float(v) for v in direction]
+                return [values[0:3], values[3:6], values[6:9]]
+            except (TypeError, ValueError):
+                return _identity_direction_matrix()
+        if len(direction) == 3 and all(isinstance(row, (list, tuple)) and len(row) >= 3 for row in direction):
+            try:
+                return [[float(row[0]), float(row[1]), float(row[2])] for row in direction]
+            except (TypeError, ValueError):
+                return _identity_direction_matrix()
+    return _identity_direction_matrix()
+
+
 def _build_standardized_ct_case(
     *,
     source: str,
@@ -319,6 +354,9 @@ def _build_standardized_ct_case(
     spacing: tuple[float, float, float],
     params_json: Dict[str, Any],
     metadata: Dict[str, Any],
+    origin: Optional[Any] = None,
+    direction: Optional[Any] = None,
+    body_part: Optional[str] = None,
 ) -> Dict[str, Any]:
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     hu_range = metadata.get("hu_range") or [
@@ -341,16 +379,12 @@ def _build_standardized_ct_case(
             "axis_order": "zyx",
             "shape": [int(v) for v in simulated_volume.shape],
             "spacing": [float(v) for v in spacing],
-            "origin": [0.0, 0.0, 0.0],
-            "direction": [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
+            "origin": _normalize_origin(origin),
+            "direction": _normalize_direction(direction),
             "hu_range": [float(hu_range[0]), float(hu_range[1])],
             "slice_count": int(simulated_volume.shape[0]),
             "modality": "CT",
-            "body_part": "upper_body",
+            "body_part": body_part or "unknown",
             "image_kind": "simulated_ct",
             "image_data_field": "simulated_volume_base64",
         },
@@ -1281,19 +1315,29 @@ async def preview_organ(config: dict):
 
 
 @router.post("/ct-params/preview", response_model=CTParamsPreviewResponse)
-async def preview_ct_scan_params(request: CTParamsPreviewRequest):
+async def preview_ct_scan_params(
+    request: CTParamsPreviewRequest,
+    db: Session = Depends(get_db),
+):
     """
-    Generate a CT parameter preview for atlas or procedural phantoms.
+    Generate a CT parameter preview for atlas, procedural, or uploaded DICOM CT volumes.
 
     The frontend already has access to the original phantom volume, so this
     endpoint returns only the simulated volume plus metadata and params_json.
     """
     try:
-        if request.source not in {"atlas", "procedural"}:
+        if request.source not in {"atlas", "procedural", "dicom"}:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unsupported source for CT parameter preview: {request.source}",
             )
+
+        label_volume = None
+        source_origin: Optional[Any] = None
+        source_direction: Optional[Any] = None
+        body_part = "upper_body"
+        standardized_notes = list(DEFAULT_STANDARDIZED_NOTES)
+        extra_metadata: Dict[str, Any] = {}
 
         if request.source == "atlas":
             source_case_id = request.case_id or "s0001"
@@ -1302,15 +1346,139 @@ async def preview_ct_scan_params(request: CTParamsPreviewRequest):
                 size=request.size,
                 scan_direction=request.scan_direction,
             )
-        else:
+            source_spacing = tuple(phantom_metadata.get("spacing", (1.0, 1.0, 1.0)))
+            standardized_notes.extend([
+                "origin uses default [0, 0, 0] because atlas origin is not propagated in this preview response.",
+                "direction uses identity matrix because atlas direction is not propagated in this preview response.",
+            ])
+            extra_metadata = {
+                "case_id": source_case_id,
+                "scan_direction": request.scan_direction,
+                "phantom_metadata": {
+                    "original_shape": phantom_metadata.get("original_shape"),
+                    "output_shape": phantom_metadata.get("output_shape"),
+                    "original_spacing": phantom_metadata.get("original_spacing"),
+                    "output_spacing": phantom_metadata.get("output_spacing"),
+                    "flipped_z": phantom_metadata.get("flipped_z"),
+                },
+            }
+        elif request.source == "procedural":
             source_case_id = "procedural"
             ct_volume, label_volume, phantom_metadata = generate_procedural_ct_phantom(
                 size=request.size,
             )
+            source_spacing = tuple(phantom_metadata.get("spacing", (1.0, 1.0, 1.0)))
+            standardized_notes.extend([
+                "origin uses default [0, 0, 0] because procedural phantom origin is not propagated in this preview response.",
+                "direction uses identity matrix because procedural phantom direction is not propagated in this preview response.",
+            ])
+            extra_metadata = {
+                "case_id": None,
+                "scan_direction": request.scan_direction,
+                "phantom_metadata": {
+                    "original_shape": phantom_metadata.get("original_shape"),
+                    "output_shape": phantom_metadata.get("output_shape"),
+                    "original_spacing": phantom_metadata.get("original_spacing"),
+                    "output_spacing": phantom_metadata.get("output_spacing"),
+                    "flipped_z": phantom_metadata.get("flipped_z"),
+                },
+            }
+        else:
+            if not request.series_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="series_id is required when source='dicom'",
+                )
+
+            series_query = db.query(DicomSeries).filter(DicomSeries.id == request.series_id)
+            if request.study_id:
+                series_query = series_query.filter(DicomSeries.study_id == request.study_id)
+            series = series_query.first()
+            if not series:
+                if request.study_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Series {request.series_id} not found in study {request.study_id}",
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Series {request.series_id} not found",
+                )
+
+            if series.modality and str(series.modality).upper() != "CT":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Series {request.series_id} modality '{series.modality}' is not supported for CT parameter preview",
+                )
+
+            instances = (
+                db.query(DicomInstance)
+                .filter(DicomInstance.series_id == series.id)
+                .order_by(DicomInstance.instance_number.asc().nulls_last())
+                .all()
+            )
+            if not instances:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"No DICOM instances found for series {series.id}",
+                )
+
+            storage = get_storage_backend()
+            try:
+                ct_volume, dicom_metadata = build_volume_from_dicom(storage, instances)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Failed to build DICOM volume for series {series.id}: {str(e)}",
+                ) from e
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to build DICOM volume for series {series.id}: {str(e)[:300]}",
+                ) from e
+
+            source_case_id = series.id
+            source_spacing = tuple(dicom_metadata.get("spacing", (1.0, 1.0, 1.0)))
+            source_origin = dicom_metadata.get("origin")
+            source_direction = dicom_metadata.get("direction")
+            body_part = series.body_part_examined or "unknown"
+
+            if not series.modality:
+                standardized_notes.append(
+                    "DICOM series modality is missing in metadata; CT compatibility could not be verified beyond HU reconstruction."
+                )
+            if source_origin is None or _normalize_origin(source_origin) == [0.0, 0.0, 0.0]:
+                standardized_notes.append(
+                    "origin defaults to [0, 0, 0] or partial z-only origin because complete DICOM patient-space origin is not fully reconstructed by the current volume builder."
+                )
+            if source_direction is None or _normalize_direction(source_direction) == _identity_direction_matrix():
+                standardized_notes.append(
+                    "direction uses identity because the current volume builder does not reconstruct patient orientation from DICOM ImageOrientationPatient."
+                )
+            if not series.body_part_examined:
+                standardized_notes.append(
+                    "body_part defaults to 'unknown' because BodyPartExamined is missing in DICOM metadata."
+                )
+
+            extra_metadata = {
+                "case_id": None,
+                "study_id": series.study_id,
+                "series_id": series.id,
+                "dicom_metadata": {
+                    "series_instance_uid": series.series_instance_uid,
+                    "series_number": series.series_number,
+                    "series_description": series.series_description,
+                    "modality": series.modality,
+                    "body_part_examined": series.body_part_examined,
+                    "image_count": series.image_count,
+                    "instance_count": len(instances),
+                    "builder_num_slices": dicom_metadata.get("num_slices"),
+                },
+            }
 
         simulation_result = simulate_ct_scan_params(
             volume=ct_volume,
-            spacing=tuple(phantom_metadata.get("spacing", (1.0, 1.0, 1.0))),
+            spacing=source_spacing,
             params=request.params.model_dump(),
             label_volume=label_volume,
         )
@@ -1319,27 +1487,14 @@ async def preview_ct_scan_params(request: CTParamsPreviewRequest):
         simulated_spacing = tuple(
             simulation_result.get(
                 "simulated_spacing",
-                phantom_metadata.get("output_spacing", (1.0, 1.0, 1.0)),
+                extra_metadata.get("phantom_metadata", {}).get("output_spacing", source_spacing),
             )
         )
-        standardized_notes = [
-            *DEFAULT_STANDARDIZED_NOTES,
-            "origin uses default [0, 0, 0] because atlas origin is not propagated in this preview response.",
-            "direction uses identity matrix because atlas direction is not propagated in this preview response.",
-        ]
         metadata = {
             **simulation_result["metadata"],
             "source": request.source,
-            "case_id": request.case_id if request.source == "atlas" else None,
-            "scan_direction": request.scan_direction,
             "preview_stats": simulation_result["preview_stats"],
-            "phantom_metadata": {
-                "original_shape": phantom_metadata.get("original_shape"),
-                "output_shape": phantom_metadata.get("output_shape"),
-                "original_spacing": phantom_metadata.get("original_spacing"),
-                "output_spacing": phantom_metadata.get("output_spacing"),
-                "flipped_z": phantom_metadata.get("flipped_z"),
-            },
+            **extra_metadata,
             "notes": standardized_notes,
         }
         params_json = {
@@ -1353,6 +1508,9 @@ async def preview_ct_scan_params(request: CTParamsPreviewRequest):
             spacing=simulated_spacing,
             params_json=params_json,
             metadata=metadata,
+            origin=source_origin,
+            direction=source_direction,
+            body_part=body_part,
         )
 
         volume_b64 = base64.b64encode(
