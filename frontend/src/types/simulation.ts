@@ -105,7 +105,7 @@ export interface CtParamsPreviewParams {
 
 export interface CtParamsPreviewRequest {
   source: CtPhantomSource;
-  caseId: string;
+  caseId?: string | null;
   size: number;
   scanDirection: CtScanDirection;
   params: CtParamsPreviewParams;
@@ -183,9 +183,9 @@ export interface StandardizedCtCaseSimulation {
   approximationWarning: string;
 }
 export interface StandardizedCtCase {
-  caseId: string;
+  caseId?: string | null;
   source: CtPhantomSource;
-  sourceCaseId: string;
+  sourceCaseId: string | null;
   volume: StandardizedCtCaseVolume;
   simulation: StandardizedCtCaseSimulation;
   metadata: CtParamsPreviewMetadata;

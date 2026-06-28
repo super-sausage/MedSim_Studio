@@ -274,10 +274,10 @@ class CTParamsPreviewParams(BaseModel):
 
 
 class CTParamsPreviewRequest(BaseModel):
-    """Request payload for atlas CT parameter preview."""
+    """Request payload for CT parameter preview."""
 
-    source: Literal["atlas", "procedural"] = "atlas"
-    case_id: str = "s0001"
+    source: str = "atlas"
+    case_id: Optional[str] = "s0001"
     size: int = Field(160, ge=64, le=192)
     scan_direction: Literal["head_to_feet", "feet_to_head"] = "head_to_feet"
     params: CTParamsPreviewParams
