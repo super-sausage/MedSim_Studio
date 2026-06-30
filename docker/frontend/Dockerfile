@@ -7,6 +7,11 @@
 # ---- Stage 1: Dependencies ----
 FROM node:20-slim AS deps
 
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG NO_PROXY="*"
+ENV HTTP_PROXY=${HTTP_PROXY} HTTPS_PROXY=${HTTPS_PROXY} NO_PROXY=${NO_PROXY}
+
 WORKDIR /app
 
 # Copy package.json only (lockfile is Windows-generated, skip it so
@@ -19,6 +24,11 @@ RUN npm config set registry https://registry.npmmirror.com && \
 
 # ---- Stage 2: Build ----
 FROM node:20-slim AS builder
+
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG NO_PROXY="*"
+ENV HTTP_PROXY=${HTTP_PROXY} HTTPS_PROXY=${HTTPS_PROXY} NO_PROXY=${NO_PROXY}
 
 WORKDIR /app
 

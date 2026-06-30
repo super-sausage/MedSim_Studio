@@ -7,12 +7,15 @@
 # ---- Stage 1: Dependencies ----
 FROM python:3.11-slim AS builder
 
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG NO_PROXY="*"
+ENV HTTP_PROXY=${HTTP_PROXY} HTTPS_PROXY=${HTTPS_PROXY} NO_PROXY=${NO_PROXY}
+
 WORKDIR /app
 
-# System dependencies for medical imaging libraries (using Tsinghua mirror)
-RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
-    apt-get update && apt-get install -y --no-install-recommends \
+# System dependencies for medical imaging libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgl1 \
     libglib2.0-0 \
@@ -23,57 +26,31 @@ RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies with BuildKit pip cache and local wheel mount.
-# Mount ./downloads/ at build time so pip finds the pre-downloaded CUDA
-# PyTorch wheel without hitting the slow public CDN.
-#
-# To pre-download the wheel locally (fast in China):
-#   mkdir -p downloads && cd downloads
-#   curl -LO https://download.pytorch.org/whl/cu121/torch-2.1.2%2Bcu121-cp311-cp311-linux_x86_64.whl
 COPY backend/requirements.txt .
 
-# Step 1: Install PyTorch — prefers the local wheel over remote download.
-# Strategy: set index-url to Tsinghua mirror (does NOT host CUDA PyTorch
-# wheels), so pip won't find torch there and will fall back to --find-links
-# to discover the pre-downloaded local wheel.  torch's dependencies
-# (filelock, sympy, networkx, …) ARE on PyPI and get fetched from Tsinghua.
-#
-# The original --extra-index-url=https://download.pytorch.org/whl/cu121
-# was removed because it gave pip a direct remote path to the full 2.2 GB
-# torch wheel, defeating the purpose of the local file.
+# Install PyTorch CPU version (ARM64 macOS doesn't support CUDA)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=bind,source=./downloads,target=/downloads \
     pip install \
-    --find-links=/downloads \
-    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    --trusted-host pypi.tuna.tsinghua.edu.cn \
     --timeout 600 \
-    torch==2.1.2+cu121
+    torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-# Step 2: Install rest of Python dependencies from Tsinghua mirror.
-# Use a constraint file to PIN torch to the CUDA 12.1 version installed
-# in Step 1.  Without this, monai / TotalSegmentator / nnunetv2 pull in
-# the latest torch (2.12.0+cu130) whose nvidia-*cu13* companion packages
-# require CUDA >= 13.0 — the host driver 566.07 only supports CUDA 12.7.
-# Torch 2.1.2+cu121 bundles its own CUDA 12.1 libs and works fine with
-# the 12.7 driver (CUDA is backward-compatible).
+# Install rest of Python dependencies
 RUN --mount=type=cache,target=/root/.cache/pip \
-    echo "torch==2.1.2+cu121" > /tmp/torch-pin.txt && \
     pip install \
-    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    --trusted-host pypi.tuna.tsinghua.edu.cn \
     --timeout 600 \
-    --constraint /tmp/torch-pin.txt \
     -r requirements.txt
 # ---- Stage 2: Runtime ----
 FROM python:3.11-slim AS runner
 
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG NO_PROXY="*"
+ENV HTTP_PROXY=${HTTP_PROXY} HTTPS_PROXY=${HTTPS_PROXY} NO_PROXY=${NO_PROXY}
+
 WORKDIR /app
 
-# Runtime system dependencies only (using Tsinghua mirror)
-RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
-    apt-get update && apt-get install -y --no-install-recommends \
+# Runtime system dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
@@ -95,7 +72,8 @@ RUN mkdir -p /tmp/uploads /app/ai-models /app/static
 # Copy custom-trained MONAI UNet weights to a path NOT overridden by volumes
 # (/app/ai-models is mounted as a named volume in docker-compose, which
 #  would hide files COPY'd there at build time)
-COPY unet.pth /app/custom-models/unet.pth
+# Optional: skip if unet.pth not present
+RUN mkdir -p /app/custom-models
 
 # TotalSegmentator pretrained weights dir (~2GB, downloaded on first use)
 # Cache them so they persist across container restarts

@@ -156,6 +156,8 @@ ct-simulator/
 
 ## 快速启动
 
+> **推荐**: 详见 [STARTUP.md](STARTUP.md) — 包含完整启动流程、常见问题排查和验证脚本。
+
 ### 前置条件
 
 - Node.js 20+

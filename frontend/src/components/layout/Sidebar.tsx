@@ -17,6 +17,8 @@ const navItems = [
   { path: '/viewer', label: 'Viewer', icon: ViewIcon },
   { path: '/simulation', label: 'Simulation', icon: SimulationIcon },
   { path: '/segmentation', label: 'Segmentation', icon: SegmentIcon },
+  { path: '/artifact', label: 'Artifact', icon: ArtifactIcon },
+  { path: '/classifier', label: 'Classifier', icon: ClassifierIcon },
 ];
 
 export function Sidebar() {
@@ -93,6 +95,26 @@ function SegmentIcon({ className }: { className?: string }) {
       <path d="M12 2L2 7l10 5 10-5-10-5z" />
       <path d="M2 17l10 5 10-5" />
       <path d="M2 12l10 5 10-5" />
+    </svg>
+  );
+}
+
+function ArtifactIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" />
+      <path d="M2 12h20" />
+    </svg>
+  );
+}
+
+function ClassifierIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2" />
+      <rect x="9" y="3" width="6" height="4" rx="1" />
+      <path d="M9 14l2 2 4-4" />
     </svg>
   );
 }

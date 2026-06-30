@@ -158,6 +158,11 @@ class ApiService {
       timeout: 120000,
     });
   }
+
+  /** Generate artifact — longer timeout for radon-based generators */
+  async generateArtifact<T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T> {
+    return this.post<T>(url, data, { ...config, timeout: 300000 });
+  }
 }
 
 export const api = new ApiService();

@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from app import __version__, __app_name__
 from app.core.config import settings
 from app.api.v1 import health_router, dicom_router, simulation_router, segmentation_router
+from app.api.v1.artifact import router as artifact_router
 from app.dicom.storage import StorageBackend, get_storage_backend
 from app.database.session import engine, Base
 import app.models.dicom  # noqa: F401 — register models for create_all
@@ -142,6 +143,7 @@ app.include_router(health_router, prefix="/api/v1")
 app.include_router(dicom_router, prefix="/api/v1")
 app.include_router(simulation_router, prefix="/api/v1")
 app.include_router(segmentation_router, prefix="/api/v1")
+app.include_router(artifact_router, prefix="/api/v1")
 
 
 # --- Legacy / root-level health endpoint ---

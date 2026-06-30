@@ -13,8 +13,6 @@
 #   - MinIO Console: http://localhost:9001
 # ============================================================
 
-version: "3.8"
-
 services:
   # ---- Frontend (React + Vite) ----
   frontend:
@@ -55,8 +53,9 @@ services:
       - MINIO_BUCKET=dicom-studies
       - DATABASE_URL=postgresql://ctuser:ctpass123@postgres:5432/ct_simulator
       - LOG_LEVEL=INFO
-      - AI_DEVICE=cuda
+      - AI_DEVICE=cpu
       - AI_MODEL_PATH=/app/custom-models
+      - CLASSIFIER_MODEL_PATH=/tmp/clf_full/best_model.pth
       # TotalSegmentator weights — mounted to a separate path to avoid
       # conflicting with the backend_models named volume at /app/ai-models
       - TOTALSEGMENTATOR_DIR=/app/models/totalsegmentator
@@ -76,17 +75,12 @@ services:
       - ./models/nnunet702_handoff:/app/models/nnunet702_handoff
       # Mount phantom atlas data (real CT volumes for demo, not tracked in git)
       - ./models/phantom_atlas:/app/models/phantom_atlas
+      # Mount classifier model weights
+      - ./models/classifier:/app/models/classifier
     # TotalSegmentator uses PyTorch DataLoader multiprocessing workers
     # which require large /dev/shm for inter-process communication.
     # Default 64MB is far too small; allocate 8GB.
     shm_size: 8g
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     depends_on:
       postgres:
         condition: service_healthy
