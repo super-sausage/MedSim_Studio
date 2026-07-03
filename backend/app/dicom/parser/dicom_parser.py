@@ -307,11 +307,17 @@ class DicomParser:
         # Flush so instance queries can find the newly created series
         db.flush()
 
-        # Store instances
+        # Store instances (deduplicate by SOP Instance UID within this batch)
         instances_created = 0
+        seen_sop = set()
         for inst_info in instances:
+            sop_uid = inst_info.get("sop_instance_uid")
+            if not sop_uid or sop_uid in seen_sop:
+                continue
+            seen_sop.add(sop_uid)
+
             existing_instance = db.query(DicomInstance).filter(
-                DicomInstance.sop_instance_uid == inst_info["sop_instance_uid"]
+                DicomInstance.sop_instance_uid == sop_uid
             ).first()
 
             if not existing_instance:
@@ -330,7 +336,7 @@ class DicomParser:
                 else:
                     logger.warning(
                         "No series found for instance %s with series_uid %s",
-                        inst_info.get("sop_instance_uid"),
+                        sop_uid,
                         inst_info.get("series_instance_uid"),
                     )
 

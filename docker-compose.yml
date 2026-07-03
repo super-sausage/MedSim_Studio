@@ -74,6 +74,8 @@ services:
       - ./models/nnunet701_full_handoff/nnunet_handoff/model/Dataset701_TotalSegOrgans6/nnUNetTrainer__nnUNetPlans__3d_fullres:/app/models/nnunet_handoff
       # Mount custom-trained nnUNet 20-class model (Dataset702_TotalSegOrgans20)
       - ./models/nnunet702_handoff:/app/models/nnunet702_handoff
+      # Mount lung lobe model (Dataset703_LungLobes, 5-class, trained from TotalSegmentator)
+      - ./models/nnunet_lung_lobe:/app/models/nnunet_lung_lobe
       # Mount phantom atlas data (real CT volumes for demo, not tracked in git)
       - ./models/phantom_atlas:/app/models/phantom_atlas
     # TotalSegmentator uses PyTorch DataLoader multiprocessing workers

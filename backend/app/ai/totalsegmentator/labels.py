@@ -415,6 +415,9 @@ def get_label_map(model_name: str) -> Dict[str, int]:
     if name_lower in ("nnunet702_20organs",):
         from app.ai.nnunet_custom_20.labels import CUSTOM20_LABEL_MAP
         return CUSTOM20_LABEL_MAP
+    if name_lower in ("nnunet_lung_lobe",):
+        from app.ai.nnunet_lung_lobe.labels import LUNG_LOBE_LABEL_MAP
+        return LUNG_LOBE_LABEL_MAP
     return MONAI_LABEL_MAP
 
 
@@ -438,6 +441,9 @@ def get_label_colors(model_name: str) -> Dict[int, Tuple[int, int, int]]:
     if name_lower in ("nnunet702_20organs",):
         from app.ai.nnunet_custom_20.labels import CUSTOM20_LABEL_COLORS
         return CUSTOM20_LABEL_COLORS
+    if name_lower in ("nnunet_lung_lobe",):
+        from app.ai.nnunet_lung_lobe.labels import LUNG_LOBE_COLORS
+        return LUNG_LOBE_COLORS
     return MONAI_LABEL_COLORS
 
 

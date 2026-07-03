@@ -63,6 +63,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
     --trusted-host pypi.tuna.tsinghua.edu.cn \
     --timeout 600 \
+    --no-cache-dir \
     --constraint /tmp/torch-pin.txt \
     -r requirements.txt
 # ---- Stage 2: Runtime ----

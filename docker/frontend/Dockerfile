@@ -15,7 +15,7 @@ COPY frontend/package.json ./
 
 # Install dependencies (using npmmirror registry for faster downloads)
 RUN npm config set registry https://registry.npmmirror.com && \
-    npm install --timeout=300000
+    npm install --timeout=300000 --no-audit --no-fund --legacy-peer-deps
 
 # ---- Stage 2: Build ----
 FROM node:20-slim AS builder

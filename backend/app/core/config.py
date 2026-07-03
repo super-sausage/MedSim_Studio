@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     # Same nnUNet results folder layout as above.
     NNUNET_CUSTOM_20_MODEL_PATH: str = Field(default="/app/models/nnunet702_handoff")
 
+    # Custom nnUNet lung lobe model — Dataset703 (5 lung lobes, user-trained)
+    # Trained on TotalSegmentator data for lobectomy simulation.
+    # Points to the nnUNetTrainer__nnUNetPlans__3d_fullres folder
+    # containing dataset.json, plans.json, and fold_0/checkpoint_best.pth
+    NNUNET_LUNG_LOBE_MODEL_PATH: str = Field(default="/app/models/nnunet_lung_lobe")
+
     # Simulation
     SIMULATION_DEFAULT_SEED: int = 42
     SIMULATION_MAX_LESIONS: int = 50

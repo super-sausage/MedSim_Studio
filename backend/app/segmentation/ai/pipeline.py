@@ -85,7 +85,33 @@ def run_full_segmentation(
     # Step 2: Run segmentation (TotalSegmentator or MONAI)
     _t2 = _time.time()
 
-    if model_name and model_name.lower() in ("nnunet_handoff", "nnunet701_full_handoff"):
+    if model_name and model_name.lower() in ("nnunet_lung_lobe", "nnunet703_lunglobes"):
+        # --- Custom nnUNet lung lobe path (Dataset703_LungLobes, 5 lobes) ---
+        logger.info("[PIPELINE] Job %s: calling nnUNet lung lobe model (model=%s)...",
+                    job_id, model_name)
+        try:
+            from app.ai.nnunet_lung_lobe import (
+                run_nnunet_lung_lobe,
+                is_available as lung_available,
+            )
+            if not lung_available():
+                raise RuntimeError(
+                    f"Lung lobe nnUNet model not found at "
+                    f"{settings.NNUNET_LUNG_LOBE_MODEL_PATH}. "
+                    "Verify the model directory is mounted in Docker."
+                )
+            label_map = run_nnunet_lung_lobe(
+                volume=volume,
+                spacing=spacing,
+            )
+        except Exception as e:
+            logger.error("[PIPELINE] Job %s: nnUNet lung lobe FAILED: %s",
+                         job_id, e, exc_info=True)
+            raise
+
+        detect_lesions = False
+
+    elif model_name and model_name.lower() in ("nnunet_handoff", "nnunet701_full_handoff"):
         # --- Custom nnUNet path (Dataset701_TotalSegOrgans6, 6 organs) ---
         logger.info("[PIPELINE] Job %s: calling custom nnUNet (model=%s)...", job_id, model_name)
         try:

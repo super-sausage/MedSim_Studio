@@ -676,6 +676,7 @@ async def list_available_models():
     from app.ai.totalsegmentator import is_available as ts_available
     from app.ai.nnunet_custom import is_available as nnunet_available
     from app.ai.nnunet_custom_20 import is_available as nnunet20_available
+    from app.ai.nnunet_lung_lobe import is_available as lung_available
     return [
         ModelInfoResponse(
             name="totalsegmentator",
@@ -704,6 +705,17 @@ async def list_available_models():
                 "small_bowel", "spleen", "stomach", "trachea", "urinary_bladder",
             ],
             status="available" if nnunet20_available() else "coming_soon",
+        ),
+        ModelInfoResponse(
+            name="nnunet_lung_lobe",
+            description="Custom nnUNet (Dataset703_LungLobes) — 5 lung lobe segmentation: "
+                        "left upper/lower, right upper/middle/lower. "
+                        "Trained on TotalSegmentator for lobectomy simulation.",
+            organs=[
+                "left_upper_lobe", "left_lower_lobe",
+                "right_upper_lobe", "right_middle_lobe", "right_lower_lobe",
+            ],
+            status="available" if lung_available() else "coming_soon",
         ),
         ModelInfoResponse(
             name="unet",

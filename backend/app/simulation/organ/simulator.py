@@ -59,7 +59,7 @@ class OrganSimulator:
         )
 
         return {
-            "voxel_count": int(np.sum(preview > -500)),
+            "voxel_count": int(np.sum(preview != 0)),
             "hu_min": float(np.min(preview)),
             "hu_max": float(np.max(preview)),
             "hu_mean": float(np.mean(preview)),

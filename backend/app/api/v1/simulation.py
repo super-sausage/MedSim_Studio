@@ -12,7 +12,7 @@ import base64
 import uuid
 import tempfile
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
@@ -31,6 +31,8 @@ from app.schemas.simulation import (
     SimulationPreviewResponse,
     DicomLesionPreviewRequest,
     DicomLesionPreviewResponse,
+    DebugLesionRequest,
+    DebugLesionResponse,
 )
 from app.simulation.lesion.generator import LesionGenerator
 from app.simulation.organ.simulator import OrganSimulator
@@ -41,6 +43,258 @@ from app.simulation.phantom_generator import (
     generate_atlas_ct_phantom,
 )
 from app.dicom.storage import get_storage_backend
+
+# ── Debug output directory ──
+DEBUG_OUTPUT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+    "debug_output",
+)
+
+# Optional matplotlib for debug PNG generation
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
+# ── Debug visualization helpers ──
+
+
+def _debug_save_lesion_pngs(
+    base_volume: np.ndarray,
+    result_volume: np.ndarray,
+    lesion_volume: np.ndarray,
+    lesion_mask: np.ndarray,
+    label: str,
+    output_dir: str = DEBUG_OUTPUT_DIR,
+) -> None:
+    """
+    Save 4 debug PNG slices through the lesion center (axial middle slice).
+
+    Files saved:
+        lesion_mask_middle_slice.png
+        lesion_hu_middle_slice.png
+        result_volume_middle_slice.png
+        difference_map.png
+    """
+    if not HAS_MPL:
+        logger.warning("matplotlib not installed — skipping debug PNGs")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Find the axial slice at the lesion center
+    nonzero = np.argwhere(lesion_mask)
+    if len(nonzero) == 0:
+        logger.warning("_debug_save_lesion_pngs: lesion_mask is empty, nothing to visualize")
+        return
+    cz = int(np.median(nonzero[:, 0]))
+    cy = int(np.median(nonzero[:, 1]))
+    cx = int(np.median(nonzero[:, 2]))
+
+    diff_map = np.abs(result_volume.astype(np.float32) - base_volume.astype(np.float32))
+
+    figures = [
+        ("lesion_mask_middle_slice.png", lesion_mask[cz, :, :].astype(np.uint8) * 255,
+         "Lesion Mask (axial z={})".format(cz), "gray"),
+        ("lesion_hu_middle_slice.png", lesion_volume[cz, :, :],
+         "Lesion HU (axial z={})".format(cz), "viridis"),
+        ("result_volume_middle_slice.png", result_volume[cz, :, :],
+         "Result Volume HU (axial z={})".format(cz), "gray"),
+        ("difference_map.png", diff_map[cz, :, :],
+         "|Δ HU| (axial z={})".format(cz), "hot"),
+    ]
+
+    for fname, data, title, cmap in figures:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        im = ax.imshow(data, cmap=cmap, aspect="equal")
+        ax.set_title(title)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        plt.colorbar(im, ax=ax, shrink=0.75)
+        path = os.path.join(output_dir, f"{label}_{fname}")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info("DEBUG PNG saved: %s", path)
+
+
+def _debug_log_lesion_write(
+    base_volume: np.ndarray,
+    result_volume: np.ndarray,
+    label: str,
+) -> None:
+    """Log before/after stats for lesion write step."""
+    before = base_volume.astype(np.float32)
+    after = result_volume.astype(np.float32)
+    delta = after - before
+    changed = np.count_nonzero(delta)
+
+    logger.debug(
+        "==== LESION WRITE DEBUG [%s] ====\n"
+        "  before_mean:  %.2f  before_std:  %.2f\n"
+        "  after_mean:   %.2f  after_std:   %.2f\n"
+        "  delta_mean:   %.6f  delta_max:   %.2f  delta_min:   %.2f\n"
+        "  changed_voxels: %d  (total: %d, ratio: %.6f)",
+        label,
+        float(np.mean(before)), float(np.std(before)),
+        float(np.mean(after)), float(np.std(after)),
+        float(np.mean(delta)), float(np.max(delta)), float(np.min(delta)),
+        changed, before.size, changed / max(before.size, 1),
+    )
+    if changed == 0:
+        logger.warning("LESION WRITE: changed_voxels == 0 — lesion did NOT modify the volume!")
+
+
+def _debug_log_position(
+    lesion_mask: np.ndarray,
+    center: Tuple[float, float, float],
+    volume_shape: Tuple[int, int, int],
+    label: str,
+) -> None:
+    """Log position validation for a lesion."""
+    nonzero = np.argwhere(lesion_mask)
+    if len(nonzero) == 0:
+        logger.warning("==== LESION POSITION DEBUG [%s] ==== mask is empty — no position to validate", label)
+        return
+
+    bbox = {
+        "z_min": int(nonzero[:, 0].min()),
+        "z_max": int(nonzero[:, 0].max()),
+        "y_min": int(nonzero[:, 1].min()),
+        "y_max": int(nonzero[:, 1].max()),
+        "x_min": int(nonzero[:, 2].min()),
+        "x_max": int(nonzero[:, 2].max()),
+    }
+    inside = (
+        bbox["z_min"] >= 0 and bbox["z_max"] < volume_shape[0]
+        and bbox["y_min"] >= 0 and bbox["y_max"] < volume_shape[1]
+        and bbox["x_min"] >= 0 and bbox["x_max"] < volume_shape[2]
+    )
+
+    logger.debug(
+        "==== LESION POSITION DEBUG [%s] ====\n"
+        "  volume_shape:  %s\n"
+        "  center:        (%.1f, %.1f, %.1f)  (z, y, x)\n"
+        "  bbox_z:        [%d, %d]  (size: %d)\n"
+        "  bbox_y:        [%d, %d]  (size: %d)\n"
+        "  bbox_x:        [%d, %d]  (size: %d)\n"
+        "  inside_volume: %s",
+        label,
+        str(volume_shape),
+        center[0], center[1], center[2],
+        bbox["z_min"], bbox["z_max"], bbox["z_max"] - bbox["z_min"] + 1,
+        bbox["y_min"], bbox["y_max"], bbox["y_max"] - bbox["y_min"] + 1,
+        bbox["x_min"], bbox["x_max"], bbox["x_max"] - bbox["x_min"] + 1,
+        "YES" if inside else "OUTSIDE",
+    )
+    if not inside:
+        logger.warning("LESION POSITION: lesion is OUTSIDE the volume!")
+
+
+def _debug_verify_sitk_metadata(
+    sitk_image: "sitk.Image",
+    nrrd_path: str,
+    label: str,
+) -> None:
+    """
+    Verify that SimpleITK preserves origin/spacing/direction after writing.
+
+    Writes the image, reads it back, and compares the metadata.
+    This catches coordinate-system corruption during the write round-trip.
+    """
+    import SimpleITK as _sitk
+
+    # Capture what was SET before write
+    orig_origin = sitk_image.GetOrigin()
+    orig_spacing = sitk_image.GetSpacing()
+    orig_direction = sitk_image.GetDirection()
+
+    # Read back
+    try:
+        reread = _sitk.ReadImage(nrrd_path)
+    except Exception as e:
+        logger.error("==== SITK META DEBUG [%s] ==== FAILED to read back: %s", label, e)
+        return
+
+    rb_origin = reread.GetOrigin()
+    rb_spacing = reread.GetSpacing()
+    rb_direction = reread.GetDirection()
+
+    origin_ok = orig_origin == rb_origin
+    spacing_ok = orig_spacing == rb_spacing
+    direction_ok = orig_direction == rb_direction
+
+    logger.debug(
+        "==== SITK META DEBUG [%s] ====\n"
+        "  --- Set ---                    --- Read back ---              Match?\n"
+        "  Origin:     (%6.2f, %6.2f, %6.2f)    (%6.2f, %6.2f, %6.2f)   %s\n"
+        "  Spacing:    (%6.4f, %6.4f, %6.4f)    (%6.4f, %6.4f, %6.4f)   %s\n"
+        "  Direction:  (%s)  (%s)  %s",
+        label,
+        orig_origin[0], orig_origin[1], orig_origin[2],
+        rb_origin[0], rb_origin[1], rb_origin[2],
+        "OK" if origin_ok else "MISMATCH",
+        orig_spacing[0], orig_spacing[1], orig_spacing[2],
+        rb_spacing[0], rb_spacing[1], rb_spacing[2],
+        "OK" if spacing_ok else "MISMATCH",
+        ",".join(f"{v:.4f}" for v in orig_direction),
+        ",".join(f"{v:.4f}" for v in rb_direction),
+        "OK" if direction_ok else "MISMATCH",
+    )
+
+    if not origin_ok:
+        logger.warning("SITK META: Origin MISMATCH — coordinate system may be corrupted!")
+    if not spacing_ok:
+        logger.warning("SITK META: Spacing MISMATCH — voxel dimensions changed!")
+    if not direction_ok:
+        logger.warning("SITK META: Direction MISMATCH — orientation may have flipped!")
+
+    # Additional: log written file size
+    file_size_mb = os.path.getsize(nrrd_path) / (1024 * 1024)
+    logger.debug("  File size: %.2f MB", file_size_mb)
+
+
+def _debug_log_spacing(
+    spacing: Optional[Tuple[float, float, float]],
+    radius_mm: Tuple[float, float, float],
+    label: str,
+) -> None:
+    """Log spacing-to-voxel conversion diagnostics."""
+    if spacing is None:
+        logger.debug("==== SPACING DEBUG [%s] ==== spacing=None, using default (1,1,1)", label)
+        spacing = (1.0, 1.0, 1.0)
+
+    radius_voxel = (
+        radius_mm[0] / spacing[0],  # z
+        radius_mm[1] / spacing[1],  # y
+        radius_mm[2] / spacing[2],  # x
+    )
+
+    logger.debug(
+        "==== SPACING DEBUG [%s] ====\n"
+        "  spacing (z,y,x):   (%.4f, %.4f, %.4f)\n"
+        "  radius_mm (z,y,x): (%.1f, %.1f, %.1f)\n"
+        "  radius_voxel:      (%.2f, %.2f, %.2f)\n"
+        "  min_voxel_dim:     %.2f\n"
+        "  Z compression:     %s (voxel count %.1f — if < 3, lesion is a 2D pancake)",
+        label,
+        spacing[0], spacing[1], spacing[2],
+        radius_mm[0], radius_mm[1], radius_mm[2],
+        radius_voxel[0], radius_voxel[1], radius_voxel[2],
+        min(radius_voxel),
+        "WARNING" if radius_voxel[0] < 3 else "OK",
+        radius_voxel[0],
+    )
+    if radius_voxel[0] < 2:
+        logger.warning("SPACING: Z-radius is only %.1f voxels — lesion will be a 2D pancake!", radius_voxel[0])
+    if radius_voxel[1] < 2 or radius_voxel[2] < 2:
+        logger.warning(
+            "SPACING: in-plane radius is < 2 voxels (y=%.1f, x=%.1f) — lesion may be invisible!",
+            radius_voxel[1], radius_voxel[2],
+        )
+
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +396,8 @@ def run_simulation_job(job_id: str) -> None:
             lesion_gen = LesionGenerator()
             spacing = metadata.get("spacing")
             for lc in lesion_configs:
+                _label = f"job_{job_id[:8]}_{lc.lesion_type}_{lc.id[:8]}"
+
                 # Normalize center: if all zeros (frontend default), place at volume center
                 cz, cy, cx = lc.center_z, lc.center_y, lc.center_x
                 if cz == 0.0 and cy == 0.0 and cx == 0.0:
@@ -164,15 +420,49 @@ def run_simulation_job(job_id: str) -> None:
                     "necrosis_fraction": lc.necrosis_fraction,
                     "spiculation_degree": lc.spiculation_degree,
                 }
+                # ── DEBUG: spacing verification (Task 4) ──
+                _debug_log_spacing(
+                    spacing=spacing,
+                    radius_mm=(lc.radius_z, lc.radius_y, lc.radius_x),
+                    label=_label,
+                )
+
                 lesion_vol = lesion_gen.generate_lesion(
                     volume_shape=result_volume.shape,
                     config=config_dict,
                     spacing=spacing,
                 )
-                result_volume = result_volume + lesion_vol
+                lesion_mask = lesion_vol != 0
+
+                # ── DEBUG: position validation (Task 3) ──
+                _debug_log_position(
+                    lesion_mask=lesion_mask,
+                    center=(cz, cy, cx),
+                    volume_shape=result_volume.shape,
+                    label=_label,
+                )
+
+                # ── DEBUG: before/after write stats (Task 2) ──
+                _base_before = result_volume.copy()
+                result_volume[lesion_mask] = lesion_vol[lesion_mask]
+                _debug_log_lesion_write(
+                    base_volume=_base_before,
+                    result_volume=result_volume,
+                    label=_label,
+                )
+
+                # ── DEBUG: save visualization PNGs (Task 5) ──
+                _debug_save_lesion_pngs(
+                    base_volume=volume,
+                    result_volume=result_volume,
+                    lesion_volume=lesion_vol,
+                    lesion_mask=lesion_mask,
+                    label=_label,
+                )
+
                 logger.info(
-                    "Job %s: applied lesion %s (%s)",
-                    job_id, lc.id, lc.lesion_type,
+                    "Job %s: applied lesion %s (%s) — voxels=%d",
+                    job_id, lc.id, lc.lesion_type, int(lesion_mask.sum()),
                 )
 
         # Apply organs
@@ -233,6 +523,13 @@ def run_simulation_job(job_id: str) -> None:
             "Job %s: wrote temp NRRD %s (%.1f MB)",
             job_id, temp_nrrd_path,
             os.path.getsize(temp_nrrd_path) / (1024 * 1024),
+        )
+
+        # ── DEBUG: verify SimpleITK metadata round-trip (Task 6) ──
+        _debug_verify_sitk_metadata(
+            sitk_image=sitk_image,
+            nrrd_path=temp_nrrd_path,
+            label=f"job_{job_id[:8]}",
         )
 
         job.progress = 75.0
@@ -508,10 +805,11 @@ async def preview_lesion_on_dicom(
             config=config_dict,
             spacing=spacing,
         )
-        result_volume = volume + lesion_vol
+        lesion_mask = lesion_vol != 0
+        result_volume = volume.copy()
+        result_volume[lesion_mask] = lesion_vol[lesion_mask]
 
         # ── 3. Compute lesion region stats ──
-        lesion_mask = lesion_vol != 0
         if lesion_mask.any():
             hu_values = result_volume[lesion_mask]
             stats_voxels = int(np.sum(lesion_mask))
@@ -583,6 +881,180 @@ async def preview_lesion_on_dicom(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"DICOM lesion preview failed: {str(e)[:300]}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Debug: lesion simulation diagnostics
+# ---------------------------------------------------------------------------
+
+
+@router.post("/debug-lesion", response_model=DebugLesionResponse)
+async def debug_lesion(request: DebugLesionRequest):
+    """
+    Comprehensive lesion simulation debug endpoint.
+
+    Runs the full lesion pipeline (generation → write) and returns
+    detailed diagnostics to help pinpoint where bugs occur:
+
+    - Task 1: Lesion generation statistics (voxel count, HU stats)
+    - Task 2: Write verification (changed voxels, delta stats)
+    - Task 3: Position validation (bounding box, inside-volume check)
+    - Task 4: Spacing conversion analysis
+    - Task 5: Preview PNG (axial slice at lesion center, base64)
+
+    Returns a JSON object with all diagnostic fields.
+    Does NOT create a simulation job or write any files.
+    """
+    try:
+        # ── Resolve volume parameters ──
+        volume_shape = tuple(request.volume_shape or [64, 128, 128])
+        spacing = tuple(request.spacing or [1.0, 0.5, 0.5])
+
+        # Normalize center: if all zeros, place at volume center
+        cz, cy, cx = request.center_z, request.center_y, request.center_x
+        if cz == 0.0 and cy == 0.0 and cx == 0.0:
+            cz = float(volume_shape[0] // 2)
+            cy = float(volume_shape[1] // 2)
+            cx = float(volume_shape[2] // 2)
+
+        # ── Build base volume ──
+        base_volume = np.full(volume_shape, -1000.0, dtype=np.float32)
+
+        # ── Generate lesion ──
+        config_dict = {
+            "lesion_type": request.lesion_type,
+            "shape": request.shape,
+            "center_x": cx,
+            "center_y": cy,
+            "center_z": cz,
+            "radius_x": request.radius_x,
+            "radius_y": request.radius_y,
+            "radius_z": request.radius_z,
+            "hu_mean": request.hu_mean,
+            "hu_std": request.hu_std,
+            "margin_sharpness": request.margin_sharpness,
+            "spiculation_degree": request.spiculation_degree,
+        }
+
+        generator = LesionGenerator()
+        lesion_vol = generator.generate_lesion(
+            volume_shape=volume_shape,
+            config=config_dict,
+            spacing=spacing,
+        )
+        lesion_mask = lesion_vol != 0
+
+        # ── Task 1: Lesion generation stats ──
+        lesion_voxels = int(np.sum(lesion_mask))
+        lesion_ratio = float(lesion_voxels / max(volume_shape[0] * volume_shape[1] * volume_shape[2], 1))
+        if lesion_voxels > 0:
+            lesion_hu = lesion_vol[lesion_mask]
+            lesion_hu_mean = float(np.mean(lesion_hu))
+            lesion_hu_min = float(np.min(lesion_hu))
+            lesion_hu_max = float(np.max(lesion_hu))
+            lesion_hu_std = float(np.std(lesion_hu))
+        else:
+            lesion_hu_mean = lesion_hu_min = lesion_hu_max = lesion_hu_std = 0.0
+
+        # ── Task 2: Write verification ──
+        result_volume = base_volume.copy()
+        result_volume[lesion_mask] = lesion_vol[lesion_mask]
+        delta = result_volume.astype(np.float32) - base_volume.astype(np.float32)
+        changed_voxels = int(np.count_nonzero(delta))
+        write_delta_mean = float(np.mean(delta))
+        write_delta_max = float(np.max(delta))
+
+        # ── Task 3: Position ──
+        nonzero = np.argwhere(lesion_mask)
+        if len(nonzero) > 0:
+            bbox = {
+                "z_min": int(nonzero[:, 0].min()),
+                "z_max": int(nonzero[:, 0].max()),
+                "y_min": int(nonzero[:, 1].min()),
+                "y_max": int(nonzero[:, 1].max()),
+                "x_min": int(nonzero[:, 2].min()),
+                "x_max": int(nonzero[:, 2].max()),
+            }
+            inside_volume = (
+                bbox["z_min"] >= 0 and bbox["z_max"] < volume_shape[0]
+                and bbox["y_min"] >= 0 and bbox["y_max"] < volume_shape[1]
+                and bbox["x_min"] >= 0 and bbox["x_max"] < volume_shape[2]
+            )
+        else:
+            bbox = {}
+            inside_volume = False
+
+        # ── Task 4: Spacing ──
+        radius_voxel = [
+            request.radius_z / spacing[0],
+            request.radius_y / spacing[1],
+            request.radius_x / spacing[2],
+        ]
+        z_compression_warning = radius_voxel[0] < 2.0
+
+        # ── Task 5: Preview PNG (if matplotlib available) ──
+        preview_png_base64 = None
+        if HAS_MPL and lesion_voxels > 0:
+            cz_idx = int(np.median(nonzero[:, 0])) if len(nonzero) > 0 else int(round(cz))
+            cz_idx = max(0, min(cz_idx, volume_shape[0] - 1))
+
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            axes = axes.ravel()
+
+            # Mask
+            im0 = axes[0].imshow(lesion_mask[cz_idx, :, :].astype(np.uint8) * 255, cmap="gray", aspect="equal")
+            axes[0].set_title(f"Lesion Mask (axial z={cz_idx})")
+            plt.colorbar(im0, ax=axes[0], shrink=0.75)
+
+            # Lesion HU
+            im1 = axes[1].imshow(lesion_vol[cz_idx, :, :], cmap="viridis", aspect="equal")
+            axes[1].set_title(f"Lesion HU (axial z={cz_idx})")
+            plt.colorbar(im1, ax=axes[1], shrink=0.75)
+
+            # Result volume
+            im2 = axes[2].imshow(result_volume[cz_idx, :, :], cmap="gray", aspect="equal")
+            axes[2].set_title(f"Result HU (axial z={cz_idx})")
+            plt.colorbar(im2, ax=axes[2], shrink=0.75)
+
+            # Difference map
+            diff = np.abs(result_volume.astype(np.float32) - base_volume.astype(np.float32))
+            im3 = axes[3].imshow(diff[cz_idx, :, :], cmap="hot", aspect="equal")
+            axes[3].set_title(f"|Δ HU| (axial z={cz_idx})")
+            plt.colorbar(im3, ax=axes[3], shrink=0.75)
+
+            plt.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            preview_png_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        return DebugLesionResponse(
+            lesion_voxels=lesion_voxels,
+            lesion_ratio=lesion_ratio,
+            lesion_hu_mean=lesion_hu_mean,
+            lesion_hu_min=lesion_hu_min,
+            lesion_hu_max=lesion_hu_max,
+            lesion_hu_std=lesion_hu_std,
+            changed_voxels=changed_voxels,
+            write_delta_mean=write_delta_mean,
+            write_delta_max=write_delta_max,
+            volume_shape=list(volume_shape),
+            center_voxel=[cz, cy, cx],
+            bbox=bbox,
+            inside_volume=inside_volume,
+            spacing=list(spacing),
+            radius_mm=[request.radius_z, request.radius_y, request.radius_x],
+            radius_voxel=radius_voxel,
+            z_compression_warning=z_compression_warning,
+            preview_png_base64=preview_png_base64,
+        )
+
+    except Exception as e:
+        logger.exception("Debug lesion endpoint failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Debug lesion failed: {str(e)[:500]}",
         )
 
 
