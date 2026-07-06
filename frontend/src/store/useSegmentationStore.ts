@@ -14,6 +14,10 @@ interface PersistedMaskData {
   seriesId: string;
   maskData: Float32Array | null;
   labels: SegmentationLabel[];
+  /** If set, the mask was downsampled — these are the labelmap volume dimensions */
+  maskDimensions?: [number, number, number];
+  /** If set, the spacing of the downsampled labelmap volume */
+  maskSpacing?: [number, number, number];
 }
 
 /**

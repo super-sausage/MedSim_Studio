@@ -82,6 +82,7 @@ class LesionGenerator:
 
         # Generate small preview volume (32×32×32)
         preview_size = 32
+        texture_config = config.get("texture_config")
         preview = self._generate_lesion_volume(
             shape=(preview_size, preview_size, preview_size),
             center=(preview_size // 2,) * 3,
@@ -91,6 +92,7 @@ class LesionGenerator:
             margin_sharpness=config.get("margin_sharpness", 0.8),
             shape_type=config.get("shape", "spherical"),
             spiculation=config.get("spiculation_degree", 0.0),
+            texture_config=texture_config,
         )
 
         return {
@@ -103,6 +105,7 @@ class LesionGenerator:
             "preview_shape": list(preview.shape),
             "center": list(center),
             "radii_mm": list(radii),
+            "texture_enabled": texture_config is not None,
         }
 
     def generate_lesion(
@@ -110,19 +113,85 @@ class LesionGenerator:
         volume_shape: Tuple[int, int, int],
         config: Dict[str, Any],
         spacing: Optional[Tuple[float, float, float]] = None,
+        mesh_path: Optional[str] = None,
+        mask_path: Optional[str] = None,
     ) -> np.ndarray:
         """
         Generate a lesion within a volume of the given shape.
+
+        Three modes (mutually exclusive):
+          1. **Voxel** (default) — procedural ellipsoid with shape deformations
+          2. **Mesh** — load 3D mesh (STL/OBJ/VTK/PLY), voxelize, apply HU
+          3. **Mask** — load NIfTI segmentation mask, distance transform, apply HU
 
         Args:
             volume_shape: Shape of the target volume (z, y, x)
             config: Lesion configuration dictionary
             spacing: Voxel spacing (z, y, x) in mm. Used to convert mm radii
                      to voxel counts. Falls back to SIMULATION_VOXEL_SIZE if None.
+            mesh_path: Path to mesh file (.stl/.obj/.vtk/.ply) for mesh mode.
+                       Mutually exclusive with mask_path.
+            mask_path: Path to NIfTI mask file (.nii/.nii.gz) for mask mode.
+                       Mutually exclusive with mesh_path.
 
         Returns:
             numpy array of HU values matching volume_shape
         """
+        # ── P2: Organ-aware placement — overrides center when organ_constraint is set ──
+        organ_constraint = config.get("organ_constraint")
+        if organ_constraint is not None and organ_constraint:
+            from app.simulation.organ.simulator import OrganSimulator
+
+            _spacing_tuple: Tuple[float, float, float]
+            if spacing is not None:
+                _spacing_tuple = spacing
+            else:
+                _v = settings.SIMULATION_VOXEL_SIZE
+                _spacing_tuple = (_v, _v, _v)
+
+            _radius_mm = (
+                config.get("radius_z", 10),
+                config.get("radius_y", 10),
+                config.get("radius_x", 10),
+            )
+            osp = OrganSimulator(
+                seed=int(self.rng.integers(0, 2**31))
+            )
+            _cz, _cy, _cx = osp.find_placement_position(
+                volume_shape=volume_shape,
+                organ_type=organ_constraint,
+                lesion_radius_mm=_radius_mm,
+                spacing=_spacing_tuple,
+            )
+            # Override center with organ-aware position
+            config = {
+                **config,
+                "center_z": _cz,
+                "center_y": _cy,
+                "center_x": _cx,
+            }
+            logger.info(
+                "OrganAware: placed lesion in '%s' at (%.1f, %.1f, %.1f)",
+                organ_constraint, _cz, _cy, _cx,
+            )
+
+        # ── Route to mesh mode ──
+        if mesh_path is not None:
+            return self._generate_from_mesh(
+                volume_shape=volume_shape,
+                mesh_path=mesh_path,
+                config=config,
+            )
+
+        # ── Route to mask mode ──
+        if mask_path is not None:
+            return self._generate_from_mask(
+                volume_shape=volume_shape,
+                mask_path=mask_path,
+                config=config,
+            )
+
+        # ── Existing voxel mode ──
         lesion_type = config.get("lesion_type", "tumor")
         hu_defaults = self.LESION_HU_DEFAULTS.get(lesion_type, self.LESION_HU_DEFAULTS["tumor"])
 
@@ -171,6 +240,9 @@ class LesionGenerator:
             config.get("margin_sharpness", 0.8),
         )
 
+        # P1: Extract texture_config from config dict (passed through from API)
+        texture_config = config.get("texture_config")
+
         return self._generate_lesion_volume(
             shape=volume_shape,
             center=center,
@@ -180,6 +252,44 @@ class LesionGenerator:
             margin_sharpness=config.get("margin_sharpness", 0.8),
             shape_type=config.get("shape", "spherical"),
             spiculation=config.get("spiculation_degree", 0.0),
+            texture_config=texture_config,
+        )
+
+    def _generate_from_mesh(
+        self,
+        volume_shape: Tuple[int, int, int],
+        mesh_path: str,
+        config: Dict[str, Any],
+    ) -> np.ndarray:
+        """Delegate to MeshGenerator. Output matches voxel mode signature."""
+        from app.simulation.lesion.mesh_generator import MeshGenerator
+
+        # Seed derived from primary generator for reproducibility
+        child_seed = int(self.rng.integers(0, 2**31))
+        gen = MeshGenerator(seed=child_seed)
+        logger.info("Delegating to MeshGenerator: %s", mesh_path)
+        return gen.generate_from_mesh(
+            volume_shape=volume_shape,
+            mesh_path=mesh_path,
+            config=config,
+        )
+
+    def _generate_from_mask(
+        self,
+        volume_shape: Tuple[int, int, int],
+        mask_path: str,
+        config: Dict[str, Any],
+    ) -> np.ndarray:
+        """Delegate to MaskGenerator. Output matches voxel mode signature."""
+        from app.simulation.lesion.mesh_generator import MaskGenerator
+
+        child_seed = int(self.rng.integers(0, 2**31))
+        gen = MaskGenerator(seed=child_seed)
+        logger.info("Delegating to MaskGenerator: %s", mask_path)
+        return gen.generate_from_mask(
+            volume_shape=volume_shape,
+            mask_path=mask_path,
+            config=config,
         )
 
     def _debug_save_lesion_mask_png(
@@ -276,6 +386,7 @@ class LesionGenerator:
         margin_sharpness: float,
         shape_type: str = "spherical",
         spiculation: float = 0.0,
+        texture_config: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         """Generate the lesion voxel grid with appropriate shape and HU values."""
         z, y, x = np.indices(shape, dtype=float)
@@ -330,12 +441,29 @@ class LesionGenerator:
             mask = (distance <= 1.0).astype(float)
 
         # Generate HU values with heterogeneity
+        # P1: Uses TextureGenerator when texture_config is provided
+        from app.simulation.lesion.texture_generator import TextureGenerator
+
         hu_volume = np.zeros(shape, dtype=np.float32)
         lesion_voxels = mask > 0.01
 
-        # Base HU with noise
-        hu_values = self.rng.normal(hu_mean, hu_std, shape)
-        hu_volume[lesion_voxels] = hu_values[lesion_voxels]
+        if texture_config is not None and lesion_voxels.any():
+            # Multi-scale texture (Perlin + fractal noise)
+            hu_values = TextureGenerator.generate_texture(
+                shape=shape,
+                hu_mean=hu_mean,
+                hu_std=hu_std,
+                texture_config={
+                    **texture_config,
+                    "lesion_type": texture_config.get("lesion_type", "tumor"),
+                },
+                rng=self.rng,
+            )
+            hu_volume[lesion_voxels] = hu_values[lesion_voxels]
+        else:
+            # Base HU with noise (existing behaviour, no texture)
+            hu_values = self.rng.normal(hu_mean, hu_std, shape)
+            hu_volume[lesion_voxels] = hu_values[lesion_voxels]
 
         # Apply smooth transition at margins
         hu_volume = hu_volume * mask

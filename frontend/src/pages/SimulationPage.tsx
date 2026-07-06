@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Button } from '@components/ui/button';
 import { useSimulationStore } from '@store/useSimulationStore';
 import { simulationService } from '@/services/simulationService';
@@ -134,6 +134,18 @@ const shapeLabel: Record<LesionShape, string> = {
   lobulated: 'Lobulated',
   spiculated: 'Spiculated',
 };
+
+/** Distinct colors for 3D lesion overlay (up to 8 lesions) */
+const LESION_OVERLAY_COLORS: Array<[number, number, number]> = [
+  [255, 60, 60],    // Red
+  [60, 200, 80],    // Green
+  [60, 140, 255],   // Blue
+  [255, 210, 60],   // Gold
+  [200, 60, 255],   // Purple
+  [255, 120, 40],   // Orange
+  [60, 255, 220],   // Teal
+  [255, 70, 160],   // Pink
+];
 
 // ---------------------------------------------------------------------------
 // Component
@@ -286,6 +298,93 @@ export default function SimulationPage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phantom?.volumeBase64, phantom?.labelBase64]);
+
+  // ---- Generate 3D lesion overlay mask for vtk.js volume preview ----
+  const lesionOverlay = useMemo(() => {
+    if (!phantom || lesions.length === 0) return null;
+
+    const { width, height, depth } = phantom.metadata;
+    const sp = phantom.metadata.spacing; // [sp_z, sp_y, sp_x] from backend
+    const totalVoxels = width * height * depth;
+    const mask = new Float32Array(totalVoxels);
+    // Track closest center distance per voxel (for overlap resolution)
+    const closestDist = new Float32Array(totalVoxels);
+    closestDist.fill(Infinity);
+
+    const labels: Array<{ index: number; name: string; color: [number, number, number] }> = [];
+
+    for (let li = 0; li < lesions.length && li < LESION_OVERLAY_COLORS.length; li++) {
+      const lesion = lesions[li];
+      const labelIdx = li + 1;
+      labels.push({
+        index: labelIdx,
+        name: `Lesion ${li + 1}: ${lesionTypeLabel[lesion.type]}`,
+        color: LESION_OVERLAY_COLORS[li],
+      });
+
+      // Center in voxel space (x=column, y=row, z=slice)
+      const cx = lesion.center[0] || width / 2;
+      const cy = lesion.center[1] || height / 2;
+      const cz = lesion.center[2] || depth / 2;
+
+      // Radii in voxels: radiusMm / voxel spacing
+      const rx = Math.max(1, lesion.radiusMm[0] / sp[2]);
+      const ry = Math.max(1, lesion.radiusMm[1] / sp[1]);
+      const rz = Math.max(1, lesion.radiusMm[2] / sp[0]);
+
+      // Conservative bounding box (±1.5 × radius for spiculated/lobulated)
+      const margin = 1.5;
+      const z0 = Math.max(0, Math.floor(cz - rz * margin));
+      const z1 = Math.min(depth - 1, Math.ceil(cz + rz * margin));
+      const y0 = Math.max(0, Math.floor(cy - ry * margin));
+      const y1 = Math.min(height - 1, Math.ceil(cy + ry * margin));
+      const x0 = Math.max(0, Math.floor(cx - rx * margin));
+      const x1 = Math.min(width - 1, Math.ceil(cx + rx * margin));
+
+      for (let z = z0; z <= z1; z++) {
+        const dz = (z - cz) / rz;
+        for (let y = y0; y <= y1; y++) {
+          const dy = (y - cy) / ry;
+          for (let x = x0; x <= x1; x++) {
+            const dx = (x - cx) / rx;
+            const r2 = dx * dx + dy * dy + dz * dz;
+
+            // Approximate shape perturbation for visual preview
+            let dist2 = r2;
+            if (lesion.shape === 'lobulated') {
+              const r = Math.sqrt(r2);
+              if (r > 0.01) {
+                const theta = Math.atan2(dy, dx);
+                const phi = Math.acos(Math.max(-1, Math.min(1, dz / r)));
+                dist2 -= 0.18 * Math.sin(3 * theta) * Math.sin(2 * phi);
+              }
+            } else if (lesion.shape === 'spiculated') {
+              const r = Math.sqrt(r2);
+              if (r > 0.01) {
+                const theta = Math.atan2(dy, dx);
+                const phi = Math.acos(Math.max(-1, Math.min(1, dz / r)));
+                dist2 -= 0.28 * Math.abs(Math.sin(6 * theta) * Math.sin(4 * phi));
+              }
+            } else if (lesion.shape === 'irregular') {
+              const hash = Math.sin(dx * 12.9898 + dy * 78.233 + dz * 45.164) * 43758.5453;
+              dist2 += (hash - Math.floor(hash)) * 0.18 - 0.09;
+            }
+
+            if (dist2 < 1.0) {
+              const idx = z * height * width + y * width + x;
+              // Resolve overlaps: keep the lesion with the closest center
+              if (dist2 < closestDist[idx]) {
+                mask[idx] = labelIdx;
+                closestDist[idx] = dist2;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return { mask, labels };
+  }, [lesions, phantom]);
 
   // ---- Axial slice canvas rendering ----
   const renderSlice = useCallback(() => {
@@ -1325,6 +1424,8 @@ export default function SimulationPage() {
                     syntheticSpacing={vtkSpacing ?? undefined}
                     syntheticClipIndex={sliceIndex}
                     syntheticScanAxis="z"
+                    segmentationMask={lesionOverlay?.mask ?? null}
+                    segmentationLabels={lesionOverlay?.labels ?? null}
                   />
                 ) : (
                   <div className="flex h-full items-center justify-center">

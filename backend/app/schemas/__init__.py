@@ -9,6 +9,8 @@ from app.schemas.simulation import (
     SimulationJobCreate,
     LesionConfigResponse,
     LesionConfigCreate,
+    LesionAnalysisRequest,
+    LesionAnalysisResponse,
 )
 from app.schemas.segmentation import (
     SegmentationJobResponse,
@@ -35,4 +37,8 @@ __all__ = [
     "InteractiveClickResponse",
     "ModelInfoResponse",
     "LabelDef",
+    "LesionAnalysisRequest",
+    "LesionAnalysisResponse",
+    "DiametersMM",
+    "BBox",
 ]

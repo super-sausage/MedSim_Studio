@@ -33,6 +33,8 @@ from app.schemas.simulation import (
     DicomLesionPreviewResponse,
     DebugLesionRequest,
     DebugLesionResponse,
+    LesionAnalysisRequest,
+    LesionAnalysisResponse,
 )
 from app.simulation.lesion.generator import LesionGenerator
 from app.simulation.organ.simulator import OrganSimulator
@@ -419,6 +421,13 @@ def run_simulation_job(job_id: str) -> None:
                     "calcification_fraction": lc.calcification_fraction,
                     "necrosis_fraction": lc.necrosis_fraction,
                     "spiculation_degree": lc.spiculation_degree,
+                    # P0: Mesh / mask template support
+                    "mesh_path": lc.mesh_path,
+                    "mask_path": lc.mask_path,
+                    # P1: Texture generation
+                    "texture_config": lc.texture_config,
+                    # P2: Organ-aware placement
+                    "organ_constraint": lc.organ_constraint,
                 }
                 # ── DEBUG: spacing verification (Task 4) ──
                 _debug_log_spacing(
@@ -431,6 +440,8 @@ def run_simulation_job(job_id: str) -> None:
                     volume_shape=result_volume.shape,
                     config=config_dict,
                     spacing=spacing,
+                    mesh_path=lc.mesh_path,
+                    mask_path=lc.mask_path,
                 )
                 lesion_mask = lesion_vol != 0
 
@@ -798,12 +809,21 @@ async def preview_lesion_on_dicom(
             "calcification_fraction": lesion_cfg.calcification_fraction,
             "necrosis_fraction": lesion_cfg.necrosis_fraction,
             "spiculation_degree": lesion_cfg.spiculation_degree,
+            # P0: Mesh / mask template support
+            "mesh_path": lesion_cfg.mesh_path,
+            "mask_path": lesion_cfg.mask_path,
+            # P1: Texture generation
+            "texture_config": lesion_cfg.texture_config,
+            # P2: Organ-aware placement
+            "organ_constraint": lesion_cfg.organ_constraint,
         }
         spacing = metadata.get("spacing")
         lesion_vol = generator.generate_lesion(
             volume_shape=volume.shape,
             config=config_dict,
             spacing=spacing,
+            mesh_path=lesion_cfg.mesh_path,
+            mask_path=lesion_cfg.mask_path,
         )
         lesion_mask = lesion_vol != 0
         result_volume = volume.copy()
@@ -1056,6 +1076,118 @@ async def debug_lesion(request: DebugLesionRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Debug lesion failed: {str(e)[:500]}",
         )
+
+
+# ---------------------------------------------------------------------------
+# P3: Lesion Analysis — morphology and density statistics
+# ---------------------------------------------------------------------------
+
+
+@router.post("/lesion/analyze", response_model=LesionAnalysisResponse)
+async def analyze_lesion(request: LesionAnalysisRequest):
+    """
+    Generate (or accept) a lesion and return comprehensive morphology metrics.
+
+    Two modes:
+      1. **Generate** (default): Provide lesion parameters (type, shape, radii, HU),
+         a temporary volume is created, a lesion generated, and analyzed.
+      2. **Existing data**: Provide ``volume_data_base64`` + ``mask_data_base64``
+         to analyze a pre-existing lesion without re-generation.
+
+    Returns:
+        voxel_count, volume_mm3, max_diameter_mm, diameters_mm (z/y/x),
+        hu_mean, hu_std, hu_min, hu_max,
+        surface_area_mm2, sphericity, bbox, shape_info
+    """
+    from app.simulation.lesion.analyzer import analyze as analyze_lesion_volume
+    from app.simulation.lesion.generator import LesionGenerator
+
+    try:
+        # ── Mode 2: Analyze existing data ──
+        if request.volume_data_base64 and request.mask_data_base64:
+            vol_bytes = base64.b64decode(request.volume_data_base64)
+            mask_bytes = base64.b64decode(request.mask_data_base64)
+
+            volume_shape = tuple(request.volume_shape or [64, 128, 128])
+            spacing = tuple(request.spacing or [1.0, 0.5, 0.5])
+
+            hu_volume = np.frombuffer(vol_bytes, dtype=np.float32).reshape(volume_shape)
+            lesion_mask = np.frombuffer(mask_bytes, dtype=np.uint8).reshape(volume_shape) > 0
+
+            result = analyze_lesion_volume(lesion_mask, hu_volume, spacing)
+            return _analysis_to_response(result)
+
+        # ── Mode 1: Generate then analyze ──
+        volume_shape = tuple(request.volume_shape or [64, 128, 128])
+        spacing = tuple(request.spacing or [1.0, 0.5, 0.5])
+
+        # Normalise center
+        cz, cy, cx = request.center_z, request.center_y, request.center_x
+        if cz == 0.0 and cy == 0.0 and cx == 0.0:
+            cz = float(volume_shape[0] // 2)
+            cy = float(volume_shape[1] // 2)
+            cx = float(volume_shape[2] // 2)
+
+        config_dict = {
+            "lesion_type": request.lesion_type,
+            "shape": request.shape,
+            "center_x": cx,
+            "center_y": cy,
+            "center_z": cz,
+            "radius_x": request.radius_x,
+            "radius_y": request.radius_y,
+            "radius_z": request.radius_z,
+            "hu_mean": request.hu_mean,
+            "hu_std": request.hu_std,
+            "margin_sharpness": request.margin_sharpness,
+            "spiculation_degree": request.spiculation_degree,
+        }
+
+        generator = LesionGenerator()
+        lesion_vol = generator.generate_lesion(
+            volume_shape=volume_shape,
+            config=config_dict,
+            spacing=spacing,
+        )
+        lesion_mask = lesion_vol != 0
+        base_volume = np.full(volume_shape, -1000.0, dtype=np.float32)
+        base_volume[lesion_mask] = lesion_vol[lesion_mask]
+
+        result = analyze_lesion_volume(lesion_mask, base_volume, spacing)
+        return _analysis_to_response(result)
+
+    except Exception as e:
+        logger.exception("Lesion analysis endpoint failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lesion analysis failed: {str(e)[:500]}",
+        )
+
+
+def _analysis_to_response(analysis: dict) -> LesionAnalysisResponse:
+    """Convert the analyzer dict to a Pydantic response."""
+    from app.schemas.simulation import (
+        LesionAnalysisResponse, DiametersMM, BBox,
+    )
+    b = analysis.get("bbox", {})
+    return LesionAnalysisResponse(
+        voxel_count=analysis.get("voxel_count", 0),
+        volume_mm3=analysis.get("volume_mm3", 0.0),
+        max_diameter_mm=analysis.get("max_diameter_mm", 0.0),
+        diameters_mm=DiametersMM(**analysis.get("diameters_mm", {"z": 0, "y": 0, "x": 0})),
+        hu_mean=analysis.get("hu_mean", 0.0),
+        hu_std=analysis.get("hu_std", 0.0),
+        hu_min=analysis.get("hu_min", 0.0),
+        hu_max=analysis.get("hu_max", 0.0),
+        surface_area_mm2=analysis.get("surface_area_mm2", 0.0),
+        sphericity=analysis.get("sphericity", 0.0),
+        bbox=BBox(
+            z_min=b.get("z_min", 0), z_max=b.get("z_max", 0),
+            y_min=b.get("y_min", 0), y_max=b.get("y_max", 0),
+            x_min=b.get("x_min", 0), x_max=b.get("x_max", 0),
+        ),
+        shape_info=analysis.get("shape_info", "empty"),
+    )
 
 
 @router.post("/preview/organ", response_model=SimulationPreviewResponse)

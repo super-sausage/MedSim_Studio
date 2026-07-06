@@ -145,29 +145,100 @@ export function useSegmentation(ctVolumeId: string | undefined) {
           );
         }
 
-        // ---- Step 4: Create labelmap volume ----
-        // Use a unique ID per load (timestamp suffix) to avoid conflicts with
-        // any lingering Cornerstone3D state from a previous page visit.
+        // ---- Step 3b: Downsample labelmap if needed ----
+        // Large labelmap volumes (>8M voxels) cause WebGL context loss on
+        // integrated GPUs. Downsample using nearest-neighbor to keep GPU
+        // texture size manageable while preserving label boundaries.
         const segLoadId = `${SEGMENTATION_ID_PREFIX}-${jobId}-${Date.now()}`;
         const segmentationId = segLoadId;
-        const labelmapVolumeId = `labelmap-${segLoadId}`;
+        const totalVoxels = dimensions[0] * dimensions[1] * dimensions[2];
+        const needsDownsample =
+          totalVoxels > MAX_LABELMAP_VOXELS ||
+          dimensions[0] > MAX_LABELMAP_DIM ||
+          dimensions[1] > MAX_LABELMAP_DIM;
 
-        // Create a derived volume with same geometry as the CT volume
-        const labelmapVolume = await volumeLoader.createAndCacheDerivedVolume(
-          ctVolumeId,
-          { volumeId: labelmapVolumeId }
-        );
-        if (cancelledRef.current) {
-          cache.removeVolumeLoadObject(labelmapVolumeId);
-          return;
-        }
+        let labelmapVolumeId = `labelmap-${segLoadId}`;
+        let labelmapVolume: any;
+        let finalMaskBytes: Uint8Array | null = null;
+        let maskDimensions: [number, number, number] | undefined;
+        let maskSpacing: [number, number, number] | undefined;
 
-        // Fill with parsed label data
-        const scalarData = labelmapVolume.getScalarData();
-        if (scalarData) {
-          scalarData.set(nrrd.data);
+        if (needsDownsample) {
+          // Calculate target dimensions preserving aspect ratio
+          const scale = MAX_LABELMAP_DIM / Math.max(dimensions[0], dimensions[1]);
+          const td: [number, number, number] = [
+            Math.max(1, Math.round(dimensions[0] * scale)),
+            Math.max(1, Math.round(dimensions[1] * scale)),
+            Math.max(1, Math.round(dimensions[2] * scale)),
+          ];
+          // Apply secondary voxel-count cap to handle very deep volumes
+          const scaledVoxels = td[0] * td[1] * td[2];
+          if (scaledVoxels > MAX_LABELMAP_VOXELS) {
+            const vscale = Math.cbrt(MAX_LABELMAP_VOXELS / scaledVoxels);
+            td[0] = Math.max(1, Math.round(td[0] * vscale));
+            td[1] = Math.max(1, Math.round(td[1] * vscale));
+            td[2] = Math.max(1, Math.round(td[2] * vscale));
+          }
+
+          maskDimensions = td;
+          maskSpacing = [
+            spacing[0] * (dimensions[0] / td[0]),
+            spacing[1] * (dimensions[1] / td[1]),
+            spacing[2] * (dimensions[2] / td[2]),
+          ] as [number, number, number];
+
+          // Downsample using nearest neighbor to preserve label integers
+          finalMaskBytes = downsampleLabelmap(
+            nrrd.data,
+            dimensions,
+            td,
+          );
+
+          // Create a downsampled labelmap volume (Uint8 → saves GPU memory)
+          labelmapVolume = await (
+            volumeLoader as any
+          ).createLocalSegmentationVolume(
+            {
+              dimensions: td,
+              spacing: maskSpacing,
+              origin,
+              direction,
+              scalarData: finalMaskBytes,
+              metadata: (sourceVolume as any).metadata ?? {},
+              referencedVolumeId: ctVolumeId,
+            },
+            labelmapVolumeId,
+          );
+
+          if (cancelledRef.current) {
+            cache.removeVolumeLoadObject(labelmapVolumeId);
+            return;
+          }
+
+          console.info(
+            `[useSegmentation] Downsampled labelmap ` +
+            `${dimensions[0]}×${dimensions[1]}×${dimensions[2]} → ` +
+            `${td[0]}×${td[1]}×${td[2]} ` +
+            `(${((td[0]*td[1]*td[2])/(totalVoxels)*100).toFixed(1)}%)`
+          );
+        } else {
+          // ---- Step 4 (full-res path): Create derived volume ----
+          labelmapVolume = await volumeLoader.createAndCacheDerivedVolume(
+            ctVolumeId,
+            { volumeId: labelmapVolumeId },
+          );
+          if (cancelledRef.current) {
+            cache.removeVolumeLoadObject(labelmapVolumeId);
+            return;
+          }
+
+          // Fill with parsed label data
+          const scalarData = labelmapVolume.getScalarData();
+          if (scalarData) {
+            scalarData.set(nrrd.data);
+          }
+          labelmapVolume.modified();
         }
-        labelmapVolume.modified();
 
         // ---- Step 5: Register with Cornerstone3D segmentation system ----
         // First, add the segmentation to global state
@@ -234,8 +305,10 @@ export function useSegmentation(ctVolumeId: string | undefined) {
           return;
         }
 
-        // Convert Int32Array → Float32Array for VTK 3D volume rendering
-        const maskFloat = new Float32Array(nrrd.data);
+        // Convert to Float32Array for VTK 3D volume rendering / zustand store
+        const maskFloat = new Float32Array(
+          finalMaskBytes ?? nrrd.data,
+        );
 
         const segStateVal = {
           segmentationId,
@@ -253,12 +326,19 @@ export function useSegmentation(ctVolumeId: string | undefined) {
           seriesId: seriesId ?? useSegmentationStore.getState().activeSeriesId ?? '',
           maskData: maskFloat,
           labels,
+          ...(maskDimensions && maskSpacing
+            ? { maskDimensions, maskSpacing }
+            : {}),
         });
 
         setLoading(false);
+        const displayVoxels = finalMaskBytes
+          ? (maskDimensions![0] * maskDimensions![1] * maskDimensions![2])
+          : numVoxels;
         console.info(
           `[useSegmentation] Loaded mask for job ${jobId}: ` +
-          `${labels.length} segments, ${numVoxels} voxels`
+          `${labels.length} segments, ${displayVoxels} voxels` +
+          (finalMaskBytes ? ` (downsampled from ${numVoxels})` : '')
         );
       } catch (err: any) {
         if (!cancelledRef.current) {
@@ -285,6 +365,8 @@ export function useSegmentation(ctVolumeId: string | undefined) {
       jobId: string;
       maskData: Float32Array;
       labels: SegmentationLabel[];
+      maskDimensions?: [number, number, number];
+      maskSpacing?: [number, number, number];
     }) => {
       if (!ctVolumeId) {
         setError('No CT volume ID available — cannot restore segmentation');
@@ -312,13 +394,20 @@ export function useSegmentation(ctVolumeId: string | undefined) {
         }
 
         const dimensions = sourceVolume.dimensions;
+        const spacing = sourceVolume.spacing;
+        const origin = sourceVolume.origin;
+        const direction = sourceVolume.direction;
 
         const numVoxels = cached.maskData.length;
-        const expectedVoxels = dimensions[0] * dimensions[1] * dimensions[2];
+        // If this is a downsampled mask, validate against stored dimensions;
+        // otherwise validate against CT volume dimensions.
+        const expectedVoxels = cached.maskDimensions
+          ? cached.maskDimensions[0] * cached.maskDimensions[1] * cached.maskDimensions[2]
+          : dimensions[0] * dimensions[1] * dimensions[2];
         if (numVoxels !== expectedVoxels) {
           console.warn(
             `[useSegmentation] Cached mask data size mismatch: ` +
-            `${numVoxels} voxels, CT volume has ${expectedVoxels}. ` +
+            `${numVoxels} voxels, expected ${expectedVoxels}. ` +
             `Attempting to proceed, but alignment may be incorrect.`
           );
         }
@@ -328,21 +417,43 @@ export function useSegmentation(ctVolumeId: string | undefined) {
         const segmentationId = segLoadId;
         const labelmapVolumeId = `labelmap-${segLoadId}`;
 
-        const labelmapVolume = await volumeLoader.createAndCacheDerivedVolume(
-          ctVolumeId,
-          { volumeId: labelmapVolumeId }
-        );
-        if (cancelledRef.current) {
-          cache.removeVolumeLoadObject(labelmapVolumeId);
-          return;
-        }
+        let labelmapVolume: any;
 
-        // Fill with cached label data
-        const scalarData = labelmapVolume.getScalarData();
-        if (scalarData) {
-          scalarData.set(cached.maskData);
+        if (cached.maskDimensions && cached.maskSpacing) {
+          // Restore downsampled mask — create local volume at stored resolution
+          const maskBytes = new Uint8Array(cached.maskData);
+          labelmapVolume = await (
+            volumeLoader as any
+          ).createLocalSegmentationVolume(
+            {
+              dimensions: cached.maskDimensions,
+              spacing: cached.maskSpacing,
+              origin,
+              direction,
+              scalarData: maskBytes,
+              metadata: (sourceVolume as any).metadata ?? {},
+              referencedVolumeId: ctVolumeId,
+            },
+            labelmapVolumeId,
+          );
+        } else {
+          // Restore full-resolution mask — create derived volume
+          labelmapVolume = await volumeLoader.createAndCacheDerivedVolume(
+            ctVolumeId,
+            { volumeId: labelmapVolumeId }
+          );
+          if (cancelledRef.current) {
+            cache.removeVolumeLoadObject(labelmapVolumeId);
+            return;
+          }
+
+          // Fill with cached label data
+          const scalarData = labelmapVolume.getScalarData();
+          if (scalarData) {
+            scalarData.set(cached.maskData);
+          }
+          labelmapVolume.modified();
         }
-        labelmapVolume.modified();
 
         // ---- Step 3: Register with Cornerstone3D segmentation system ----
         csSegmentation.addSegmentations([
@@ -549,4 +660,63 @@ async function clearSegmentation(representationUID: string): Promise<void> {
   } catch {
     // May already be removed — ignore
   }
+}
+
+// ---------------------------------------------------------------------------
+// Labelmap downsampling
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum number of voxels for labelmap volumes uploaded to GPU.
+ * Above this threshold we downsample to prevent WebGL context loss
+ * on integrated GPUs.
+ *
+ * 8M voxels ≈ 256×256×128 ≈ 32MB as Float32 texture → safe for most GPUs.
+ * At Uint8 (used internally by createLocalSegmentationVolume) it's only 8MB.
+ */
+const MAX_LABELMAP_VOXELS = 8_000_000;
+
+/**
+ * Maximum dimension (width, height, depth) for any axis of the labelmap.
+ * The XY plane is the primary concern — Z is usually much smaller.
+ */
+const MAX_LABELMAP_DIM = 256;
+
+/**
+ * Nearest-neighbor downsampling of a 3D labelmap volume.
+ * Preserves integer label values (no interpolation).
+ *
+ * @param src - Source label data (Int32Array or Float32Array), C-contiguous (x varies fastest)
+ * @param srcDims - Source dimensions [x, y, z]
+ * @param dstDims - Target dimensions [x, y, z]
+ * @returns Uint8Array of downsampled data
+ */
+function downsampleLabelmap(
+  src: Int32Array | Float32Array,
+  srcDims: readonly number[],
+  dstDims: readonly number[],
+): Uint8Array {
+  const [sx, sy, sz] = srcDims;
+  const [dx, dy, dz] = dstDims;
+  const rx = sx / dx;
+  const ry = sy / dy;
+  const rz = sz / dz;
+  const out = new Uint8Array(dx * dy * dz);
+
+  for (let z = 0; z < dz; z++) {
+    const srcZ = Math.min(Math.round(z * rz), sz - 1);
+    const zOffsetSrc = srcZ * sx * sy;
+    const zOffsetDst = z * dx * dy;
+    for (let y = 0; y < dy; y++) {
+      const srcY = Math.min(Math.round(y * ry), sy - 1);
+      const yOffsetSrc = zOffsetSrc + srcY * sx;
+      const yOffsetDst = zOffsetDst + y * dx;
+      for (let x = 0; x < dx; x++) {
+        const srcX = Math.min(Math.round(x * rx), sx - 1);
+        out[yOffsetDst + x] = src[yOffsetSrc + srcX];
+      }
+    }
+  }
+
+  return out;
 }

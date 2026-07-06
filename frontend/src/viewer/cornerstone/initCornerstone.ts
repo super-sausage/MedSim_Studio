@@ -58,6 +58,8 @@ const RENDERING_CONFIG = {
   isMobile: false,
   detectGPUConfig: {},
   enableCacheOptimization: true,
+  /** 限制 GPU 纹理缓存上限，防止集成显卡因显存不足导致 WebGL context lost */
+  cacheSize: 256 * 1024 * 1024,
 };
 
 /** DICOM image loader configuration */
@@ -129,6 +131,36 @@ export async function initCornerstone(): Promise<void> {
       // shared cache, and event system.
       await cs.init(RENDERING_CONFIG);
       console.info('[Cornerstone3D] Core initialized');
+
+      // ------------------------------------------------------------------
+      // Step 1b: Register WebGL context lost auto-recovery
+      // ------------------------------------------------------------------
+      // When the GPU runs out of memory (e.g. loading a large segmentation
+      // mask), the browser loses the WebGL context and all canvases go
+      // blank. We reset internal state so Cornerstone re-initializes with
+      // fresh GL resources on the next opportunity.
+      //
+      // NOTE: We intentionally do NOT call e.preventDefault() here —
+      //       preventDefault tells the browser to NOT auto-restore the
+      //       context, which makes recovery harder. Instead we let the
+      //       browser handle native context restoration and just ensure
+      //       our internal flags reflect the lost state.
+      document.addEventListener('webglcontextlost', () => {
+        console.warn('[Cornerstone3D] WebGL context lost! Resetting state for recovery...');
+        initialized = false;
+        initPromise = null;
+        // Clear the Cornerstone3D cache to free GPU memory
+        try { cs.cache.purgeCache(); } catch { /* ignore */ }
+      });
+      // When the browser successfully restores the context, re-init
+      document.addEventListener('webglcontextrestored', () => {
+        console.info('[Cornerstone3D] WebGL context restored!');
+        setTimeout(() => {
+          initCornerstone().catch((err) =>
+            console.error('[Cornerstone3D] Recovery failed:', err)
+          );
+        }, 100);
+      });
 
       // ------------------------------------------------------------------
       // Step 2: Initialize @cornerstonejs/tools event system

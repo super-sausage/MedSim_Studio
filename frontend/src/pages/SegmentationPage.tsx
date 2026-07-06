@@ -347,6 +347,9 @@ export default function SegmentationPage() {
         jobId: p.jobId,
         maskData: p.maskData,
         labels: p.labels.length > 0 ? p.labels : DEFAULT_LABELS,
+        ...(p.maskDimensions && p.maskSpacing
+          ? { maskDimensions: p.maskDimensions, maskSpacing: p.maskSpacing }
+          : {}),
       });
     }
   }, [volumeReady, volumeId, selectedSeriesId, restoreMaskFromCache]);
