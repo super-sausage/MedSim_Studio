@@ -385,6 +385,10 @@ export default function SimulationPage() {
   const [ctParamsError, setCtParamsError] = useState<string | null>(null);
   const [ctParamsResult, setCtParamsResult] = useState<CtParamsPreviewResponse | null>(null);
   const [isCtParamsPanelOpen, setIsCtParamsPanelOpen] = useState(false);
+  const [ctParamsCopyState, setCtParamsCopyState] = useState<string | null>(null);
+  const [ctParamsDownloadState, setCtParamsDownloadState] = useState<string | null>(null);
+  const [standardizedCaseCopyState, setStandardizedCaseCopyState] = useState<string | null>(null);
+  const [standardizedCaseDownloadState, setStandardizedCaseDownloadState] = useState<string | null>(null);
 
   // ---- Active rendering data ----
   const [decodedPhantomData, setDecodedPhantomData] = useState<Float32Array | null>(null);
@@ -396,6 +400,7 @@ export default function SimulationPage() {
   // ---- Refs ----
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const originalCompareCanvasRef = useRef<HTMLCanvasElement>(null);
+  const simulatedCompareCanvasRef = useRef<HTMLCanvasElement>(null);
   const playTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const gantryTiltAutoRunTimerRef = useRef<number | null>(null);
   const hasMountedGantryTiltRef = useRef(false);
@@ -407,6 +412,30 @@ export default function SimulationPage() {
       setPlaying(false);
     }
   }, [phantom]);
+
+  useEffect(() => {
+    if (!ctParamsCopyState) return;
+    const timer = window.setTimeout(() => setCtParamsCopyState(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [ctParamsCopyState]);
+
+  useEffect(() => {
+    if (!ctParamsDownloadState) return;
+    const timer = window.setTimeout(() => setCtParamsDownloadState(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [ctParamsDownloadState]);
+
+  useEffect(() => {
+    if (!standardizedCaseCopyState) return;
+    const timer = window.setTimeout(() => setStandardizedCaseCopyState(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [standardizedCaseCopyState]);
+
+  useEffect(() => {
+    if (!standardizedCaseDownloadState) return;
+    const timer = window.setTimeout(() => setStandardizedCaseDownloadState(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [standardizedCaseDownloadState]);
 
   // ---- Decode phantom data and labels when phantom changes ----
   useEffect(() => {
@@ -639,6 +668,28 @@ export default function SimulationPage() {
     });
   }, [activePreset, decodedPhantomData, phantom, sliceIndex]);
 
+  useEffect(() => {
+    const canvas = simulatedCompareCanvasRef.current;
+    if (!canvas || !phantom || !simulatedVolumeData) return;
+
+    const shape =
+      ctParamsResult?.metadata.shape && ctParamsResult.metadata.shape.length >= 3
+        ? ctParamsResult.metadata.shape
+        : [phantom.metadata.depth, phantom.metadata.height, phantom.metadata.width];
+    const [depth, height, width] = shape;
+
+    renderVolumeSliceToCanvas({
+      canvas,
+      width,
+      height,
+      depth,
+      volumeData: simulatedVolumeData,
+      sliceIndex: Math.min(sliceIndex, depth - 1),
+      windowLevel: activePreset.windowLevel,
+      windowWidth: activePreset.windowWidth,
+    });
+  }, [activePreset, ctParamsResult?.metadata.shape, phantom, simulatedVolumeData, sliceIndex]);
+
   // ---- Playback effect ----
   useEffect(() => {
     if (!playing || totalSlices <= 0) return;
@@ -794,6 +845,10 @@ export default function SimulationPage() {
 
     setCtParamsLoading(true);
     setCtParamsError(null);
+    setCtParamsCopyState(null);
+    setCtParamsDownloadState(null);
+    setStandardizedCaseCopyState(null);
+    setStandardizedCaseDownloadState(null);
     try {
       const response = await simulationService.runCtParamsPreview({
         source: currentSource,
@@ -812,6 +867,58 @@ export default function SimulationPage() {
       setCtParamsLoading(false);
     }
   };
+
+  const handleCopyCtParamsJson = async () => {
+    if (!ctParamsResult) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(ctParamsResult.paramsJson, null, 2));
+      setCtParamsCopyState('Copied');
+    } catch {
+      setCtParamsCopyState('Copy failed');
+    }
+  };
+
+  const handleDownloadCtParamsJson = useCallback(() => {
+    if (!ctParamsResult) return;
+    try {
+      const caseId = phantom?.metadata.caseId || 's0001';
+      const filename = `ct_params_simulation_${caseId}_${formatTimestampForFilename(new Date())}.json`;
+      const blob = new Blob([JSON.stringify(ctParamsResult.paramsJson, null, 2)], {
+        type: 'application/json;charset=utf-8',
+      });
+      triggerDownload(blob, filename);
+      setCtParamsDownloadState('Downloaded');
+    } catch (err) {
+      console.error('[SimulationPage] CT params JSON download failed:', err);
+      setCtParamsDownloadState('Download failed');
+    }
+  }, [ctParamsResult, phantom?.metadata.caseId]);
+
+  const handleCopyStandardizedCaseJson = async () => {
+    if (!ctParamsResult?.standardizedCase) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(ctParamsResult.standardizedCase, null, 2));
+      setStandardizedCaseCopyState('Copied');
+    } catch {
+      setStandardizedCaseCopyState('Copy failed');
+    }
+  };
+
+  const handleDownloadStandardizedCaseJson = useCallback(() => {
+    if (!ctParamsResult?.standardizedCase) return;
+    try {
+      const caseId = ctParamsResult.standardizedCase.caseId;
+      const filename = `standardized_ct_case_${caseId}.json`;
+      const blob = new Blob([JSON.stringify(ctParamsResult.standardizedCase, null, 2)], {
+        type: 'application/json;charset=utf-8',
+      });
+      triggerDownload(blob, filename);
+      setStandardizedCaseDownloadState('Downloaded');
+    } catch (err) {
+      console.error('[SimulationPage] Standardized case JSON download failed:', err);
+      setStandardizedCaseDownloadState('Download failed');
+    }
+  }, [ctParamsResult]);
 
   useEffect(() => {
     if (!phantom) return;
@@ -1689,7 +1796,7 @@ export default function SimulationPage() {
             </div>
           </div>
 
-          <div className="grid flex-shrink-0 grid-cols-1 gap-3 border-t border-border bg-zinc-950 px-4 py-3 lg:grid-cols-2">
+          <div className="grid flex-shrink-0 grid-cols-1 gap-3 border-t border-border bg-zinc-950 px-4 py-3 lg:grid-cols-3">
             <div className="flex min-h-[280px] flex-col rounded border border-white/10 bg-black">
               <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
                 <span className="text-xs font-medium text-white/70">Original CT Slice</span>
@@ -1708,6 +1815,30 @@ export default function SimulationPage() {
                   />
                 ) : (
                   <p className="text-sm text-white/35">Generate a CT phantom to preview original slices.</p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex min-h-[280px] flex-col rounded border border-white/10 bg-black">
+              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
+                <span className="text-xs font-medium text-white/70">Simulated CT Slice</span>
+                {ctParamsLoading && (
+                  <span className="text-[10px] text-cyan-400/80">Running CT parameter simulation...</span>
+                )}
+              </div>
+              <div className="flex flex-1 items-center justify-center p-2">
+                {ctParamsResult && simulatedVolumeData ? (
+                  <canvas
+                    ref={simulatedCompareCanvasRef}
+                    className="max-h-full max-w-full border border-white/10 object-contain"
+                    style={{ imageRendering: 'pixelated' }}
+                  />
+                ) : (
+                  <div className="px-6 text-center text-sm text-white/35">
+                    {ctParamsError && !ctParamsResult
+                      ? ctParamsError
+                      : 'Run CT Parameter Simulation to preview simulated CT.'}
+                  </div>
                 )}
               </div>
             </div>
@@ -2138,6 +2269,109 @@ export default function SimulationPage() {
 
                   {ctParamsError && (
                     <p className="mt-3 text-xs text-red-500">{ctParamsError}</p>
+                  )}
+
+                  {ctParamsResult && (
+                    <div className="mt-4 rounded border border-border/70 bg-background/60 p-3">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div>
+                          <h4 className="text-sm font-medium">Simulation Result</h4>
+                          <p className="text-xs text-muted-foreground">
+                            Preview metadata and the exact parameter payload returned by the backend.
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Button variant="outline" size="sm" onClick={handleCopyCtParamsJson}>
+                            {ctParamsCopyState || 'Copy Params JSON'}
+                          </Button>
+                          <Button variant="outline" size="sm" onClick={handleDownloadCtParamsJson}>
+                            {ctParamsDownloadState || 'Download Params JSON'}
+                          </Button>
+                        </div>
+                      </div>
+
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <div className="rounded border border-border/70 bg-card px-3 py-2">
+                          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">HU Range</div>
+                          <div className="mt-1 text-xs text-foreground">
+                            Before: {ctParamsResult.paramsJson.huRangeBefore ? `${ctParamsResult.paramsJson.huRangeBefore[0].toFixed(1)} to ${ctParamsResult.paramsJson.huRangeBefore[1].toFixed(1)}` : '--'}
+                          </div>
+                          <div className="text-xs text-foreground">
+                            After: {ctParamsResult.paramsJson.huRangeAfter ?? ctParamsResult.metadata.huRange ? `${(ctParamsResult.paramsJson.huRangeAfter ?? ctParamsResult.metadata.huRange)[0].toFixed(1)} to ${(ctParamsResult.paramsJson.huRangeAfter ?? ctParamsResult.metadata.huRange)[1].toFixed(1)}` : '--'}
+                          </div>
+                        </div>
+
+                        <div className="rounded border border-border/70 bg-card px-3 py-2">
+                          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Shape</div>
+                          <div className="mt-1 text-xs text-foreground">
+                            Input: {ctParamsResult.paramsJson.inputShape ? ctParamsResult.paramsJson.inputShape.join(' x ') : '--'}
+                          </div>
+                          <div className="text-xs text-foreground">
+                            Output: {(ctParamsResult.paramsJson.outputShape ?? ctParamsResult.metadata.shape) ? (ctParamsResult.paramsJson.outputShape ?? ctParamsResult.metadata.shape).join(' x ') : '--'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                        <div className="rounded border border-border/70 bg-card px-3 py-2">
+                          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Effective Slice Thickness</div>
+                          <div className="mt-1 text-xs text-foreground">
+                            {ctParamsResult.metadata.effectiveSliceThicknessMm.toFixed(3)} mm
+                          </div>
+                        </div>
+
+                        <div className="rounded border border-border/70 bg-card px-3 py-2">
+                          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Warnings</div>
+                          <div className="mt-1 text-xs text-foreground">
+                            {(ctParamsResult.metadata.warnings ?? ctParamsResult.paramsJson.warnings ?? []).length > 0
+                              ? (ctParamsResult.metadata.warnings ?? ctParamsResult.paramsJson.warnings ?? []).join(' | ')
+                              : 'None'}
+                          </div>
+                        </div>
+                      </div>
+
+                      {ctParamsResult.standardizedCase && (
+                        <div className="mt-3 rounded border border-border/70 bg-card px-3 py-2">
+                          <div className="mb-2 flex items-center justify-between gap-3">
+                            <div>
+                              <div className="text-xs font-medium text-foreground">Standardized Output for Downstream Modules</div>
+                              <div className="text-[11px] text-muted-foreground">
+                                Lightweight standardized case metadata for downstream artifact or lesion modules.
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Button variant="outline" size="sm" onClick={handleCopyStandardizedCaseJson}>
+                                {standardizedCaseCopyState || 'Copy Standardized Case JSON'}
+                              </Button>
+                              <Button variant="outline" size="sm" onClick={handleDownloadStandardizedCaseJson}>
+                                {standardizedCaseDownloadState || 'Download Standardized Case JSON'}
+                              </Button>
+                            </div>
+                          </div>
+
+                          <div className="grid gap-2 text-xs text-foreground sm:grid-cols-2 xl:grid-cols-3">
+                            <div><span className="text-muted-foreground">case_id:</span> {ctParamsResult.standardizedCase.caseId}</div>
+                            <div><span className="text-muted-foreground">source:</span> {ctParamsResult.standardizedCase.source}</div>
+                            <div><span className="text-muted-foreground">shape:</span> {ctParamsResult.standardizedCase.volume.shape.join(' x ')}</div>
+                            <div><span className="text-muted-foreground">spacing:</span> {ctParamsResult.standardizedCase.volume.spacing.join(', ')}</div>
+                            <div><span className="text-muted-foreground">hu_range:</span> {ctParamsResult.standardizedCase.volume.huRange[0].toFixed(1)} to {ctParamsResult.standardizedCase.volume.huRange[1].toFixed(1)}</div>
+                            <div><span className="text-muted-foreground">slice_count:</span> {ctParamsResult.standardizedCase.volume.sliceCount}</div>
+                            <div><span className="text-muted-foreground">dtype:</span> {ctParamsResult.standardizedCase.volume.dtype}</div>
+                            <div><span className="text-muted-foreground">axis_order:</span> {ctParamsResult.standardizedCase.volume.axisOrder}</div>
+                            <div><span className="text-muted-foreground">image_data_field:</span> {ctParamsResult.standardizedCase.volume.imageDataField}</div>
+                          </div>
+                        </div>
+                      )}
+
+                      <details className="mt-3 rounded border border-border/70 bg-card px-3 py-2">
+                        <summary className="cursor-pointer text-xs font-medium text-foreground">
+                          Params JSON
+                        </summary>
+                        <pre className="mt-2 overflow-auto whitespace-pre-wrap break-all text-[11px] text-muted-foreground">
+                          {JSON.stringify(ctParamsResult.paramsJson, null, 2)}
+                        </pre>
+                      </details>
+                    </div>
                   )}
                 </div>
               )}
