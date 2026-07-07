@@ -87,6 +87,7 @@ interface VolumeRendererProps {
    * Undefined / -1 disables scan clipping (full volume shown).
    */
   syntheticClipIndex?: number;
+  syntheticClipDirection?: 'low_to_high' | 'high_to_low';
   /**
    * Axis along which the progressive scan proceeds.
    * 'x', 'y', or 'z' — defaults to 'z' (superior→inferior for CT phantom).
@@ -259,6 +260,88 @@ function generateSyntheticVolume(): Float32Array {
   return data;
 }
 
+function centerVolumeOrigin(
+  dimensions: [number, number, number],
+  spacing: [number, number, number],
+): [number, number, number] {
+  return [
+    -((dimensions[0] - 1) * spacing[0]) / 2,
+    -((dimensions[1] - 1) * spacing[1]) / 2,
+    -((dimensions[2] - 1) * spacing[2]) / 2,
+  ];
+}
+
+function createProgressiveClipPlane(
+  axisIdx: number,
+  axisDim: number,
+  clipIndex: number,
+  direction: 'low_to_high' | 'high_to_low',
+  origin: [number, number, number],
+  spacing: [number, number, number],
+): any | null {
+  if (axisDim <= 0) {
+    return null;
+  }
+
+  const clampedIndex = Math.max(0, Math.min(axisDim - 1, clipIndex));
+  const normal: [number, number, number] = [0, 0, 0];
+  const planeOrigin: [number, number, number] = [0, 0, 0];
+
+  if (direction === 'high_to_low') {
+    const visibleStart = Math.max(axisDim - 1 - clampedIndex, 0);
+    if (visibleStart <= 0) {
+      return null;
+    }
+
+    planeOrigin[axisIdx] =
+      origin[axisIdx] + (visibleStart - 0.5) * spacing[axisIdx];
+    normal[axisIdx] = 1;
+    return vtkPlane.newInstance({ normal, origin: planeOrigin });
+  }
+
+  if (clampedIndex >= axisDim - 1) {
+    return null;
+  }
+
+  planeOrigin[axisIdx] =
+    origin[axisIdx] + (clampedIndex + 0.5) * spacing[axisIdx];
+  normal[axisIdx] = -1;
+  return vtkPlane.newInstance({ normal, origin: planeOrigin });
+}
+
+function resetCameraToVolume(
+  renderer: any,
+  imageData: any,
+  container: HTMLDivElement,
+  scanView: boolean,
+): void {
+  const bounds = imageData.getBounds() as [number, number, number, number, number, number];
+  const center: [number, number, number] = [
+    (bounds[0] + bounds[1]) / 2,
+    (bounds[2] + bounds[3]) / 2,
+    (bounds[4] + bounds[5]) / 2,
+  ];
+  const sizeX = Math.max(bounds[1] - bounds[0], 1e-3);
+  const sizeY = Math.max(bounds[3] - bounds[2], 1e-3);
+  const sizeZ = Math.max(bounds[5] - bounds[4], 1e-3);
+  const radius = 0.5 * Math.sqrt(sizeX ** 2 + sizeY ** 2 + sizeZ ** 2);
+  const { width, height } = container.getBoundingClientRect();
+  const aspect = Math.max(width, 1) / Math.max(height, 1);
+
+  const camera = renderer.getActiveCamera();
+  camera.setFocalPoint(center[0], center[1], center[2]);
+  camera.setViewAngle(30);
+
+  const viewAngleRad = (30 * Math.PI) / 180;
+  const fitHeight = radius / Math.tan(viewAngleRad / 2);
+  const fitWidth = (radius * aspect) / Math.tan(viewAngleRad / 2);
+  const distance = Math.max(fitHeight, fitWidth) * 1.15;
+
+  camera.setPosition(center[0], center[1] + distance, center[2]);
+  camera.setViewUp(0, 0, scanView ? -1 : 1);
+  renderer.resetCameraClippingRange(bounds);
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -274,6 +357,7 @@ export function VolumeRenderer({
   syntheticDims,
   syntheticSpacing,
   syntheticClipIndex,
+  syntheticClipDirection = 'low_to_high',
   syntheticScanAxis = 'z',
   scanView = false,
   scanDirection = 'head_to_feet',
@@ -355,11 +439,7 @@ export function VolumeRenderer({
               scalarData: syntheticData,
               dimensions: syntheticDims,
               spacing: sp,
-              origin: [
-                -(syntheticDims[0] * sp[0]) / 2,
-                -(syntheticDims[1] * sp[1]) / 2,
-                -(syntheticDims[2] * sp[2]) / 2,
-              ],
+              origin: centerVolumeOrigin(syntheticDims, sp),
             };
           } else {
             // Built-in 64³ phantom (legacy / demo)
@@ -367,7 +447,7 @@ export function VolumeRenderer({
               scalarData: generateSyntheticVolume(),
               dimensions: [64, 64, 64],
               spacing: [1, 1, 1],
-              origin: [-32, -32, -32],
+              origin: centerVolumeOrigin([64, 64, 64], [1, 1, 1]),
             };
           }
         }
@@ -426,29 +506,7 @@ export function VolumeRenderer({
         property.setUseGradientOpacity(0, false);
 
         renderer.addVolume(volume);
-        renderer.resetCamera();
-
-        // ------- Scan-view camera orientation -------
-        // When scanView is enabled, orient the camera so the progressive
-        // scan builds from TOP (head/chest) to BOTTOM (abdomen/pelvis).
-        // We position the camera in +Y (anterior) and set viewUp to -Z,
-        // which makes +Z (the head→feet axis) point downward on screen.
-        if (scanView) {
-          const camera = renderer.getActiveCamera();
-          const fp = camera.getFocalPoint();
-          const pos = camera.getPosition();
-          const dist = Math.sqrt(
-            (pos[0] - fp[0]) ** 2 +
-            (pos[1] - fp[1]) ** 2 +
-            (pos[2] - fp[2]) ** 2,
-          );
-          // Camera from anterior (+Y), looking at volume center
-          camera.setPosition(fp[0], fp[1] + dist, fp[2]);
-          // -Z is screen-up → +Z (head→feet) is screen-down
-          camera.setViewUp(0, 0, -1);
-          renderer.resetCameraClippingRange();
-        }
-
+        resetCameraToVolume(renderer, imageData, container, scanView);
         // ------- mouse interaction -------
         const interactor = vtkRenderWindowInteractor.newInstance();
         interactor.setView(openglRW);
@@ -637,21 +695,16 @@ export function VolumeRenderer({
         : syntheticScanAxis === 'y' ? 1 : 2;
       const axisDim = dims[axisIdx];
 
-      // Only add plane when we haven't reached the final slice yet
-      if (syntheticClipIndex < axisDim - 1) {
-        // Position the plane just past the last visible slice
-        const clipWorld =
-          origin[axisIdx] + (syntheticClipIndex + 0.5) * spacing[axisIdx];
-
-        const normal: [number, number, number] = [0, 0, 0];
-        normal[axisIdx] = -1; // negative normal → clips positive side
-
-        const planeOrigin: [number, number, number] = [0, 0, 0];
-        planeOrigin[axisIdx] = clipWorld;
-
-        activePlanes.push(
-          vtkPlane.newInstance({ normal, origin: planeOrigin }),
-        );
+      const progressivePlane = createProgressiveClipPlane(
+        axisIdx,
+        axisDim,
+        syntheticClipIndex,
+        syntheticClipDirection,
+        origin,
+        spacing,
+      );
+      if (progressivePlane) {
+        activePlanes.push(progressivePlane);
       }
     }
 
@@ -661,7 +714,7 @@ export function VolumeRenderer({
     }
     renderWindow.render();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clip, syntheticClipIndex, syntheticScanAxis, isReady]);
+  }, [clip, syntheticClipDirection, syntheticClipIndex, syntheticScanAxis, isReady]);
 
   // ------------------------------------------------------------------
   // 4. Segmentation overlay — add/remove a second volume for mask
@@ -861,13 +914,14 @@ export function VolumeRenderer({
       const { width, height } = container.getBoundingClientRect();
       if (width > 0 && height > 0) {
         state.openglRW.setSize(width, height);
+        resetCameraToVolume(state.renderer, state.imageData, container, scanView);
         state.renderWindow.render();
       }
     });
 
     observer.observe(container);
     return () => observer.disconnect();
-  }, [isReady]);
+  }, [isReady, scanView]);
 
   // ------------------------------------------------------------------
   // 5. Preset button handler
@@ -921,49 +975,6 @@ export function VolumeRenderer({
         className="h-full w-full"
         style={{ opacity: isReady ? 1 : 0 }}
       />
-
-      {/* ---- Scan-view overlays (scan plane + direction labels) ---- */}
-      {scanView && isReady && syntheticDims && syntheticClipIndex !== undefined && syntheticClipIndex >= 0 && (() => {
-        const axisIdx = syntheticScanAxis === 'x' ? 0 : syntheticScanAxis === 'y' ? 1 : 2;
-        const totalDepth = syntheticDims[axisIdx];
-        const scanFraction = totalDepth > 1
-          ? (syntheticClipIndex + 0.5) / totalDepth
-          : 0;
-        const topPct = scanFraction * 100;
-        const isHeadFirst = scanDirection === 'head_to_feet';
-        const topLabel = isHeadFirst ? 'TOP / Head-Chest' : 'TOP / Abdomen-Pelvis';
-        const bottomLabel = isHeadFirst ? 'BOTTOM / Abdomen-Pelvis' : 'BOTTOM / Head-Chest';
-        return (
-          <>
-            {/* Direction labels */}
-            <div className="pointer-events-none absolute inset-x-0 top-1 z-10 flex justify-center">
-              <span className="rounded bg-black/60 px-2 py-0.5 text-[10px] font-medium text-cyan-300/80">
-                ▲ {topLabel}
-              </span>
-            </div>
-            <div className="pointer-events-none absolute inset-x-0 bottom-1 z-10 flex justify-center">
-              <span className="rounded bg-black/60 px-2 py-0.5 text-[10px] font-medium text-cyan-300/80">
-                ▼ {bottomLabel}
-              </span>
-            </div>
-
-            {/* Scan plane — horizontal cyan line at current clip position */}
-            <div
-              className="pointer-events-none absolute inset-x-0 z-10"
-              style={{ top: `${topPct}%` }}
-            >
-              {/* Glow line */}
-              <div className="h-px w-full bg-cyan-400/60 shadow-[0_0_8px_2px_rgba(34,211,238,0.4)]" />
-              {/* Scan arrow indicator on the right side */}
-              <div className="absolute right-2 -translate-y-1/2">
-                <span className="text-[9px] text-cyan-300/70 tabular-nums">
-                  slice {syntheticClipIndex + 1}/{totalDepth}
-                </span>
-              </div>
-            </div>
-          </>
-        );
-      })()}
 
       {/* Controls overlay */}
       {showControls && isReady && (

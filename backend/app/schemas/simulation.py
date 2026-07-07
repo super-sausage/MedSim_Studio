@@ -262,6 +262,7 @@ class LesionAnalysisResponse(BaseModel):
 class CTParamsPreviewParams(BaseModel):
     """CT scan parameter simulation controls for preview."""
 
+    gantry_tilt_deg: float = Field(0.0, ge=-30.0, le=30.0)
     slice_thickness_mm: Literal[0.625, 1.0, 2.5, 5.0, 10.0] = 1.0
     dose_level: Literal["low", "standard", "high"] = "standard"
     mAs: int = Field(150, ge=30, le=300)

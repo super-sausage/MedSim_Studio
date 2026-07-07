@@ -91,6 +91,44 @@ function decodeBase64ToFloat32(base64: string): Float32Array {
   return new Float32Array(bytes.buffer);
 }
 
+function decodeBase64ToUint8(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function buildVtkVolumePayload(
+  volumeData: Float32Array,
+  shape: [number, number, number],
+  spacing: [number, number, number],
+): {
+  transposedData: Float32Array;
+  dims: [number, number, number];
+  vtkSpacing: [number, number, number];
+} {
+  const [depth, height, width] = shape;
+  const transposed = new Float32Array(width * height * depth);
+
+  for (let z = 0; z < depth; z++) {
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const srcIdx = z * height * width + y * width + x;
+        const dstIdx = x + y * width + z * width * height;
+        transposed[dstIdx] = volumeData[srcIdx];
+      }
+    }
+  }
+
+  return {
+    transposedData: transposed,
+    dims: [width, height, depth],
+    vtkSpacing: [spacing[2], spacing[1], spacing[0]],
+  };
+}
+
 function renderVolumeSliceToCanvas({
   canvas,
   width,
@@ -225,6 +263,7 @@ const DEFAULT_FORM: {
 };
 
 const DEFAULT_CT_PARAMS: CtParamsPreviewParams = {
+  gantryTiltDeg: 0,
   sliceThicknessMm: 5.0,
   doseLevel: 'standard',
   mAs: 150,
@@ -345,12 +384,11 @@ export default function SimulationPage() {
   const [ctParamsLoading, setCtParamsLoading] = useState(false);
   const [ctParamsError, setCtParamsError] = useState<string | null>(null);
   const [ctParamsResult, setCtParamsResult] = useState<CtParamsPreviewResponse | null>(null);
-  const [ctParamsCopyState, setCtParamsCopyState] = useState<string | null>(null);
-  const [ctParamsDownloadState, setCtParamsDownloadState] = useState<string | null>(null);
-  const [standardizedCaseCopyState, setStandardizedCaseCopyState] = useState<string | null>(null);
-  const [standardizedCaseDownloadState, setStandardizedCaseDownloadState] = useState<string | null>(null);
+  const [isCtParamsPanelOpen, setIsCtParamsPanelOpen] = useState(false);
 
-  // ---- vtk.js volume data (decoded once from phantom) ----
+  // ---- Active rendering data ----
+  const [decodedPhantomData, setDecodedPhantomData] = useState<Float32Array | null>(null);
+  const [decodedLabelData, setDecodedLabelData] = useState<Uint8Array | null>(null);
   const [vtkVolumeData, setVtkVolumeData] = useState<Float32Array | null>(null);
   const [vtkDims, setVtkDims] = useState<[number, number, number] | null>(null);
   const [vtkSpacing, setVtkSpacing] = useState<[number, number, number] | null>(null);
@@ -358,10 +396,9 @@ export default function SimulationPage() {
   // ---- Refs ----
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const originalCompareCanvasRef = useRef<HTMLCanvasElement>(null);
-  const simulatedCompareCanvasRef = useRef<HTMLCanvasElement>(null);
-  const cachedPhantomDataRef = useRef<Float32Array | null>(null);
-  const cachedLabelDataRef = useRef<Uint8Array | null>(null);
   const playTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const gantryTiltAutoRunTimerRef = useRef<number | null>(null);
+  const hasMountedGantryTiltRef = useRef(false);
 
   // ---- Reset slice index to 0 when a new phantom is loaded ----
   useEffect(() => {
@@ -371,90 +408,27 @@ export default function SimulationPage() {
     }
   }, [phantom]);
 
-  useEffect(() => {
-    if (!ctParamsCopyState) return;
-    const timer = window.setTimeout(() => setCtParamsCopyState(null), 2000);
-    return () => window.clearTimeout(timer);
-  }, [ctParamsCopyState]);
-
-  useEffect(() => {
-    if (!ctParamsDownloadState) return;
-    const timer = window.setTimeout(() => setCtParamsDownloadState(null), 2000);
-    return () => window.clearTimeout(timer);
-  }, [ctParamsDownloadState]);
-
-  useEffect(() => {
-    if (!standardizedCaseCopyState) return;
-    const timer = window.setTimeout(() => setStandardizedCaseCopyState(null), 2000);
-    return () => window.clearTimeout(timer);
-  }, [standardizedCaseCopyState]);
-
-  useEffect(() => {
-    if (!standardizedCaseDownloadState) return;
-    const timer = window.setTimeout(() => setStandardizedCaseDownloadState(null), 2000);
-    return () => window.clearTimeout(timer);
-  }, [standardizedCaseDownloadState]);
-
-  // ---- Decode vtk.js data when phantom changes ----
+  // ---- Decode phantom data and labels when phantom changes ----
   useEffect(() => {
     if (!phantom) {
-      setVtkVolumeData(null);
-      setVtkDims(null);
-      setVtkSpacing(null);
       setLoadedPhantomSize(null);
-      cachedPhantomDataRef.current = null;
-      cachedLabelDataRef.current = null;
+      setDecodedPhantomData(null);
+      setDecodedLabelData(null);
       return;
     }
+
     try {
-      const data = decodeBase64ToFloat32(phantom.volumeBase64);
-      // Cache the original (z,y,x)-ordered data for slice rendering
-      cachedPhantomDataRef.current = data;
-
-      // Decode label data if present
-      if (phantom.labelBase64) {
-        try {
-          const binary = atob(phantom.labelBase64);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) {
-            bytes[i] = binary.charCodeAt(i);
-          }
-          cachedLabelDataRef.current = bytes;
-        } catch {
-          cachedLabelDataRef.current = null;
-        }
-      } else {
-        cachedLabelDataRef.current = null;
-      }
-
-      const { width, height, depth, spacing } = phantom.metadata;
-      // Volume stored as (z, y, x) in backend; vtk.js expects (x, y, z)
-      // so we need to transpose. Build transposed volume: x fastest, then y, then z.
-      const xDim = width;
-      const yDim = height;
-      const zDim = depth;
-      const transposed = new Float32Array(xDim * yDim * zDim);
-      for (let z = 0; z < zDim; z++) {
-        for (let y = 0; y < yDim; y++) {
-          for (let x = 0; x < xDim; x++) {
-            const srcIdx = z * yDim * xDim + y * xDim + x;
-            const dstIdx = x + y * xDim + z * xDim * yDim;
-            transposed[dstIdx] = data[srcIdx];
-          }
-        }
-      }
-      setVtkVolumeData(transposed);
-      setVtkDims([xDim, yDim, zDim]);
-      setVtkSpacing([spacing[2], spacing[1], spacing[0]]); // (z,y,x)→(x,y,z)
+      setDecodedPhantomData(decodeBase64ToFloat32(phantom.volumeBase64));
+      setDecodedLabelData(
+        phantom.labelBase64
+        ? decodeBase64ToUint8(phantom.labelBase64)
+        : null,
+      );
     } catch (err: any) {
       console.error('[SimulationPage] Failed to decode phantom volume:', err);
-      setVtkVolumeData(null);
-      setVtkDims(null);
-      setVtkSpacing(null);
-      cachedPhantomDataRef.current = null;
-      cachedLabelDataRef.current = null;
+      setDecodedPhantomData(null);
+      setDecodedLabelData(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phantom?.volumeBase64, phantom?.labelBase64]);
 
   // ---- Generate 3D lesion overlay mask for vtk.js volume preview ----
@@ -554,29 +528,94 @@ export default function SimulationPage() {
     }
   }, [ctParamsResult?.simulatedVolumeBase64]);
 
+  const activeVolumeShape = useMemo<[number, number, number] | null>(() => {
+    if (ctParamsResult?.metadata.shape && ctParamsResult.metadata.shape.length >= 3) {
+      const [depth, height, width] = ctParamsResult.metadata.shape;
+      return [depth, height, width];
+    }
+
+    if (!phantom) return null;
+    return [phantom.metadata.depth, phantom.metadata.height, phantom.metadata.width];
+  }, [ctParamsResult?.metadata.shape, phantom]);
+
+  const activeVolumeSpacing = useMemo<[number, number, number] | null>(() => {
+    if (ctParamsResult?.metadata.spacing && ctParamsResult.metadata.spacing.length >= 3) {
+      const [z, y, x] = ctParamsResult.metadata.spacing;
+      return [z, y, x];
+    }
+
+    if (!phantom) return null;
+    const [z, y, x] = phantom.metadata.spacing;
+    return [z, y, x];
+  }, [ctParamsResult?.metadata.spacing, phantom]);
+
+  const activeSliceData = ctParamsResult ? simulatedVolumeData : decodedPhantomData;
+  const activeLabelData = ctParamsResult ? null : decodedLabelData;
+  const totalSlices = activeVolumeShape?.[0] ?? 0;
+
+  useEffect(() => {
+    if (!activeVolumeShape) return;
+    const maxIndex = Math.max(activeVolumeShape[0] - 1, 0);
+    if (sliceIndex > maxIndex) {
+      setSliceIndex(maxIndex);
+    }
+  }, [activeVolumeShape, sliceIndex]);
+
+  useEffect(() => {
+    if (!activeVolumeShape || !activeVolumeSpacing || !activeSliceData) {
+      setVtkVolumeData(null);
+      setVtkDims(null);
+      setVtkSpacing(null);
+      return;
+    }
+
+    try {
+      const { transposedData, dims, vtkSpacing: spacing } = buildVtkVolumePayload(
+        activeSliceData,
+        activeVolumeShape,
+        activeVolumeSpacing,
+      );
+      setVtkVolumeData(transposedData);
+      setVtkDims(dims);
+      setVtkSpacing(spacing);
+    } catch (err) {
+      console.error('[SimulationPage] Failed to prepare VTK volume payload:', err);
+      setVtkVolumeData(null);
+      setVtkDims(null);
+      setVtkSpacing(null);
+    }
+  }, [activeSliceData, activeVolumeShape, activeVolumeSpacing]);
+
   // ---- Axial slice canvas rendering ----
   const renderSlice = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !phantom) return;
+    if (!canvas || !activeVolumeShape || !activeSliceData) return;
 
-    const { width, height, depth } = phantom.metadata;
-    const data = cachedPhantomDataRef.current;
-    if (!data) return;
+    const [depth, height, width] = activeVolumeShape;
     const { windowLevel, windowWidth } = activePreset;
     renderVolumeSliceToCanvas({
       canvas,
       width,
       height,
       depth,
-      volumeData: data,
+      volumeData: activeSliceData,
       sliceIndex,
       windowLevel,
       windowWidth,
-      labelData: cachedLabelDataRef.current,
-      showLabelOverlay,
+      labelData: activeLabelData,
+      showLabelOverlay: showLabelOverlay && !ctParamsResult,
       pickedPosition,
     });
-  }, [phantom, sliceIndex, activePreset, showLabelOverlay, pickedPosition]);
+  }, [
+    activePreset,
+    activeSliceData,
+    activeLabelData,
+    activeVolumeShape,
+    ctParamsResult,
+    pickedPosition,
+    showLabelOverlay,
+    sliceIndex,
+  ]);
 
   // Re-render on slice/preset change
   useEffect(() => {
@@ -585,45 +624,29 @@ export default function SimulationPage() {
 
   useEffect(() => {
     const canvas = originalCompareCanvasRef.current;
-    const data = cachedPhantomDataRef.current;
-    if (!canvas || !phantom || !data) return;
-    const { width, height, depth } = phantom.metadata;
-    renderVolumeSliceToCanvas({
-      canvas,
-      width,
-      height,
-      depth,
-      volumeData: data,
-      sliceIndex,
-      windowLevel: activePreset.windowLevel,
-      windowWidth: activePreset.windowWidth,
-    });
-  }, [phantom, sliceIndex, activePreset]);
+    if (!canvas || !phantom || !decodedPhantomData) return;
 
-  useEffect(() => {
-    const canvas = simulatedCompareCanvasRef.current;
-    if (!canvas || !phantom || !simulatedVolumeData) return;
     const { width, height, depth } = phantom.metadata;
     renderVolumeSliceToCanvas({
       canvas,
       width,
       height,
       depth,
-      volumeData: simulatedVolumeData,
-      sliceIndex,
+      volumeData: decodedPhantomData,
+      sliceIndex: Math.min(sliceIndex, depth - 1),
       windowLevel: activePreset.windowLevel,
       windowWidth: activePreset.windowWidth,
     });
-  }, [phantom, simulatedVolumeData, sliceIndex, activePreset]);
+  }, [activePreset, decodedPhantomData, phantom, sliceIndex]);
 
   // ---- Playback effect ----
   useEffect(() => {
-    if (!playing || !phantom) return;
+    if (!playing || totalSlices <= 0) return;
 
     const intervalMs = 1000 / Math.max(playSpeed, 1);
     playTimerRef.current = setInterval(() => {
       setSliceIndex((prev) => {
-        const maxIdx = phantom.metadata.depth - 1;
+        const maxIdx = totalSlices - 1;
         if (prev >= maxIdx) {
           // Stop at end (loop disabled by default for MVP)
           setPlaying(false);
@@ -639,7 +662,7 @@ export default function SimulationPage() {
         playTimerRef.current = null;
       }
     };
-  }, [playing, playSpeed, phantom]);
+  }, [playing, playSpeed, totalSlices]);
 
   // ---- Load available DICOM studies on mount ----
   useEffect(() => {
@@ -696,8 +719,6 @@ export default function SimulationPage() {
     setPhantomError(null);
     setCtParamsError(null);
     setCtParamsResult(null);
-    setCtParamsCopyState(null);
-    setCtParamsDownloadState(null);
     setPhantom(null);
     setSliceIndex(0);
     setPlaying(false);
@@ -722,12 +743,12 @@ export default function SimulationPage() {
   };
 
   const handlePlayPause = () => {
-    if (!phantom) return;
+    if (totalSlices <= 0) return;
     if (playing) {
       setPlaying(false);
     } else {
       // If at end, restart from top
-      if (sliceIndex >= phantom.metadata.depth - 1) {
+      if (sliceIndex >= totalSlices - 1) {
         setSliceIndex(0);
       }
       setPlaying(true);
@@ -750,7 +771,9 @@ export default function SimulationPage() {
     return normalized;
   }, [mAsInput]);
 
-  const handleRunCtParamsSimulation = async () => {
+  const handleRunCtParamsSimulation = async (
+    overrideParams?: Partial<CtParamsPreviewParams>,
+  ) => {
     if (!phantom) {
       setCtParamsError('Please generate a CT phantom first.');
       return;
@@ -765,15 +788,12 @@ export default function SimulationPage() {
     const normalizedMAs = normalizeMAsInput();
     const normalizedParams: CtParamsPreviewParams = {
       ...ctParams,
+      ...overrideParams,
       mAs: normalizedMAs,
     };
 
     setCtParamsLoading(true);
     setCtParamsError(null);
-    setCtParamsCopyState(null);
-    setCtParamsDownloadState(null);
-    setStandardizedCaseCopyState(null);
-    setStandardizedCaseDownloadState(null);
     try {
       const response = await simulationService.runCtParamsPreview({
         source: currentSource,
@@ -783,6 +803,8 @@ export default function SimulationPage() {
         params: normalizedParams,
       });
       setCtParamsResult(response);
+      setSliceIndex(0);
+      setPlaying(false);
     } catch (err: any) {
       console.error('[SimulationPage] CT parameter simulation failed:', err);
       setCtParamsError(err?.message || 'Failed to run CT parameter simulation.');
@@ -791,57 +813,29 @@ export default function SimulationPage() {
     }
   };
 
-  const handleCopyCtParamsJson = async () => {
-    if (!ctParamsResult) return;
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(ctParamsResult.paramsJson, null, 2));
-      setCtParamsCopyState('Copied');
-    } catch {
-      setCtParamsCopyState('Copy failed');
-    }
-  };
+  useEffect(() => {
+    if (!phantom) return;
 
-  const handleDownloadCtParamsJson = useCallback(() => {
-    if (!ctParamsResult) return;
-    try {
-      const caseId = phantom?.metadata.caseId || 's0001';
-      const filename = `ct_params_simulation_${caseId}_${formatTimestampForFilename(new Date())}.json`;
-      const blob = new Blob([JSON.stringify(ctParamsResult.paramsJson, null, 2)], {
-        type: 'application/json;charset=utf-8',
-      });
-      triggerDownload(blob, filename);
-      setCtParamsDownloadState('Downloaded');
-    } catch (err) {
-      console.error('[SimulationPage] CT params JSON download failed:', err);
-      setCtParamsDownloadState('Download failed');
+    if (!hasMountedGantryTiltRef.current) {
+      hasMountedGantryTiltRef.current = true;
+      return;
     }
-  }, [ctParamsResult, phantom?.metadata.caseId]);
 
-  const handleCopyStandardizedCaseJson = async () => {
-    if (!ctParamsResult?.standardizedCase) return;
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(ctParamsResult.standardizedCase, null, 2));
-      setStandardizedCaseCopyState('Copied');
-    } catch {
-      setStandardizedCaseCopyState('Copy failed');
+    if (gantryTiltAutoRunTimerRef.current) {
+      clearTimeout(gantryTiltAutoRunTimerRef.current);
     }
-  };
 
-  const handleDownloadStandardizedCaseJson = useCallback(() => {
-    if (!ctParamsResult?.standardizedCase) return;
-    try {
-      const caseId = ctParamsResult.standardizedCase.caseId;
-      const filename = `standardized_ct_case_${caseId}.json`;
-      const blob = new Blob([JSON.stringify(ctParamsResult.standardizedCase, null, 2)], {
-        type: 'application/json;charset=utf-8',
-      });
-      triggerDownload(blob, filename);
-      setStandardizedCaseDownloadState('Downloaded');
-    } catch (err) {
-      console.error('[SimulationPage] Standardized case JSON download failed:', err);
-      setStandardizedCaseDownloadState('Download failed');
-    }
-  }, [ctParamsResult]);
+    gantryTiltAutoRunTimerRef.current = window.setTimeout(() => {
+      void handleRunCtParamsSimulation({ gantryTiltDeg: ctParams.gantryTiltDeg });
+    }, 250);
+
+    return () => {
+      if (gantryTiltAutoRunTimerRef.current) {
+        clearTimeout(gantryTiltAutoRunTimerRef.current);
+        gantryTiltAutoRunTimerRef.current = null;
+      }
+    };
+  }, [ctParams.gantryTiltDeg, phantom]);
 
   // -----------------------------------------------------------------------
   // Handlers: lesion form
@@ -857,7 +851,7 @@ export default function SimulationPage() {
   /** Handle click on CT phantom canvas to pick lesion position */
   const handleCanvasClick = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!pickingMode || !phantom) return;
+      if (!pickingMode || !activeVolumeShape) return;
 
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -870,7 +864,7 @@ export default function SimulationPage() {
       const y = Math.round((e.clientY - rect.top) * scaleY);
 
       // Clamp to volume bounds
-      const { width, height, depth } = phantom.metadata;
+      const [depth, height, width] = activeVolumeShape;
       const clampedX = Math.max(0, Math.min(x, width - 1));
       const clampedY = Math.max(0, Math.min(y, height - 1));
       const clampedZ = Math.max(0, Math.min(sliceIndex, depth - 1));
@@ -893,7 +887,7 @@ export default function SimulationPage() {
       setPickingMode(false);
       setActiveTab('lesion');
     },
-    [pickingMode, phantom, sliceIndex, updateForm],
+    [activeVolumeShape, pickingMode, sliceIndex, updateForm],
   );
 
   /** Add a lesion from the current form values */
@@ -1145,16 +1139,8 @@ export default function SimulationPage() {
   // Render
   // -----------------------------------------------------------------------
 
-  const totalSlices = phantom ? phantom.metadata.depth : 0;
-  const ctParamsWarnings = ctParamsResult?.metadata.warnings ?? ctParamsResult?.paramsJson.warnings ?? [];
-  const huRangeBefore = ctParamsResult?.paramsJson.huRangeBefore;
-  const huRangeAfter = ctParamsResult?.paramsJson.huRangeAfter ?? ctParamsResult?.metadata.huRange;
-  const inputShape = ctParamsResult?.paramsJson.inputShape;
-  const outputShape = ctParamsResult?.paramsJson.outputShape ?? ctParamsResult?.metadata.shape;
-  const standardizedCase = ctParamsResult?.standardizedCase;
-
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex min-h-full flex-col">
       {/* ---- Header ---- */}
       <div className="flex-shrink-0 border-b border-border px-6 py-4">
         <h1 className="text-2xl font-bold text-foreground">
@@ -1563,91 +1549,110 @@ export default function SimulationPage() {
         /* ================================================================ */
         /*  CT Phantom View                                                  */
         /* ================================================================ */
-        <div className="flex flex-1 flex-col overflow-hidden">
-          {/* ---- Main area: Axial Viewer (left) + 3D Preview (right) ---- */}
-          <div className="flex flex-1 overflow-hidden">
-            {/* ---- Left: Axial Slice Viewer ---- */}
-            <div className="flex w-1/2 flex-col border-r border-border bg-black">
-              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
-                <div className="flex flex-col gap-0.5">
-                  <span className="text-xs font-medium text-white/70">
-                    Axial Slice Viewer
-                  </span>
-                  {phantom && (
-                    <span className="text-[10px] text-cyan-400/70">
-                      Scanning: Head/Chest → Abdomen/Pelvis
+        <div className="flex-1 overflow-y-auto p-6">
+          <div className="flex flex-col gap-4 pb-6">
+            {/* ---- Main area: Axial Viewer (left) + 3D Preview (right) ---- */}
+            <div className="grid gap-4 xl:grid-cols-2">
+              <div className="flex min-h-[520px] flex-col overflow-hidden rounded-lg border border-border bg-black">
+                <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
+                  <span className="text-xs font-medium text-white/70">CT Slice</span>
+                  {activeVolumeShape && (
+                    <span className="text-xs tabular-nums text-white/50">
+                      Slice {sliceIndex + 1} / {totalSlices}
+                      {pickedPosition && (
+                        <span className="ml-2 text-red-400/80">
+                          . Pick: ({pickedPosition.x}, {pickedPosition.y}, z={pickedPosition.z})
+                        </span>
+                      )}
+                      {pickingMode && (
+                        <span className="ml-2 animate-pulse text-amber-400">
+                          . Click canvas to set position
+                        </span>
+                      )}
                     </span>
                   )}
                 </div>
-                {phantom && (
-                  <span className="text-xs tabular-nums text-white/50">
-                    Slice {sliceIndex + 1} / {totalSlices}
-                    {pickedPosition && (
-                      <span className="ml-2 text-red-400/80">
-                        · Pick: ({pickedPosition.x}, {pickedPosition.y}, z={pickedPosition.z})
-                      </span>
-                    )}
-                    {pickingMode && (
-                      <span className="ml-2 text-amber-400 animate-pulse">
-                        · Click canvas to set position
-                      </span>
-                    )}
-                  </span>
-                )}
-              </div>
-              <div className="flex-1 flex items-center justify-center p-2">
-                {!phantom ? (
-                  <div className="flex flex-col items-center gap-3 text-center">
-                    <svg
-                      className="h-12 w-12 text-white/15"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth={1}
+                <div className="flex min-h-0 flex-1 items-center justify-center p-4">
+                  {!phantom ? (
+                    <div className="flex flex-col items-center gap-3 text-center">
+                      <svg
+                        className="h-12 w-12 text-white/15"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth={1}
+                      >
+                        <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                        <path d="M8 21h8" />
+                        <path d="M12 17v4" />
+                      </svg>
+                      <p className="text-sm text-white/40">
+                        {phantomSource === 'atlas'
+                          ? 'Click "Generate Atlas CT" to load the real CT phantom'
+                          : 'Click "Generate Synthetic CT" to load the phantom'}
+                      </p>
+                      {phantomLoading && (
+                        <div className="flex items-center gap-2 text-xs text-white/50">
+                          <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                          Generating phantom...
+                        </div>
+                      )}
+                      {phantomError && (
+                        <p className="text-xs text-red-400">{phantomError}</p>
+                      )}
+                    </div>
+                  ) : activeVolumeShape ? (
+                    <div
+                      className="flex max-h-full w-full items-center justify-center"
+                      style={{ aspectRatio: `${activeVolumeShape[2]} / ${activeVolumeShape[1]}` }}
                     >
-                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-                      <path d="M8 21h8" />
-                      <path d="M12 17v4" />
-                    </svg>
-                    <p className="text-sm text-white/40">
-                      {phantomSource === 'atlas'
-                        ? 'Click "Generate Atlas CT" to load the real CT phantom'
-                        : 'Click "Generate Synthetic CT" to load the phantom'}
-                    </p>
-                    {phantomLoading && (
-                      <div className="flex items-center gap-2 text-xs text-white/50">
-                        <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                        Generating phantom...
-                      </div>
-                    )}
-                    {phantomError && (
-                      <p className="text-xs text-red-400">{phantomError}</p>
-                    )}
-                  </div>
-                ) : (
-                  <canvas
-                    ref={canvasRef}
-                    onClick={handleCanvasClick}
-                    className={`max-h-full max-w-full border border-white/10 object-contain ${
-                      pickingMode ? 'cursor-crosshair' : 'cursor-default'
-                    }`}
-                    style={{ imageRendering: 'pixelated' }}
-                  />
-                )}
+                      <canvas
+                        ref={canvasRef}
+                        onClick={handleCanvasClick}
+                        className={`h-auto max-h-full w-full max-w-full border border-white/10 ${
+                          pickingMode ? 'cursor-crosshair' : 'cursor-default'
+                        }`}
+                        style={{ imageRendering: 'pixelated' }}
+                      />
+                    </div>
+                  ) : null}
+                </div>
               </div>
-            </div>
 
-            {/* ---- Right: 3D Volume Preview ---- */}
-            <div className="flex w-1/2 flex-col bg-black">
-              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
-                <div className="flex flex-col gap-0.5">
-                  <span className="text-xs font-medium text-white/70">
-                    3D Volume Preview
-                  </span>
-                  {phantom && (
-                    <span className="text-[10px] text-cyan-400/70">
-                      Progressive Scan · Head → Feet
-                    </span>
+              <div className="flex min-h-[520px] flex-col overflow-hidden rounded-lg border border-border bg-black">
+                <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
+                  <span className="text-xs font-medium text-white/70">3D Accumulated Volume</span>
+                  {ctParamsLoading && (
+                    <span className="text-[10px] text-cyan-400/80">Running CT parameter simulation...</span>
+                  )}
+                </div>
+                <div className="min-h-0 flex-1">
+                  {vtkVolumeData && vtkDims ? (
+                    <VolumeRenderer
+                      mode="synthetic"
+                      showControls
+                      opacityPreset={
+                        activePreset.label === 'Soft'
+                          ? 'ct-soft-tissue'
+                          : activePreset.label === 'Lung'
+                            ? 'ct-lung'
+                            : 'ct-bone'
+                      }
+                      syntheticData={vtkVolumeData}
+                      syntheticDims={vtkDims}
+                      syntheticSpacing={vtkSpacing ?? undefined}
+                      syntheticClipIndex={sliceIndex}
+                      syntheticClipDirection="low_to_high"
+                      syntheticScanAxis="z"
+                      scanView
+                      scanDirection="head_to_feet"
+                    />
+                  ) : (
+                    <div className="flex h-full items-center justify-center px-6 text-center">
+                      <p className="text-sm text-white/30">
+                        Generate a phantom, then run CT Parameter Simulation to build the accumulated 3D preview from the same slice stack.
+                      </p>
+                    </div>
                   )}
                 </div>
               </div>
@@ -1707,58 +1712,31 @@ export default function SimulationPage() {
               </div>
             </div>
 
-            <div className="flex min-h-[280px] flex-col rounded border border-white/10 bg-black">
-              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
-                <span className="text-xs font-medium text-white/70">Simulated CT Slice</span>
-                {ctParamsLoading && (
-                  <span className="text-[10px] text-cyan-400/80">Running CT parameter simulation...</span>
-                )}
-              </div>
-              <div className="flex flex-1 items-center justify-center p-2">
-                {ctParamsResult && simulatedVolumeData ? (
-                  <canvas
-                    ref={simulatedCompareCanvasRef}
-                    className="max-h-full max-w-full border border-white/10 object-contain"
-                    style={{ imageRendering: 'pixelated' }}
-                  />
-                ) : (
-                  <div className="px-6 text-center text-sm text-white/35">
-                    {ctParamsError && !ctParamsResult
-                      ? ctParamsError
-                      : 'Run CT Parameter Simulation to preview simulated CT.'}
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* ---- Bottom: Controls bar ---- */}
-          <div className="flex-shrink-0 border-t border-border bg-card px-4 py-3">
-            <div className="flex items-center gap-4 flex-wrap">
-              {/* Source selector */}
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground">Source:</span>
-                <select
-                  value={phantomSource}
-                  onChange={(e) => {
-                    const src = e.target.value as 'procedural' | 'atlas';
-                    setPhantomSource(src);
-                    setPhantom(null);
-                    setPhantomError(null);
-                    setCtParamsResult(null);
-                    setCtParamsError(null);
-                    setCtParamsCopyState(null);
-                    setCtParamsDownloadState(null);
-                    // Reset size to sensible default for each mode
-                    setPhantomSize(src === 'atlas' ? 192 : 128);
-                  }}
-                  disabled={phantomLoading}
-                  className="rounded border border-border bg-background px-2 py-1 text-xs"
-                >
-                  <option value="atlas">Real CT Atlas</option>
-                  <option value="procedural">Procedural Phantom</option>
-                </select>
-              </div>
+            {/* ---- Compact toolbar ---- */}
+            <div className="rounded-lg border border-border bg-card px-4 py-3">
+              <div className="flex flex-wrap items-center gap-4">
+                {/* Source selector */}
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">Source:</span>
+                  <select
+                    value={phantomSource}
+                    onChange={(e) => {
+                      const src = e.target.value as 'procedural' | 'atlas';
+                      setPhantomSource(src);
+                      setPhantom(null);
+                      setPhantomError(null);
+                      setCtParamsResult(null);
+                      setCtParamsError(null);
+                      // Reset size to sensible default for each mode
+                      setPhantomSize(src === 'atlas' ? 192 : 128);
+                    }}
+                    disabled={phantomLoading}
+                    className="rounded border border-border bg-background px-2 py-1 text-xs"
+                  >
+                    <option value="atlas">Real CT Atlas</option>
+                    <option value="procedural">Procedural Phantom</option>
+                  </select>
+                </div>
 
               {/* Size selector */}
               <div className="flex items-center gap-2">
@@ -1769,8 +1747,6 @@ export default function SimulationPage() {
                     setPhantomSize(Number(e.target.value));
                     setCtParamsResult(null);
                     setCtParamsError(null);
-                    setCtParamsCopyState(null);
-                    setCtParamsDownloadState(null);
                   }}
                   disabled={phantomLoading}
                   className="rounded border border-border bg-background px-2 py-1 text-xs"
@@ -1806,15 +1782,15 @@ export default function SimulationPage() {
                 onClick={handlePlayPause}
                 disabled={!phantom}
               >
-                {playing ? '⏸ Pause' : '▶ Play'}
+                {playing ? 'Pause' : 'Play'}
               </Button>
 
               {/* Slice slider */}
-              <div className="flex items-center gap-2 min-w-[200px]">
+              <div className="flex min-w-[240px] flex-1 items-center gap-2">
                 <span className="text-xs text-muted-foreground w-16 tabular-nums">
                   {phantom
                     ? `${sliceIndex + 1} / ${totalSlices}`
-                    : '— / —'}
+                    : '-- / --'}
                 </span>
                 <input
                   type="range"
@@ -1910,61 +1886,80 @@ export default function SimulationPage() {
                   </span>
                 </>
               )}
-
-              {/* Scan direction indicator */}
-              {phantom && phantom.metadata.scanDirection && (
-                <>
-                  <div className="h-5 w-px bg-border" />
-                  <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                    <span className="text-[10px]">
-                      {phantom.metadata.scanDirection === 'head_to_feet'
-                        ? '🔽 Head → Feet'
-                        : '🔼 Feet → Head'}
-                    </span>
-                    {phantom.metadata.flippedZ && (
-                      <span
-                        className="rounded bg-amber-500/20 px-1 text-[9px] text-amber-400"
-                        title="Volume was flipped along z to match requested scan direction"
-                      >
-                        flipped
-                      </span>
-                    )}
-                  </span>
-                </>
-              )}
-
-              {/* Shape info */}
-              {phantom && phantom.metadata.outputShape && (
-                <>
-                  <div className="h-5 w-px bg-border" />
-                  <span className="text-[10px] text-muted-foreground/60">
-                    shape{' '}
-                    {phantom.metadata.outputShape.join('×')}
-                  </span>
-                </>
-              )}
+              </div>
             </div>
 
-            <div className="mt-3 grid gap-3 border-t border-border/60 pt-3 xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
-              <div className="rounded border border-border bg-background/60 p-3">
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <div>
-                    <h3 className="text-sm font-medium">CT Scan Params Simulation</h3>
-                    <p className="text-xs text-muted-foreground">
-                      CT parameter simulation supports Real CT Atlas and Procedural Phantom.
-                    </p>
-                  </div>
-                  <Button
-                    variant="default"
-                    size="sm"
-                    onClick={handleRunCtParamsSimulation}
-                    disabled={ctParamsLoading}
-                  >
-                    {ctParamsLoading ? 'Running...' : 'Run CT Parameter Simulation'}
-                  </Button>
-                </div>
+            <div className="rounded-lg border border-border bg-card">
+              <div className="flex items-center justify-between gap-3 px-4 py-3">
+                <h3 className="text-sm font-medium">CT Scan Params Simulation</h3>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setIsCtParamsPanelOpen((prev) => !prev)}
+                >
+                  {isCtParamsPanelOpen ? 'Collapse' : 'Expand'}
+                </Button>
+              </div>
 
-                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {isCtParamsPanelOpen && (
+                <div className="border-t border-border/60 px-4 py-4">
+                  <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+                    <p className="max-w-3xl text-xs text-muted-foreground">
+                      CT parameter simulation supports Real CT Atlas and Procedural Phantom. Gantry tilt changes trigger an automatic preview refresh and reset the current slice to the first layer.
+                    </p>
+                    <Button
+                      variant="default"
+                      size="sm"
+                      onClick={() => {
+                        void handleRunCtParamsSimulation();
+                      }}
+                      disabled={ctParamsLoading}
+                    >
+                      {ctParamsLoading ? 'Running...' : 'Run CT Parameter Simulation'}
+                    </Button>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                    <label className="flex flex-col gap-1 text-xs text-muted-foreground md:col-span-2 xl:col-span-3">
+                    Gantry Tilt (deg)
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="range"
+                        min={-30}
+                        max={30}
+                        step={1}
+                        value={ctParams.gantryTiltDeg}
+                        onChange={(e) =>
+                          setCtParams((prev) => ({
+                            ...prev,
+                            gantryTiltDeg: Number(e.target.value),
+                          }))
+                        }
+                        className="flex-1 cursor-pointer accent-primary"
+                      />
+                      <input
+                        type="number"
+                        min={-30}
+                        max={30}
+                        step={1}
+                        value={ctParams.gantryTiltDeg}
+                        onChange={(e) =>
+                          setCtParams((prev) => ({
+                            ...prev,
+                            gantryTiltDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
+                          }))
+                        }
+                        className="w-20 rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                      />
+                      <span className="w-8 text-right text-xs text-muted-foreground">
+                        {ctParams.gantryTiltDeg}°
+                      </span>
+                    </div>
+                    <span className="text-[11px] text-muted-foreground/80">
+                      Range: -30° to 30°. Rotation is applied around the patient left-right axis.
+                    </span>
+                  </label>
+
                   <label className="flex flex-col gap-1 text-xs text-muted-foreground">
                     Slice Thickness (mm)
                     <select
@@ -2141,123 +2136,11 @@ export default function SimulationPage() {
                   </label>
                 </div>
 
-                {ctParamsError && (
-                  <p className="mt-3 text-xs text-red-500">{ctParamsError}</p>
-                )}
-              </div>
-
-              <div className="rounded border border-border bg-background/60 p-3">
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <div>
-                    <h3 className="text-sm font-medium">Simulation Result</h3>
-                    <p className="text-xs text-muted-foreground">
-                      Preview metadata and the exact parameter payload returned by the backend.
-                    </p>
-                  </div>
-                  {ctParamsResult && (
-                    <div className="flex items-center gap-2">
-                      <Button variant="outline" size="sm" onClick={handleCopyCtParamsJson}>
-                        {ctParamsCopyState || 'Copy Params JSON'}
-                      </Button>
-                      <Button variant="outline" size="sm" onClick={handleDownloadCtParamsJson}>
-                        {ctParamsDownloadState || 'Download Params JSON'}
-                      </Button>
-                    </div>
+                  {ctParamsError && (
+                    <p className="mt-3 text-xs text-red-500">{ctParamsError}</p>
                   )}
                 </div>
-
-                {ctParamsResult ? (
-                  <div className="space-y-3 text-sm">
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      <div className="rounded border border-border/70 bg-card px-3 py-2">
-                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">HU Range</div>
-                        <div className="mt-1 text-xs text-foreground">
-                          Before: {huRangeBefore ? `${huRangeBefore[0].toFixed(1)} to ${huRangeBefore[1].toFixed(1)}` : '—'}
-                        </div>
-                        <div className="text-xs text-foreground">
-                          After: {huRangeAfter ? `${huRangeAfter[0].toFixed(1)} to ${huRangeAfter[1].toFixed(1)}` : '—'}
-                        </div>
-                      </div>
-
-                      <div className="rounded border border-border/70 bg-card px-3 py-2">
-                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Shape</div>
-                        <div className="mt-1 text-xs text-foreground">
-                          Input: {inputShape ? inputShape.join(' × ') : '—'}
-                        </div>
-                        <div className="text-xs text-foreground">
-                          Output: {outputShape ? outputShape.join(' × ') : '—'}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      <div className="rounded border border-border/70 bg-card px-3 py-2">
-                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
-                          Effective Slice Thickness
-                        </div>
-                        <div className="mt-1 text-xs text-foreground">
-                          {ctParamsResult.metadata.effectiveSliceThicknessMm.toFixed(3)} mm
-                        </div>
-                      </div>
-
-                      <div className="rounded border border-border/70 bg-card px-3 py-2">
-                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Warnings</div>
-                        <div className="mt-1 text-xs text-foreground">
-                          {ctParamsWarnings.length > 0 ? ctParamsWarnings.join(' | ') : 'None'}
-                        </div>
-                      </div>
-                    </div>
-
-                    {standardizedCase && (
-                      <div className="rounded border border-border/70 bg-card px-3 py-2">
-                        <div className="mb-2 flex items-center justify-between gap-3">
-                          <div>
-                            <div className="text-xs font-medium text-foreground">
-                              Standardized Output for Downstream Modules
-                            </div>
-                            <div className="text-[11px] text-muted-foreground">
-                              Lightweight standardized case metadata for downstream artifact or lesion modules.
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <Button variant="outline" size="sm" onClick={handleCopyStandardizedCaseJson}>
-                              {standardizedCaseCopyState || 'Copy Standardized Case JSON'}
-                            </Button>
-                            <Button variant="outline" size="sm" onClick={handleDownloadStandardizedCaseJson}>
-                              {standardizedCaseDownloadState || 'Download Standardized Case JSON'}
-                            </Button>
-                          </div>
-                        </div>
-
-                        <div className="grid gap-2 text-xs text-foreground sm:grid-cols-2 xl:grid-cols-3">
-                          <div><span className="text-muted-foreground">case_id:</span> {standardizedCase.caseId}</div>
-                          <div><span className="text-muted-foreground">source:</span> {standardizedCase.source}</div>
-                          <div><span className="text-muted-foreground">shape:</span> {standardizedCase.volume.shape.join(' x ')}</div>
-                          <div><span className="text-muted-foreground">spacing:</span> {standardizedCase.volume.spacing.join(', ')}</div>
-                          <div><span className="text-muted-foreground">hu_range:</span> {standardizedCase.volume.huRange[0].toFixed(1)} to {standardizedCase.volume.huRange[1].toFixed(1)}</div>
-                          <div><span className="text-muted-foreground">slice_count:</span> {standardizedCase.volume.sliceCount}</div>
-                          <div><span className="text-muted-foreground">dtype:</span> {standardizedCase.volume.dtype}</div>
-                          <div><span className="text-muted-foreground">axis_order:</span> {standardizedCase.volume.axisOrder}</div>
-                          <div><span className="text-muted-foreground">image_data_field:</span> {standardizedCase.volume.imageDataField}</div>
-                        </div>
-                      </div>
-                    )}
-
-                    <details className="rounded border border-border/70 bg-card px-3 py-2">
-                      <summary className="cursor-pointer text-xs font-medium text-foreground">
-                        Params JSON
-                      </summary>
-                      <pre className="mt-2 overflow-auto whitespace-pre-wrap break-all text-[11px] text-muted-foreground">
-                        {JSON.stringify(ctParamsResult.paramsJson, null, 2)}
-                      </pre>
-                    </details>
-                  </div>
-                ) : (
-                  <p className="text-sm text-muted-foreground">
-                    Run CT Parameter Simulation to populate preview metadata and params JSON.
-                  </p>
-                )}
-              </div>
+              )}
             </div>
 
             {/* ---- Label legend (compact, shown when labels available) ---- */}

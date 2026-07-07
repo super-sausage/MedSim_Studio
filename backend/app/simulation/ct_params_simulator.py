@@ -10,10 +10,11 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, gaussian_filter1d, laplace, zoom
+from scipy.ndimage import affine_transform, gaussian_filter, gaussian_filter1d, laplace, zoom
 
 
 Spacing3D = Tuple[float, float, float]
+AIR_HU = -1000.0
 
 DEFAULT_MAS_BY_DOSE_LEVEL: Dict[str, int] = {
     "low": 50,
@@ -42,6 +43,7 @@ def _resolve_params(params: Dict[str, Any]) -> Dict[str, Any]:
     dose_level = params["dose_level"]
     resolved_mas = int(params.get("mAs") or DEFAULT_MAS_BY_DOSE_LEVEL[dose_level])
     return {
+        "gantry_tilt_deg": float(params.get("gantry_tilt_deg", 0.0)),
         "slice_thickness_mm": float(params["slice_thickness_mm"]),
         "dose_level": dose_level,
         "mAs": resolved_mas,
@@ -52,6 +54,129 @@ def _resolve_params(params: Dict[str, Any]) -> Dict[str, Any]:
         "matrix_size": int(params["matrix_size"]),
         "kernel": params["kernel"],
         "contrast_phase": params["contrast_phase"],
+    }
+
+
+def _estimate_tilt_output_shape(
+    shape: tuple[int, int, int],
+    spacing: Spacing3D,
+    angle_rad: float,
+) -> tuple[int, int, int]:
+    if abs(angle_rad) < 1e-8:
+        return shape
+
+    nz, ny, nx = shape
+    sz, sy, sx = spacing
+    cz = (nz - 1) * 0.5
+    cy = (ny - 1) * 0.5
+    cx = (nx - 1) * 0.5
+
+    corners_idx = np.array(
+        [
+            [z, y, x]
+            for z in (0.0, float(nz - 1))
+            for y in (0.0, float(ny - 1))
+            for x in (0.0, float(nx - 1))
+        ],
+        dtype=np.float64,
+    )
+    centered_phys = (corners_idx - np.array([cz, cy, cx], dtype=np.float64)) * np.array(
+        [sz, sy, sx],
+        dtype=np.float64,
+    )
+
+    cos_a = float(np.cos(angle_rad))
+    sin_a = float(np.sin(angle_rad))
+    rotation = np.array(
+        [
+            [cos_a, -sin_a, 0.0],
+            [sin_a, cos_a, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    rotated = centered_phys @ rotation.T
+    extent_mm = rotated.max(axis=0) - rotated.min(axis=0)
+
+    out_ny = max(int(np.ceil(extent_mm[1] / sy)) + 1, ny)
+    return nz, out_ny, nx
+
+
+def _apply_gantry_tilt(
+    volume: np.ndarray,
+    spacing: Spacing3D,
+    gantry_tilt_deg: float,
+    *,
+    label_volume: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+    if abs(gantry_tilt_deg) < 1e-6:
+        return volume, label_volume, {
+            "gantry_tilt_deg": 0.0,
+            "rotation_axis": "x_left_to_right",
+            "interpolation_order_ct": 1,
+            "interpolation_order_label": 0,
+            "input_shape": [int(v) for v in volume.shape],
+            "output_shape": [int(v) for v in volume.shape],
+            "output_shape_changed": False,
+        }
+
+    angle_rad = float(np.deg2rad(gantry_tilt_deg))
+    input_shape = tuple(int(v) for v in volume.shape)
+    output_shape = _estimate_tilt_output_shape(input_shape, spacing, angle_rad)
+
+    cos_a = float(np.cos(angle_rad))
+    sin_a = float(np.sin(angle_rad))
+    rotation = np.array(
+        [
+            [cos_a, -sin_a, 0.0],
+            [sin_a, cos_a, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    input_center_idx = (np.array(input_shape, dtype=np.float64) - 1.0) * 0.5
+    output_center_idx = (np.array(output_shape, dtype=np.float64) - 1.0) * 0.5
+    spacing_arr = np.array(spacing, dtype=np.float64)
+    spacing_matrix = np.diag(spacing_arr)
+    inv_spacing_matrix = np.diag(1.0 / spacing_arr)
+
+    # Map output voxel indices back to input voxel indices in spacing-aware coordinates.
+    transform_matrix = inv_spacing_matrix @ rotation.T @ spacing_matrix
+    offset = input_center_idx - transform_matrix @ output_center_idx
+
+    rotated_volume = affine_transform(
+        volume.astype(np.float32, copy=False),
+        matrix=transform_matrix,
+        offset=offset,
+        output_shape=output_shape,
+        order=1,
+        mode="constant",
+        cval=AIR_HU,
+        prefilter=True,
+    ).astype(np.float32, copy=False)
+
+    rotated_labels: Optional[np.ndarray] = None
+    if label_volume is not None:
+        rotated_labels = affine_transform(
+            label_volume.astype(np.float32, copy=False),
+            matrix=transform_matrix,
+            offset=offset,
+            output_shape=output_shape,
+            order=0,
+            mode="constant",
+            cval=0.0,
+            prefilter=False,
+        ).astype(np.uint8, copy=False)
+
+    return rotated_volume, rotated_labels, {
+        "gantry_tilt_deg": float(gantry_tilt_deg),
+        "rotation_axis": "x_left_to_right",
+        "interpolation_order_ct": 1,
+        "interpolation_order_label": 0,
+        "input_shape": [int(v) for v in input_shape],
+        "output_shape": [int(v) for v in output_shape],
+        "output_shape_changed": list(input_shape) != list(output_shape),
     }
 
 
@@ -166,6 +291,7 @@ def _apply_fov_effect(
     spacing: Spacing3D,
     fov_mm: float,
     warnings: list[str],
+    label_volume: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, Spacing3D, Dict[str, Any]]:
     ny, nx = volume.shape[1], volume.shape[2]
     current_fov_y = float(spacing[1] * ny)
@@ -173,7 +299,7 @@ def _apply_fov_effect(
     reference_fov = max(current_fov_y, current_fov_x)
 
     if abs(fov_mm - reference_fov) < 1.0:
-        return volume, spacing, {
+        return volume, label_volume, spacing, {
             "mode": "identity",
             "reference_fov_mm": float(reference_fov),
         }
@@ -193,12 +319,17 @@ def _apply_fov_effect(
         result = _crop_or_pad_to_shape(scaled, (ny, nx))
         mode = "pad_and_resize"
 
+    label_result = label_volume
+    if label_volume is not None:
+        scaled_labels = _resize_xy(label_volume.astype(np.float32, copy=False), zoom_factor, order=0)
+        label_result = _crop_or_pad_to_shape(scaled_labels, (ny, nx)).astype(np.uint8, copy=False)
+
     new_spacing = (
         float(spacing[0]),
         float(fov_mm / ny),
         float(fov_mm / nx),
     )
-    return result.astype(np.float32, copy=False), new_spacing, {
+    return result.astype(np.float32, copy=False), label_result, new_spacing, {
         "mode": mode,
         "reference_fov_mm": float(reference_fov),
         "applied_zoom_factor": float(zoom_factor),
@@ -329,6 +460,7 @@ def simulate_ct_scan_params(
         )
 
     working = volume.astype(np.float32, copy=True)
+    working_labels = label_volume.astype(np.uint8, copy=True) if label_volume is not None else None
     input_spacing = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
     warnings: list[str] = []
     resolved_params = _resolve_params(params)
@@ -345,6 +477,14 @@ def simulate_ct_scan_params(
     hu_before = [float(np.min(working)), float(np.max(working))]
     preview_before = _center_slice_stats(working)
 
+    working, working_labels, step_meta = _apply_gantry_tilt(
+        working,
+        input_spacing,
+        resolved_params["gantry_tilt_deg"],
+        label_volume=working_labels,
+    )
+    algorithm_steps.append({"name": "gantry_tilt_resampling", **step_meta})
+
     working, step_meta = _apply_slice_thickness(working, input_spacing, resolved_params["slice_thickness_mm"])
     algorithm_steps.append({"name": "slice_thickness", **step_meta})
 
@@ -357,7 +497,13 @@ def simulate_ct_scan_params(
     working, step_meta = _apply_pitch_effect(working, resolved_params["pitch"])
     algorithm_steps.append({"name": "pitch_degradation", **step_meta})
 
-    working, output_spacing, step_meta = _apply_fov_effect(working, input_spacing, resolved_params["fov_mm"], warnings)
+    working, working_labels, output_spacing, step_meta = _apply_fov_effect(
+        working,
+        input_spacing,
+        resolved_params["fov_mm"],
+        warnings,
+        label_volume=working_labels,
+    )
     algorithm_steps.append({"name": "fov_adjustment", **step_meta})
 
     working, step_meta = _apply_matrix_effect(working, resolved_params["matrix_size"])
@@ -366,7 +512,7 @@ def simulate_ct_scan_params(
     working, step_meta = _apply_kernel_effect(working, resolved_params["kernel"])
     algorithm_steps.append({"name": "reconstruction_kernel", **step_meta})
 
-    working, step_meta = _apply_contrast_phase(working, resolved_params["contrast_phase"], label_volume)
+    working, step_meta = _apply_contrast_phase(working, resolved_params["contrast_phase"], working_labels)
     algorithm_steps.append({"name": "contrast_phase", **step_meta})
 
     working = _clipped_float32(working)
@@ -376,6 +522,7 @@ def simulate_ct_scan_params(
 
     approximation_notes = [
         "Image-domain approximation only; not a physics-based CT forward model.",
+        "Gantry tilt changes the actual slice plane via spacing-aware 3D affine resampling around the patient left-right axis.",
         "Dose and mAs use Gaussian noise scaling rather than quantum noise reconstruction.",
         "kVp effect uses HU contrast remapping, not spectrum-dependent attenuation.",
         "Pitch, slice thickness, FOV, and matrix effects are approximated with resampling and smoothing.",
@@ -394,6 +541,7 @@ def simulate_ct_scan_params(
         "shape": [int(v) for v in working.shape],
         "spacing": [float(v) for v in output_spacing],
         "hu_range": hu_after,
+        "gantry_tilt_deg": float(resolved_params["gantry_tilt_deg"]),
         "effective_slice_thickness_mm": float(resolved_params["slice_thickness_mm"]),
         "algorithm_notes": approximation_notes,
         "warnings": warnings,
