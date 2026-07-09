@@ -369,7 +369,6 @@ export default function SimulationPage() {
   const [phantom, setPhantom] = useState<PhantomResponse | null>(null);
   const [phantomLoading, setPhantomLoading] = useState(false);
   const [phantomError, setPhantomError] = useState<string | null>(null);
-  const [phantomSource, setPhantomSource] = useState<'procedural' | 'atlas'>('procedural');
   const [phantomSize, setPhantomSize] = useState(192);
   const [loadedPhantomSize, setLoadedPhantomSize] = useState<number | null>(null);
   const [sliceIndex, setSliceIndex] = useState(0);
@@ -399,8 +398,6 @@ export default function SimulationPage() {
 
   // ---- Refs ----
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const originalCompareCanvasRef = useRef<HTMLCanvasElement>(null);
-  const simulatedCompareCanvasRef = useRef<HTMLCanvasElement>(null);
   const playTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const gantryTiltAutoRunTimerRef = useRef<number | null>(null);
   const hasMountedGantryTiltRef = useRef(false);
@@ -581,6 +578,10 @@ export default function SimulationPage() {
   const activeSliceData = ctParamsResult ? simulatedVolumeData : decodedPhantomData;
   const activeLabelData = ctParamsResult ? null : decodedLabelData;
   const totalSlices = activeVolumeShape?.[0] ?? 0;
+  const activeVolumeSourceLabel = ctParamsResult ? 'Simulated CT' : 'Atlas CT';
+  const activeSpacingLabel = activeVolumeSpacing
+    ? activeVolumeSpacing.map((value) => value.toFixed(2)).join(' / ')
+    : null;
 
   useEffect(() => {
     if (!activeVolumeShape) return;
@@ -650,45 +651,6 @@ export default function SimulationPage() {
   useEffect(() => {
     renderSlice();
   }, [renderSlice]);
-
-  useEffect(() => {
-    const canvas = originalCompareCanvasRef.current;
-    if (!canvas || !phantom || !decodedPhantomData) return;
-
-    const { width, height, depth } = phantom.metadata;
-    renderVolumeSliceToCanvas({
-      canvas,
-      width,
-      height,
-      depth,
-      volumeData: decodedPhantomData,
-      sliceIndex: Math.min(sliceIndex, depth - 1),
-      windowLevel: activePreset.windowLevel,
-      windowWidth: activePreset.windowWidth,
-    });
-  }, [activePreset, decodedPhantomData, phantom, sliceIndex]);
-
-  useEffect(() => {
-    const canvas = simulatedCompareCanvasRef.current;
-    if (!canvas || !phantom || !simulatedVolumeData) return;
-
-    const shape =
-      ctParamsResult?.metadata.shape && ctParamsResult.metadata.shape.length >= 3
-        ? ctParamsResult.metadata.shape
-        : [phantom.metadata.depth, phantom.metadata.height, phantom.metadata.width];
-    const [depth, height, width] = shape;
-
-    renderVolumeSliceToCanvas({
-      canvas,
-      width,
-      height,
-      depth,
-      volumeData: simulatedVolumeData,
-      sliceIndex: Math.min(sliceIndex, depth - 1),
-      windowLevel: activePreset.windowLevel,
-      windowWidth: activePreset.windowWidth,
-    });
-  }, [activePreset, ctParamsResult?.metadata.shape, phantom, simulatedVolumeData, sliceIndex]);
 
   // ---- Playback effect ----
   useEffect(() => {
@@ -774,9 +736,9 @@ export default function SimulationPage() {
     setSliceIndex(0);
     setPlaying(false);
     try {
-      const size = phantomSource === 'atlas' ? phantomSize : 128;
+      const size = phantomSize;
       const response = await simulationService.getPhantom(
-        phantomSource,
+        'atlas',
         size,
         's0001',
         'head_to_feet',
@@ -830,7 +792,7 @@ export default function SimulationPage() {
       return;
     }
 
-    const currentSource = phantom.metadata.source ?? phantomSource;
+    const currentSource = phantom.metadata.source ?? 'atlas';
     if (currentSource !== 'atlas' && currentSource !== 'procedural') {
       setCtParamsError(`Unsupported source for CT parameter simulation: ${String(currentSource)}`);
       return;
@@ -1658,217 +1620,186 @@ export default function SimulationPage() {
         /* ================================================================ */
         <div className="flex-1 overflow-y-auto p-6">
           <div className="flex flex-col gap-4 pb-6">
-            {/* ---- Main area: Axial Viewer (left) + 3D Preview (right) ---- */}
-            <div className="grid gap-4 xl:grid-cols-2">
-              <div className="flex min-h-[520px] flex-col overflow-hidden rounded-lg border border-border bg-black">
-                <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
-                  <span className="text-xs font-medium text-white/70">CT Slice</span>
+            <div className="rounded-[28px] border border-border/70 bg-gradient-to-br from-slate-950 via-slate-900 to-zinc-950 p-4 shadow-[0_24px_80px_rgba(0,0,0,0.28)]">
+              <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-medium uppercase tracking-[0.24em] text-cyan-300/70">
+                    CT Simulation Workspace
+                  </div>
+                  <h3 className="mt-1 text-lg font-semibold text-white">Clean axial browsing with one synchronized 3D view</h3>
+                  <p className="mt-1 text-sm text-slate-300/70">
+                    Slice view and accumulated volume stay on the same active stack without duplicate comparison panels.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] text-slate-200/80">
+                    {activeVolumeSourceLabel}
+                  </span>
                   {activeVolumeShape && (
-                    <span className="text-xs tabular-nums text-white/50">
-                      Slice {sliceIndex + 1} / {totalSlices}
-                      {pickedPosition && (
-                        <span className="ml-2 text-red-400/80">
-                          . Pick: ({pickedPosition.x}, {pickedPosition.y}, z={pickedPosition.z})
-                        </span>
-                      )}
-                      {pickingMode && (
-                        <span className="ml-2 animate-pulse text-amber-400">
-                          . Click canvas to set position
-                        </span>
-                      )}
+                    <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] text-slate-200/80">
+                      {activeVolumeShape[2]} x {activeVolumeShape[1]} x {activeVolumeShape[0]}
+                    </span>
+                  )}
+                  {activeSpacingLabel && (
+                    <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-[11px] text-cyan-100/80">
+                      spacing {activeSpacingLabel} mm
                     </span>
                   )}
                 </div>
-                <div className="flex min-h-0 flex-1 items-center justify-center p-4">
-                  {!phantom ? (
-                    <div className="flex flex-col items-center gap-3 text-center">
-                      <svg
-                        className="h-12 w-12 text-white/15"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth={1}
+              </div>
+
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1.18fr)_minmax(360px,0.82fr)]">
+                <div className="flex min-h-[620px] flex-col overflow-hidden rounded-2xl border border-white/10 bg-black/70 backdrop-blur">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 px-4 py-3">
+                    <div>
+                      <div className="text-xs font-semibold uppercase tracking-[0.18em] text-white/55">
+                        Axial Slice
+                      </div>
+                      <div className="mt-1 text-sm text-white/85">
+                        {activeVolumeShape ? `Slice ${sliceIndex + 1} / ${totalSlices}` : 'Ready for atlas load'}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                      {pickedPosition && (
+                        <span className="rounded-full border border-red-400/20 bg-red-400/10 px-2.5 py-1 text-red-200/80">
+                          Pick ({pickedPosition.x}, {pickedPosition.y}, z={pickedPosition.z})
+                        </span>
+                      )}
+                      {pickingMode && (
+                        <span className="rounded-full border border-amber-400/20 bg-amber-400/10 px-2.5 py-1 text-amber-200">
+                          Click canvas to set position
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex min-h-0 flex-1 items-center justify-center p-5">
+                    {!phantom ? (
+                      <div className="flex max-w-sm flex-col items-center gap-3 text-center">
+                        <svg
+                          className="h-12 w-12 text-white/15"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth={1}
+                        >
+                          <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                          <path d="M8 21h8" />
+                          <path d="M12 17v4" />
+                        </svg>
+                        <p className="text-sm text-white/40">
+                          Click "Generate Atlas CT" to load the real CT phantom.
+                        </p>
+                        {phantomLoading && (
+                          <div className="flex items-center gap-2 text-xs text-white/50">
+                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                            Generating phantom...
+                          </div>
+                        )}
+                        {phantomError && (
+                          <p className="text-xs text-red-400">{phantomError}</p>
+                        )}
+                      </div>
+                    ) : activeVolumeShape ? (
+                      <div
+                        className="flex max-h-full w-full items-center justify-center rounded-xl border border-white/8 bg-neutral-950/80 p-3"
+                        style={{ aspectRatio: `${activeVolumeShape[2]} / ${activeVolumeShape[1]}` }}
                       >
-                        <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-                        <path d="M8 21h8" />
-                        <path d="M12 17v4" />
-                      </svg>
-                      <p className="text-sm text-white/40">
-                        {phantomSource === 'atlas'
-                          ? 'Click "Generate Atlas CT" to load the real CT phantom'
-                          : 'Click "Generate Synthetic CT" to load the phantom'}
-                      </p>
-                      {phantomLoading && (
-                        <div className="flex items-center gap-2 text-xs text-white/50">
-                          <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                          Generating phantom...
+                        <canvas
+                          ref={canvasRef}
+                          onClick={handleCanvasClick}
+                          className={`h-auto max-h-full w-full max-w-full rounded-lg border border-white/10 ${
+                            pickingMode ? 'cursor-crosshair' : 'cursor-default'
+                          }`}
+                          style={{ imageRendering: 'pixelated' }}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div className="grid min-h-[620px] gap-4 grid-rows-[minmax(0,1fr)_auto]">
+                  <div className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-black/80">
+                    <div className="flex items-center justify-between gap-2 border-b border-white/10 px-4 py-3">
+                      <div>
+                        <div className="text-xs font-semibold uppercase tracking-[0.18em] text-white/55">
+                          3D Accumulation
+                        </div>
+                        <div className="mt-1 text-sm text-white/85">
+                          Progressive body build-up synced to the current slice
+                        </div>
+                      </div>
+                      {ctParamsLoading && (
+                        <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2.5 py-1 text-[11px] text-cyan-200/85">
+                          Running simulation...
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="min-h-0 flex-1">
+                      {vtkVolumeData && vtkDims ? (
+                        <VolumeRenderer
+                          mode="synthetic"
+                          showControls
+                          scanView
+                          scanDirection="head_to_feet"
+                          opacityPreset={
+                            activePreset.label === 'Soft'
+                              ? 'ct-soft-tissue'
+                              : activePreset.label === 'Lung'
+                                ? 'ct-lung'
+                                : 'ct-bone'
+                          }
+                          syntheticData={vtkVolumeData}
+                          syntheticDims={vtkDims}
+                          syntheticSpacing={vtkSpacing ?? undefined}
+                          syntheticClipIndex={sliceIndex}
+                          syntheticClipDirection="low_to_high"
+                          syntheticScanAxis="z"
+                          segmentationMask={lesionOverlay?.mask ?? null}
+                          segmentationLabels={lesionOverlay?.labels ?? null}
+                        />
+                      ) : (
+                        <div className="flex h-full items-center justify-center px-6 text-center">
+                          <p className="max-w-xs text-sm text-white/30">
+                            Generate a phantom to view the synchronized 3D accumulation.
+                          </p>
                         </div>
                       )}
-                      {phantomError && (
-                        <p className="text-xs text-red-400">{phantomError}</p>
-                      )}
                     </div>
-                  ) : activeVolumeShape ? (
-                    <div
-                      className="flex max-h-full w-full items-center justify-center"
-                      style={{ aspectRatio: `${activeVolumeShape[2]} / ${activeVolumeShape[1]}` }}
-                    >
-                      <canvas
-                        ref={canvasRef}
-                        onClick={handleCanvasClick}
-                        className={`h-auto max-h-full w-full max-w-full border border-white/10 ${
-                          pickingMode ? 'cursor-crosshair' : 'cursor-default'
-                        }`}
-                        style={{ imageRendering: 'pixelated' }}
-                      />
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="flex min-h-[520px] flex-col overflow-hidden rounded-lg border border-border bg-black">
-                <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
-                  <span className="text-xs font-medium text-white/70">3D Accumulated Volume</span>
-                  {ctParamsLoading && (
-                    <span className="text-[10px] text-cyan-400/80">Running CT parameter simulation...</span>
-                  )}
-                </div>
-                <div className="min-h-0 flex-1">
-                  {vtkVolumeData && vtkDims ? (
-                    <VolumeRenderer
-                      mode="synthetic"
-                      showControls
-                      opacityPreset={
-                        activePreset.label === 'Soft'
-                          ? 'ct-soft-tissue'
-                          : activePreset.label === 'Lung'
-                            ? 'ct-lung'
-                            : 'ct-bone'
-                      }
-                      syntheticData={vtkVolumeData}
-                      syntheticDims={vtkDims}
-                      syntheticSpacing={vtkSpacing ?? undefined}
-                      syntheticClipIndex={sliceIndex}
-                      syntheticClipDirection="low_to_high"
-                      syntheticScanAxis="z"
-                      scanView
-                      scanDirection="head_to_feet"
-                    />
-                  ) : (
-                    <div className="flex h-full items-center justify-center px-6 text-center">
-                      <p className="text-sm text-white/30">
-                        Generate a phantom, then run CT Parameter Simulation to build the accumulated 3D preview from the same slice stack.
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-              <div className="flex-1">
-                {vtkVolumeData && vtkDims ? (
-                  <VolumeRenderer
-                    mode="synthetic"
-                    showControls
-                    scanView
-                    scanDirection="head_to_feet"
-                    opacityPreset={
-                      activePreset.label === 'Soft'
-                        ? 'ct-soft-tissue'
-                        : activePreset.label === 'Lung'
-                          ? 'ct-lung'
-                          : 'ct-bone'
-                    }
-                    syntheticData={vtkVolumeData}
-                    syntheticDims={vtkDims}
-                    syntheticSpacing={vtkSpacing ?? undefined}
-                    syntheticClipIndex={sliceIndex}
-                    syntheticScanAxis="z"
-                    segmentationMask={lesionOverlay?.mask ?? null}
-                    segmentationLabels={lesionOverlay?.labels ?? null}
-                  />
-                ) : (
-                  <div className="flex h-full items-center justify-center">
-                    <p className="text-sm text-white/30">
-                      Generate a phantom to see 3D preview
-                    </p>
                   </div>
-                )}
-              </div>
-            </div>
-          </div>
 
-          <div className="grid flex-shrink-0 grid-cols-1 gap-3 border-t border-border bg-zinc-950 px-4 py-3 lg:grid-cols-3">
-            <div className="flex min-h-[280px] flex-col rounded border border-white/10 bg-black">
-              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
-                <span className="text-xs font-medium text-white/70">Original CT Slice</span>
-                {phantom && (
-                  <span className="text-[10px] text-white/50">
-                    Slice {sliceIndex + 1} / {totalSlices}
-                  </span>
-                )}
-              </div>
-              <div className="flex flex-1 items-center justify-center p-2">
-                {phantom ? (
-                  <canvas
-                    ref={originalCompareCanvasRef}
-                    className="max-h-full max-w-full border border-white/10 object-contain"
-                    style={{ imageRendering: 'pixelated' }}
-                  />
-                ) : (
-                  <p className="text-sm text-white/35">Generate a CT phantom to preview original slices.</p>
-                )}
-              </div>
-            </div>
-
-            <div className="flex min-h-[280px] flex-col rounded border border-white/10 bg-black">
-              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
-                <span className="text-xs font-medium text-white/70">Simulated CT Slice</span>
-                {ctParamsLoading && (
-                  <span className="text-[10px] text-cyan-400/80">Running CT parameter simulation...</span>
-                )}
-              </div>
-              <div className="flex flex-1 items-center justify-center p-2">
-                {ctParamsResult && simulatedVolumeData ? (
-                  <canvas
-                    ref={simulatedCompareCanvasRef}
-                    className="max-h-full max-w-full border border-white/10 object-contain"
-                    style={{ imageRendering: 'pixelated' }}
-                  />
-                ) : (
-                  <div className="px-6 text-center text-sm text-white/35">
-                    {ctParamsError && !ctParamsResult
-                      ? ctParamsError
-                      : 'Run CT Parameter Simulation to preview simulated CT.'}
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
+                      <div className="text-[11px] uppercase tracking-[0.16em] text-white/45">Current Stack</div>
+                      <div className="mt-1 text-sm font-medium text-white/85">{activeVolumeSourceLabel}</div>
+                      <div className="mt-1 text-xs text-white/45">
+                        {ctParamsResult ? 'Showing the latest CT-parameter result.' : 'Showing the generated atlas phantom.'}
+                      </div>
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
+                      <div className="text-[11px] uppercase tracking-[0.16em] text-white/45">Window</div>
+                      <div className="mt-1 text-sm font-medium text-white/85">
+                        WL {activePreset.windowLevel} / WW {activePreset.windowWidth}
+                      </div>
+                      <div className="mt-1 text-xs text-white/45">{activePreset.label} preset</div>
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
+                      <div className="text-[11px] uppercase tracking-[0.16em] text-white/45">Playback</div>
+                      <div className="mt-1 text-sm font-medium text-white/85">{playSpeed} fps</div>
+                      <div className="mt-1 text-xs text-white/45">
+                        {playing ? 'Auto-scrolling slices' : 'Manual browsing'}
+                      </div>
+                    </div>
                   </div>
-                )}
+                </div>
               </div>
             </div>
 
             {/* ---- Compact toolbar ---- */}
-            <div className="rounded-lg border border-border bg-card px-4 py-3">
+            <div className="rounded-2xl border border-border/70 bg-card px-4 py-3 shadow-sm">
               <div className="flex flex-wrap items-center gap-4">
-                {/* Source selector */}
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground">Source:</span>
-                  <select
-                    value={phantomSource}
-                    onChange={(e) => {
-                      const src = e.target.value as 'procedural' | 'atlas';
-                      setPhantomSource(src);
-                      setPhantom(null);
-                      setPhantomError(null);
-                      setCtParamsResult(null);
-                      setCtParamsError(null);
-                      // Reset size to sensible default for each mode
-                      setPhantomSize(src === 'atlas' ? 192 : 128);
-                    }}
-                    disabled={phantomLoading}
-                    className="rounded border border-border bg-background px-2 py-1 text-xs"
-                  >
-                    <option value="atlas">Real CT Atlas</option>
-                    <option value="procedural">Procedural Phantom</option>
-                  </select>
-                </div>
-
               {/* Size selector */}
               <div className="flex items-center gap-2">
                 <span className="text-xs text-muted-foreground">Size:</span>
@@ -1899,11 +1830,7 @@ export default function SimulationPage() {
                 onClick={handleGeneratePhantom}
                 disabled={phantomLoading}
               >
-                {phantomLoading
-                  ? 'Generating...'
-                  : phantomSource === 'atlas'
-                    ? 'Generate Atlas CT'
-                    : 'Generate Synthetic CT'}
+                {phantomLoading ? 'Generating...' : 'Generate Atlas CT'}
               </Button>
 
               {/* Play / Pause */}
@@ -2036,7 +1963,7 @@ export default function SimulationPage() {
                 <div className="border-t border-border/60 px-4 py-4">
                   <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
                     <p className="max-w-3xl text-xs text-muted-foreground">
-                      CT parameter simulation supports Real CT Atlas and Procedural Phantom. Gantry tilt changes trigger an automatic preview refresh and reset the current slice to the first layer.
+                      CT parameter simulation uses Real CT Atlas. Gantry tilt changes trigger an automatic preview refresh and reset the current slice to the first layer.
                     </p>
                     <Button
                       variant="default"

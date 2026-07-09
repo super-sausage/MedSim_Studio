@@ -12,6 +12,7 @@ import base64
 import uuid
 import tempfile
 import logging
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
@@ -344,6 +345,46 @@ def _normalize_direction(direction: Optional[Any]) -> List[List[float]]:
             except (TypeError, ValueError):
                 return _identity_direction_matrix()
     return _identity_direction_matrix()
+
+
+@lru_cache(maxsize=8)
+def _get_cached_phantom_payload(
+    source: str,
+    size: int,
+    case_id: str,
+    scan_direction: str,
+) -> Dict[str, Any]:
+    """Cache expensive phantom generation + base64 encoding by request key."""
+    if source == "atlas":
+        ct_volume, label_volume, metadata = generate_atlas_ct_phantom(
+            case_id=case_id,
+            size=size,
+            scan_direction=scan_direction,
+        )
+
+        response_content: Dict[str, Any] = {
+            "volume_base64": base64.b64encode(
+                np.asarray(ct_volume, dtype="<f4").tobytes()
+            ).decode("ascii"),
+            "metadata": metadata,
+            "label_base64": None,
+        }
+
+        if label_volume is not None:
+            response_content["label_base64"] = base64.b64encode(
+                np.asarray(label_volume, dtype=np.uint8).tobytes()
+            ).decode("ascii")
+
+        return response_content
+
+    volume, _, metadata = generate_procedural_ct_phantom(size=size)
+    return {
+        "volume_base64": base64.b64encode(
+            np.asarray(volume, dtype="<f4").tobytes()
+        ).decode("ascii"),
+        "label_base64": None,
+        "metadata": metadata,
+    }
 
 
 def _build_standardized_ct_case(
@@ -1580,46 +1621,19 @@ async def generate_ct_phantom(
                           label_map?, windowPresets, bodyThresholdHU}
     """
     try:
-        if source == "atlas":
-            ct_volume, label_volume, metadata = generate_atlas_ct_phantom(
-                case_id=case_id,
-                size=size,
-                scan_direction=scan_direction,
+        if source not in {"atlas", "procedural"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported phantom source: {source}",
             )
 
-            # Encode CT volume
-            raw_bytes = ct_volume.astype(np.float32).tobytes()
-            volume_b64 = base64.b64encode(raw_bytes).decode("ascii")
-
-            response_content: dict = {
-                "volume_base64": volume_b64,
-                "metadata": metadata,
-            }
-
-            # Encode label volume (if present)
-            if label_volume is not None:
-                label_bytes = label_volume.astype(np.uint8).tobytes()
-                label_b64 = base64.b64encode(label_bytes).decode("ascii")
-                response_content["label_base64"] = label_b64
-            else:
-                response_content["label_base64"] = None
-
-            return JSONResponse(content=response_content)
-
-        else:
-            # --- procedural (default) ---
-            volume, _, metadata = generate_procedural_ct_phantom(size=size)
-
-            raw_bytes = volume.astype(np.float32).tobytes()
-            volume_b64 = base64.b64encode(raw_bytes).decode("ascii")
-
-            return JSONResponse(
-                content={
-                    "volume_base64": volume_b64,
-                    "label_base64": None,
-                    "metadata": metadata,
-                }
-            )
+        response_content = _get_cached_phantom_payload(
+            source=source,
+            size=size,
+            case_id=case_id,
+            scan_direction=scan_direction,
+        )
+        return JSONResponse(content=response_content)
 
     except FileNotFoundError as e:
         logger.warning("Phantom generation 鈥?file not found: %s", e)

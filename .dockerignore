@@ -14,6 +14,8 @@ dist/
 build/
 docker/data/
 datasets/
+data/
+models/
 *.log
 .venv/
 *.db
@@ -21,3 +23,16 @@ pip_cache/
 *.whl
 
 backend/export_test/
+frontend/
+docs/
+tests/
+notebooks/
+scripts/
+ai-services/
+.agents/
+.codex/
+.github/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+backend/debug_output/

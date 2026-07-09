@@ -251,11 +251,14 @@ export const simulationService = {
   ): Promise<PhantomResponse> =>
     api.get<PhantomResponse>(
       `/simulation/phantom?source=${source}&size=${size}&case_id=${caseId}&scan_direction=${scanDirection}`,
+      { timeout: 180000 },
     ),
 
   /** Run CT scan parameter simulation preview for the current phantom */
   runCtParamsPreview: (request: CtParamsPreviewRequest): Promise<CtParamsPreviewResponse> =>
-    api.post<CtParamsPreviewResponse>('/simulation/ct-params/preview', request),
+    api.post<CtParamsPreviewResponse>('/simulation/ct-params/preview', request, {
+      timeout: 180000,
+    }),
 };
 
 export type { PreviewResponse };

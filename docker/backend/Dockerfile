@@ -9,9 +9,13 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
+ARG APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+
 # System dependencies for medical imaging libraries (using Tsinghua mirror)
-RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
+RUN sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
+    sed -i "s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
     apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgl1 \
@@ -30,7 +34,7 @@ RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc
 # To pre-download the wheel locally (fast in China):
 #   mkdir -p downloads && cd downloads
 #   curl -LO https://download.pytorch.org/whl/cu121/torch-2.1.2%2Bcu121-cp311-cp311-linux_x86_64.whl
-COPY backend/requirements.txt .
+COPY backend/requirements.runtime.txt ./requirements.txt
 
 # Step 1: Install PyTorch — prefers the local wheel over remote download.
 # Strategy: set index-url to Tsinghua mirror (does NOT host CUDA PyTorch
@@ -45,8 +49,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=bind,source=./downloads,target=/downloads \
     pip install \
     --find-links=/downloads \
-    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    --trusted-host pypi.tuna.tsinghua.edu.cn \
+    --index-url ${PIP_INDEX_URL} \
+    --trusted-host ${PIP_TRUSTED_HOST} \
     --timeout 600 \
     torch==2.1.2+cu121
 
@@ -60,8 +64,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     echo "torch==2.1.2+cu121" > /tmp/torch-pin.txt && \
     pip install \
-    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    --trusted-host pypi.tuna.tsinghua.edu.cn \
+    --index-url ${PIP_INDEX_URL} \
+    --trusted-host ${PIP_TRUSTED_HOST} \
     --timeout 600 \
     --no-cache-dir \
     --constraint /tmp/torch-pin.txt \
@@ -71,9 +75,11 @@ FROM python:3.11-slim AS runner
 
 WORKDIR /app
 
+ARG APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
+
 # Runtime system dependencies only (using Tsinghua mirror)
-RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources && \
+RUN sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
+    sed -i "s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
     apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
