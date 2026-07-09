@@ -101,7 +101,7 @@ export default function StudiesPage() {
             ref={dirInputRef}
             type="file"
             className="hidden"
-            // @ts-ignore — webkitdirectory is not in TS lib but supported in all major browsers
+            // @ts-expect-error -- webkitdirectory is not in the DOM lib but is supported by target browsers.
             webkitdirectory=""
             onChange={(e) => handleFileUpload(e.target.files)}
           />

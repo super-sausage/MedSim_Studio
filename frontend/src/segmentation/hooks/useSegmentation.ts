@@ -157,7 +157,7 @@ export function useSegmentation(ctVolumeId: string | undefined) {
           dimensions[0] > MAX_LABELMAP_DIM ||
           dimensions[1] > MAX_LABELMAP_DIM;
 
-        let labelmapVolumeId = `labelmap-${segLoadId}`;
+        const labelmapVolumeId = `labelmap-${segLoadId}`;
         let labelmapVolume: any;
         let finalMaskBytes: Uint8Array | null = null;
         let maskDimensions: [number, number, number] | undefined;

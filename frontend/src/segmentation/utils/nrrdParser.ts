@@ -206,9 +206,13 @@ async function decompressGzip(compressed: ArrayBuffer): Promise<ArrayBuffer> {
     const reader = ds.readable.getReader();
     const chunks: Uint8Array[] = [];
     let totalLength = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    let streamDone = false;
+    while (!streamDone) {
+      const { done: readDone, value } = await reader.read();
+      if (readDone) {
+        streamDone = true;
+        continue;
+      }
       if (value) {
         chunks.push(value);
         totalLength += value.length;
