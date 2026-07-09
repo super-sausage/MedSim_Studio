@@ -39,11 +39,26 @@ def _clipped_float32(volume: np.ndarray) -> np.ndarray:
     return np.clip(volume, -1024.0, 3071.0).astype(np.float32, copy=False)
 
 
+def _material_masks(volume: np.ndarray) -> Dict[str, np.ndarray]:
+    """Coarse HU-based tissue groups for image-domain parameter remapping."""
+    return {
+        "air": volume < -900.0,
+        "lung": (volume >= -900.0) & (volume < -500.0),
+        "fat": (volume >= -180.0) & (volume < -30.0),
+        "soft": (volume >= -30.0) & (volume < 120.0),
+        "vascular": (volume >= 120.0) & (volume < 300.0),
+        "cancellous_bone": (volume >= 300.0) & (volume < 1000.0),
+        "cortical_bone": volume >= 1000.0,
+    }
+
+
 def _resolve_params(params: Dict[str, Any]) -> Dict[str, Any]:
     dose_level = params["dose_level"]
     resolved_mas = int(params.get("mAs") or DEFAULT_MAS_BY_DOSE_LEVEL[dose_level])
     return {
-        "gantry_tilt_deg": float(params.get("gantry_tilt_deg", 0.0)),
+        "gantry_pitch_deg": float(params.get("gantry_pitch_deg", params.get("gantry_tilt_deg", 0.0))),
+        "gantry_yaw_deg": float(params.get("gantry_yaw_deg", 0.0)),
+        "gantry_roll_deg": float(params.get("gantry_roll_deg", 0.0)),
         "slice_thickness_mm": float(params["slice_thickness_mm"]),
         "dose_level": dose_level,
         "mAs": resolved_mas,
@@ -57,12 +72,62 @@ def _resolve_params(params: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _estimate_tilt_output_shape(
+def _rotation_matrix_pitch(pitch_deg: float) -> np.ndarray:
+    angle_rad = float(np.deg2rad(pitch_deg))
+    cos_a = float(np.cos(angle_rad))
+    sin_a = float(np.sin(angle_rad))
+    return np.array(
+        [
+            [cos_a, -sin_a, 0.0],
+            [sin_a, cos_a, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _rotation_matrix_yaw(yaw_deg: float) -> np.ndarray:
+    angle_rad = float(np.deg2rad(yaw_deg))
+    cos_a = float(np.cos(angle_rad))
+    sin_a = float(np.sin(angle_rad))
+    return np.array(
+        [
+            [cos_a, 0.0, sin_a],
+            [0.0, 1.0, 0.0],
+            [-sin_a, 0.0, cos_a],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _rotation_matrix_roll(roll_deg: float) -> np.ndarray:
+    angle_rad = float(np.deg2rad(roll_deg))
+    cos_a = float(np.cos(angle_rad))
+    sin_a = float(np.sin(angle_rad))
+    return np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cos_a, -sin_a],
+            [0.0, sin_a, cos_a],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _build_gantry_pose_rotation_matrix(
+    pitch_deg: float,
+    yaw_deg: float,
+    roll_deg: float,
+) -> np.ndarray:
+    return _rotation_matrix_roll(roll_deg) @ _rotation_matrix_yaw(yaw_deg) @ _rotation_matrix_pitch(pitch_deg)
+
+
+def _estimate_pose_output_shape(
     shape: tuple[int, int, int],
     spacing: Spacing3D,
-    angle_rad: float,
+    rotation: np.ndarray,
 ) -> tuple[int, int, int]:
-    if abs(angle_rad) < 1e-8:
+    if np.allclose(rotation, np.eye(3), atol=1e-8):
         return shape
 
     nz, ny, nx = shape
@@ -85,34 +150,40 @@ def _estimate_tilt_output_shape(
         dtype=np.float64,
     )
 
-    cos_a = float(np.cos(angle_rad))
-    sin_a = float(np.sin(angle_rad))
-    rotation = np.array(
-        [
-            [cos_a, -sin_a, 0.0],
-            [sin_a, cos_a, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
     rotated = centered_phys @ rotation.T
     extent_mm = rotated.max(axis=0) - rotated.min(axis=0)
 
+    out_nz = max(int(np.ceil(extent_mm[0] / sz)) + 1, nz)
     out_ny = max(int(np.ceil(extent_mm[1] / sy)) + 1, ny)
-    return nz, out_ny, nx
+    out_nx = max(int(np.ceil(extent_mm[2] / sx)) + 1, nx)
+    return out_nz, out_ny, out_nx
 
 
-def _apply_gantry_tilt(
+def _apply_gantry_pose(
     volume: np.ndarray,
     spacing: Spacing3D,
-    gantry_tilt_deg: float,
+    gantry_pitch_deg: float,
+    gantry_yaw_deg: float,
+    gantry_roll_deg: float,
     *,
     label_volume: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
-    if abs(gantry_tilt_deg) < 1e-6:
+    if (
+        abs(gantry_pitch_deg) < 1e-6
+        and abs(gantry_yaw_deg) < 1e-6
+        and abs(gantry_roll_deg) < 1e-6
+    ):
         return volume, label_volume, {
+            "gantry_pitch_deg": 0.0,
+            "gantry_yaw_deg": 0.0,
+            "gantry_roll_deg": 0.0,
             "gantry_tilt_deg": 0.0,
-            "rotation_axis": "x_left_to_right",
+            "rotation_axes": {
+                "pitch": "x_left_to_right",
+                "yaw": "y_anterior_to_posterior",
+                "roll": "z_head_to_feet",
+            },
+            "rotation_order": ["pitch", "yaw", "roll"],
             "interpolation_order_ct": 1,
             "interpolation_order_label": 0,
             "input_shape": [int(v) for v in volume.shape],
@@ -120,20 +191,13 @@ def _apply_gantry_tilt(
             "output_shape_changed": False,
         }
 
-    angle_rad = float(np.deg2rad(gantry_tilt_deg))
     input_shape = tuple(int(v) for v in volume.shape)
-    output_shape = _estimate_tilt_output_shape(input_shape, spacing, angle_rad)
-
-    cos_a = float(np.cos(angle_rad))
-    sin_a = float(np.sin(angle_rad))
-    rotation = np.array(
-        [
-            [cos_a, -sin_a, 0.0],
-            [sin_a, cos_a, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
+    rotation = _build_gantry_pose_rotation_matrix(
+        gantry_pitch_deg,
+        gantry_yaw_deg,
+        gantry_roll_deg,
     )
+    output_shape = _estimate_pose_output_shape(input_shape, spacing, rotation)
 
     input_center_idx = (np.array(input_shape, dtype=np.float64) - 1.0) * 0.5
     output_center_idx = (np.array(output_shape, dtype=np.float64) - 1.0) * 0.5
@@ -170,8 +234,16 @@ def _apply_gantry_tilt(
         ).astype(np.uint8, copy=False)
 
     return rotated_volume, rotated_labels, {
-        "gantry_tilt_deg": float(gantry_tilt_deg),
-        "rotation_axis": "x_left_to_right",
+        "gantry_pitch_deg": float(gantry_pitch_deg),
+        "gantry_yaw_deg": float(gantry_yaw_deg),
+        "gantry_roll_deg": float(gantry_roll_deg),
+        "gantry_tilt_deg": float(gantry_pitch_deg),
+        "rotation_axes": {
+            "pitch": "x_left_to_right",
+            "yaw": "y_anterior_to_posterior",
+            "roll": "z_head_to_feet",
+        },
+        "rotation_order": ["pitch", "yaw", "roll"],
         "interpolation_order_ct": 1,
         "interpolation_order_label": 0,
         "input_shape": [int(v) for v in input_shape],
@@ -190,13 +262,21 @@ def _apply_slice_thickness(
         return volume, {
             "effective_slice_thickness_mm": float(max(slice_thickness_mm, z_spacing)),
             "z_sigma_voxels": 0.0,
+            "xy_sigma_voxels": 0.0,
+            "thickness_model": "identity",
         }
 
     sigma_voxels = max((slice_thickness_mm / z_spacing - 1.0) * 0.5, 0.0)
     blurred = gaussian_filter1d(volume, sigma=sigma_voxels, axis=0, mode="nearest")
+    xy_sigma = max((slice_thickness_mm / z_spacing - 1.0) * 0.08, 0.0)
+    if xy_sigma > 1e-6:
+        blurred = gaussian_filter(blurred, sigma=(0.0, xy_sigma, xy_sigma), mode="nearest")
+
     return blurred.astype(np.float32, copy=False), {
         "effective_slice_thickness_mm": float(slice_thickness_mm),
         "z_sigma_voxels": float(sigma_voxels),
+        "xy_sigma_voxels": float(xy_sigma),
+        "thickness_model": "z_blur_plus_partial_volume",
     }
 
 
@@ -207,17 +287,44 @@ def _apply_dose_noise(
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     reference_mas = 150.0
     actual_mas = max(float(resolved_params["mAs"]), 1.0)
-    sigma = 12.0 * np.sqrt(reference_mas / actual_mas)
+    base_sigma = 12.0 * np.sqrt(reference_mas / actual_mas)
 
     dose_level = resolved_params["dose_level"]
     level_scale = {"low": 1.2, "standard": 1.0, "high": 0.85}[dose_level]
-    sigma *= level_scale
+    pitch_scale = float(np.sqrt(max(float(resolved_params["pitch"]), 0.1)))
+    slice_thickness_scale = float(
+        np.sqrt(5.0 / max(float(resolved_params["slice_thickness_mm"]), 0.625))
+    )
+    sigma = base_sigma * level_scale * pitch_scale * slice_thickness_scale
 
-    noise = rng.normal(0.0, sigma, size=volume.shape).astype(np.float32)
-    return (volume + noise).astype(np.float32, copy=False), {
+    materials = _material_masks(volume)
+    body_mask = ~materials["air"]
+    sigma_map = np.full(volume.shape, sigma * 0.22, dtype=np.float32)
+    sigma_map[body_mask] = sigma * 0.72
+    sigma_map[materials["soft"]] = sigma * 0.92
+    sigma_map[materials["vascular"]] = sigma * 1.05
+    sigma_map[materials["cancellous_bone"]] = sigma * 1.18
+    sigma_map[materials["cortical_bone"]] = sigma * 1.28
+
+    # Blend fine-grain and correlated noise so low-dose images look less synthetic.
+    white_noise = rng.normal(0.0, 1.0, size=volume.shape).astype(np.float32)
+    correlated_noise = gaussian_filter(
+        rng.normal(0.0, 1.0, size=volume.shape).astype(np.float32),
+        sigma=(0.25, 0.55, 0.55),
+        mode="nearest",
+    )
+    noise = sigma_map * (0.78 * white_noise + 0.22 * correlated_noise)
+    noisy = volume + noise
+
+    return noisy.astype(np.float32, copy=False), {
         "noise_sigma_hu": float(sigma),
+        "noise_sigma_soft_tissue_hu": float(sigma * 0.92),
+        "noise_sigma_dense_bone_hu": float(sigma * 1.28),
         "noise_reference_mAs": reference_mas,
         "dose_level_scale": float(level_scale),
+        "pitch_noise_scale": float(pitch_scale),
+        "slice_thickness_noise_scale": float(slice_thickness_scale),
+        "noise_model": "heteroscedastic_correlated_gaussian",
     }
 
 
@@ -225,21 +332,56 @@ def _apply_kvp_transform(
     volume: np.ndarray,
     kVp: int,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
-    contrast_scale = {
-        80: 1.18,
-        100: 1.08,
-        120: 1.00,
-        140: 0.93,
+    materials = _material_masks(volume)
+    transformed = volume.copy()
+
+    material_scales = {
+        80: {
+            "lung": 1.02,
+            "fat": 1.01,
+            "soft": 1.08,
+            "vascular": 1.24,
+            "cancellous_bone": 1.10,
+            "cortical_bone": 1.05,
+        },
+        100: {
+            "lung": 1.01,
+            "fat": 1.00,
+            "soft": 1.04,
+            "vascular": 1.12,
+            "cancellous_bone": 1.05,
+            "cortical_bone": 1.02,
+        },
+        120: {
+            "lung": 1.00,
+            "fat": 1.00,
+            "soft": 1.00,
+            "vascular": 1.00,
+            "cancellous_bone": 1.00,
+            "cortical_bone": 1.00,
+        },
+        140: {
+            "lung": 0.995,
+            "fat": 0.995,
+            "soft": 0.97,
+            "vascular": 0.90,
+            "cancellous_bone": 0.96,
+            "cortical_bone": 0.985,
+        },
     }[kVp]
 
-    centered = volume.copy()
-    high_hu_mask = centered > 150.0
-    centered *= contrast_scale
-    centered[high_hu_mask] *= 1.0 + (contrast_scale - 1.0) * 0.35
+    water_reference = 0.0
+    for material_name, scale in material_scales.items():
+        mask = materials[material_name]
+        if not np.any(mask):
+            continue
+        transformed[mask] = water_reference + (transformed[mask] - water_reference) * scale
 
-    return centered.astype(np.float32, copy=False), {
-        "contrast_scale": float(contrast_scale),
-        "high_hu_boost_applied": bool(kVp < 120),
+    return transformed.astype(np.float32, copy=False), {
+        "material_scales": {key: float(value) for key, value in material_scales.items()},
+        "kvp_model": "piecewise_material_hu_remap",
+        "iodine_like_boost_applied": bool(kVp < 120),
+        "vascular_contrast_scale": float(material_scales["vascular"]),
     }
 
 
@@ -248,12 +390,25 @@ def _apply_pitch_effect(
     pitch: float,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     if pitch <= 1.0:
-        return volume, {"z_sigma_voxels": 0.0}
+        return volume, {
+            "z_sigma_voxels": 0.0,
+            "artifact_amplitude_hu": 0.0,
+            "pitch_model": "identity",
+        }
 
     sigma_voxels = (pitch - 1.0) * 0.8
     degraded = gaussian_filter1d(volume, sigma=sigma_voxels, axis=0, mode="nearest")
+    artifact_amplitude = min((pitch - 1.0) * 6.0, 4.0)
+    if artifact_amplitude > 0.0 and degraded.shape[0] > 3:
+        z = np.linspace(0.0, 2.0 * np.pi, degraded.shape[0], dtype=np.float32)
+        ripple = np.sin(z * (1.0 + pitch * 0.35)).astype(np.float32)[:, None, None]
+        body_mask = (degraded > -850.0).astype(np.float32)
+        degraded = degraded + ripple * body_mask * artifact_amplitude
+
     return degraded.astype(np.float32, copy=False), {
         "z_sigma_voxels": float(sigma_voxels),
+        "artifact_amplitude_hu": float(artifact_amplitude),
+        "pitch_model": "z_blur_plus_interpolation_ripple",
     }
 
 
@@ -344,10 +499,16 @@ def _apply_matrix_effect(
         return volume, {
             "downsample_factor": 1.0,
             "effective_matrix_size": int(matrix_size),
+            "matrix_model": "identity",
         }
 
     scale = matrix_size / 512.0
-    down = _resize_xy(volume, scale, order=1)
+    prefiltered = gaussian_filter(
+        volume,
+        sigma=(0.0, max((1.0 / max(scale, 1e-6) - 1.0) * 0.22, 0.0), max((1.0 / max(scale, 1e-6) - 1.0) * 0.22, 0.0)),
+        mode="nearest",
+    )
+    down = _resize_xy(prefiltered, scale, order=1)
     restored = zoom(
         down,
         (1.0, volume.shape[1] / max(down.shape[1], 1), volume.shape[2] / max(down.shape[2], 1)),
@@ -355,9 +516,13 @@ def _apply_matrix_effect(
         mode="nearest",
     )
     restored = _crop_or_pad_to_shape(restored.astype(np.float32, copy=False), (volume.shape[1], volume.shape[2]))
+    edge_loss_sigma = max((1.0 / max(scale, 1e-6) - 1.0) * 0.12, 0.0)
+    if edge_loss_sigma > 1e-6:
+        restored = gaussian_filter(restored, sigma=(0.0, edge_loss_sigma, edge_loss_sigma), mode="nearest")
     return restored, {
         "downsample_factor": float(scale),
         "effective_matrix_size": int(matrix_size),
+        "matrix_model": "downsample_restore_with_antialias",
     }
 
 
@@ -368,16 +533,31 @@ def _apply_kernel_effect(
     if kernel in ("smooth", "soft"):
         sigma = 1.1 if kernel == "smooth" else 0.8
         filtered = gaussian_filter(volume, sigma=(0.0, sigma, sigma), mode="nearest")
-        return filtered.astype(np.float32, copy=False), {"mode": "gaussian_blur", "sigma_xy": float(sigma)}
+        return filtered.astype(np.float32, copy=False), {
+            "mode": "gaussian_blur",
+            "sigma_xy": float(sigma),
+            "kernel_family": "soft_tissue",
+        }
 
     if kernel == "standard":
         filtered = gaussian_filter(volume, sigma=(0.0, 0.45, 0.45), mode="nearest")
-        return filtered.astype(np.float32, copy=False), {"mode": "mild_blur", "sigma_xy": 0.45}
+        return filtered.astype(np.float32, copy=False), {
+            "mode": "mild_blur",
+            "sigma_xy": 0.45,
+            "kernel_family": "balanced",
+        }
 
     if kernel == "lung":
         blurred = gaussian_filter(volume, sigma=(0.0, 0.5, 0.5), mode="nearest")
         sharpened = volume + 0.55 * (volume - blurred)
-        return _clipped_float32(sharpened), {"mode": "unsharp_mask", "amount": 0.55, "pre_blur_sigma_xy": 0.5}
+        high_freq = volume - gaussian_filter(volume, sigma=(0.0, 0.25, 0.25), mode="nearest")
+        sharpened = sharpened + 0.08 * high_freq
+        return _clipped_float32(sharpened), {
+            "mode": "unsharp_mask",
+            "amount": 0.55,
+            "pre_blur_sigma_xy": 0.5,
+            "kernel_family": "lung",
+        }
 
     if kernel in ("bone", "sharp"):
         blurred = gaussian_filter(volume, sigma=(0.0, 0.7, 0.7), mode="nearest")
@@ -389,18 +569,34 @@ def _apply_kernel_effect(
             "amount": 0.9,
             "pre_blur_sigma_xy": 0.7,
             "laplacian_boost": bool(kernel == "sharp"),
+            "kernel_family": "high_resolution",
         }
 
-    return volume, {"mode": "identity"}
+    return volume, {"mode": "identity", "kernel_family": "unknown"}
 
 
-def _enhance_mask_region(volume: np.ndarray, mask: np.ndarray, delta_hu: float) -> np.ndarray:
+def _enhance_mask_region(
+    volume: np.ndarray,
+    mask: np.ndarray,
+    delta_hu: float,
+    *,
+    smooth_sigma: float = 0.8,
+    blur_sigma: float = 0.6,
+) -> np.ndarray:
     if not np.any(mask):
         return volume
     result = volume.copy()
     result[mask] += delta_hu
-    softened = gaussian_filter(mask.astype(np.float32), sigma=(0.8, 0.8, 0.8), mode="nearest") > 0.05
-    result[softened] = 0.7 * result[softened] + 0.3 * gaussian_filter(result, sigma=0.6, mode="nearest")[softened]
+    softened = gaussian_filter(
+        mask.astype(np.float32),
+        sigma=(smooth_sigma, smooth_sigma, smooth_sigma),
+        mode="nearest",
+    ) > 0.05
+    result[softened] = 0.7 * result[softened] + 0.3 * gaussian_filter(
+        result,
+        sigma=blur_sigma,
+        mode="nearest",
+    )[softened]
     return result.astype(np.float32, copy=False)
 
 
@@ -414,29 +610,76 @@ def _apply_contrast_phase(
 
     result = volume.copy()
     phase_deltas = {
-        "arterial": {9: 18.0, 7: 28.0, 8: 28.0, 17: 22.0, "generic": 12.0},
-        "venous": {9: 26.0, 7: 18.0, 8: 18.0, 17: 20.0, "generic": 10.0},
-        "delayed": {9: 14.0, 7: 12.0, 8: 12.0, 17: 10.0, "generic": 6.0},
+        "arterial": {
+            9: 14.0,   # liver
+            7: 32.0,   # left kidney
+            8: 32.0,   # right kidney
+            17: 18.0,  # spleen
+            15: 10.0,  # pancreas
+            19: 42.0,  # trachea/major airway region proxy kept low relevance
+            "generic_soft": 7.0,
+            "generic_vascular": 30.0,
+        },
+        "venous": {
+            9: 26.0,
+            7: 20.0,
+            8: 20.0,
+            17: 22.0,
+            15: 14.0,
+            19: 18.0,
+            "generic_soft": 12.0,
+            "generic_vascular": 18.0,
+        },
+        "delayed": {
+            9: 12.0,
+            7: 10.0,
+            8: 10.0,
+            17: 8.0,
+            15: 6.0,
+            19: 8.0,
+            "generic_soft": 5.0,
+            "generic_vascular": 8.0,
+        },
     }[contrast_phase]
 
     label_based = False
     if label_volume is not None and label_volume.shape == volume.shape:
-        for label_id in (9, 7, 8, 17):
+        for label_id in (9, 7, 8, 17, 15, 19):
             label_mask = label_volume == label_id
             if np.any(label_mask):
-                result = _enhance_mask_region(result, label_mask, phase_deltas[label_id])
+                sigma = 0.55 if label_id in (7, 8, 19) else 0.9
+                blur_sigma = 0.45 if label_id in (7, 8, 19) else 0.7
+                result = _enhance_mask_region(
+                    result,
+                    label_mask,
+                    phase_deltas[label_id],
+                    smooth_sigma=sigma,
+                    blur_sigma=blur_sigma,
+                )
                 label_based = True
 
     if not label_based:
         soft_tissue_mask = (volume > 20.0) & (volume < 120.0)
-        vascular_mask = (volume >= 120.0) & (volume < 300.0)
-        result[soft_tissue_mask] += phase_deltas["generic"]
-        result[vascular_mask] += phase_deltas["generic"] * 0.5
+        vascular_mask = (volume >= 120.0) & (volume < 260.0)
+        organ_rich_mask = (volume >= 45.0) & (volume < 95.0)
+        result[soft_tissue_mask] += phase_deltas["generic_soft"]
+        result[organ_rich_mask] += phase_deltas["generic_soft"] * 0.35
+        result[vascular_mask] += phase_deltas["generic_vascular"]
+
+    # Mild phase-specific smoothing prevents enhancement from looking like simple voxel-wise brightening.
+    phase_blend_sigma = {
+        "arterial": 0.35,
+        "venous": 0.45,
+        "delayed": 0.55,
+    }[contrast_phase]
+    smoothed = gaussian_filter(result, sigma=(0.0, phase_blend_sigma, phase_blend_sigma), mode="nearest")
+    result = 0.82 * result + 0.18 * smoothed
 
     return result.astype(np.float32, copy=False), {
         "mode": "empirical_hu_boost",
         "used_label_volume": bool(label_based),
         "phase": contrast_phase,
+        "phase_model": "organ_weighted_empirical_enhancement",
     }
 
 
@@ -477,13 +720,15 @@ def simulate_ct_scan_params(
     hu_before = [float(np.min(working)), float(np.max(working))]
     preview_before = _center_slice_stats(working)
 
-    working, working_labels, step_meta = _apply_gantry_tilt(
+    working, working_labels, step_meta = _apply_gantry_pose(
         working,
         input_spacing,
-        resolved_params["gantry_tilt_deg"],
+        resolved_params["gantry_pitch_deg"],
+        resolved_params["gantry_yaw_deg"],
+        resolved_params["gantry_roll_deg"],
         label_volume=working_labels,
     )
-    algorithm_steps.append({"name": "gantry_tilt_resampling", **step_meta})
+    algorithm_steps.append({"name": "gantry_pose_resampling", **step_meta})
 
     working, step_meta = _apply_slice_thickness(working, input_spacing, resolved_params["slice_thickness_mm"])
     algorithm_steps.append({"name": "slice_thickness", **step_meta})
@@ -522,7 +767,7 @@ def simulate_ct_scan_params(
 
     approximation_notes = [
         "Image-domain approximation only; not a physics-based CT forward model.",
-        "Gantry tilt changes the actual slice plane via spacing-aware 3D affine resampling around the patient left-right axis.",
+        "Gantry pitch/yaw/roll use spacing-aware 3D affine resampling in image space.",
         "Dose and mAs use Gaussian noise scaling rather than quantum noise reconstruction.",
         "kVp effect uses HU contrast remapping, not spectrum-dependent attenuation.",
         "Pitch, slice thickness, FOV, and matrix effects are approximated with resampling and smoothing.",
@@ -541,7 +786,10 @@ def simulate_ct_scan_params(
         "shape": [int(v) for v in working.shape],
         "spacing": [float(v) for v in output_spacing],
         "hu_range": hu_after,
-        "gantry_tilt_deg": float(resolved_params["gantry_tilt_deg"]),
+        "gantry_pitch_deg": float(resolved_params["gantry_pitch_deg"]),
+        "gantry_yaw_deg": float(resolved_params["gantry_yaw_deg"]),
+        "gantry_roll_deg": float(resolved_params["gantry_roll_deg"]),
+        "gantry_tilt_deg": float(resolved_params["gantry_pitch_deg"]),
         "effective_slice_thickness_mm": float(resolved_params["slice_thickness_mm"]),
         "algorithm_notes": approximation_notes,
         "warnings": warnings,

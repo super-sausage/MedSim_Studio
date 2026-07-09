@@ -264,6 +264,9 @@ const DEFAULT_FORM: {
 
 const DEFAULT_CT_PARAMS: CtParamsPreviewParams = {
   gantryTiltDeg: 0,
+  gantryPitchDeg: 0,
+  gantryYawDeg: 0,
+  gantryRollDeg: 0,
   sliceThicknessMm: 5.0,
   doseLevel: 'standard',
   mAs: 150,
@@ -399,8 +402,6 @@ export default function SimulationPage() {
   // ---- Refs ----
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const playTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const gantryTiltAutoRunTimerRef = useRef<number | null>(null);
-  const hasMountedGantryTiltRef = useRef(false);
 
   // ---- Reset slice index to 0 when a new phantom is loaded ----
   useEffect(() => {
@@ -784,6 +785,16 @@ export default function SimulationPage() {
     return normalized;
   }, [mAsInput]);
 
+  const handleResetCtAngles = useCallback(() => {
+    setCtParams((prev) => ({
+      ...prev,
+      gantryTiltDeg: 0,
+      gantryPitchDeg: 0,
+      gantryYawDeg: 0,
+      gantryRollDeg: 0,
+    }));
+  }, []);
+
   const handleRunCtParamsSimulation = async (
     overrideParams?: Partial<CtParamsPreviewParams>,
   ) => {
@@ -802,6 +813,12 @@ export default function SimulationPage() {
     const normalizedParams: CtParamsPreviewParams = {
       ...ctParams,
       ...overrideParams,
+      gantryPitchDeg:
+        overrideParams?.gantryPitchDeg
+        ?? overrideParams?.gantryTiltDeg
+        ?? ctParams.gantryPitchDeg
+        ?? ctParams.gantryTiltDeg
+        ?? 0,
       mAs: normalizedMAs,
     };
 
@@ -881,30 +898,6 @@ export default function SimulationPage() {
       setStandardizedCaseDownloadState('Download failed');
     }
   }, [ctParamsResult]);
-
-  useEffect(() => {
-    if (!phantom) return;
-
-    if (!hasMountedGantryTiltRef.current) {
-      hasMountedGantryTiltRef.current = true;
-      return;
-    }
-
-    if (gantryTiltAutoRunTimerRef.current) {
-      clearTimeout(gantryTiltAutoRunTimerRef.current);
-    }
-
-    gantryTiltAutoRunTimerRef.current = window.setTimeout(() => {
-      void handleRunCtParamsSimulation({ gantryTiltDeg: ctParams.gantryTiltDeg });
-    }, 250);
-
-    return () => {
-      if (gantryTiltAutoRunTimerRef.current) {
-        clearTimeout(gantryTiltAutoRunTimerRef.current);
-        gantryTiltAutoRunTimerRef.current = null;
-      }
-    };
-  }, [ctParams.gantryTiltDeg, phantom]);
 
   // -----------------------------------------------------------------------
   // Handlers: lesion form
@@ -1963,7 +1956,7 @@ export default function SimulationPage() {
                 <div className="border-t border-border/60 px-4 py-4">
                   <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
                     <p className="max-w-3xl text-xs text-muted-foreground">
-                      CT parameter simulation uses Real CT Atlas. Gantry tilt changes trigger an automatic preview refresh and reset the current slice to the first layer.
+                      CT parameter simulation uses Real CT Atlas. Parameter changes are applied only when you click the run button. Angle controls support pitch, yaw, and roll.
                     </p>
                     <Button
                       variant="default"
@@ -1978,8 +1971,26 @@ export default function SimulationPage() {
                   </div>
 
                   <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                    <div className="flex items-center justify-between gap-3 md:col-span-2 xl:col-span-3">
+                      <div>
+                        <h4 className="text-xs font-medium uppercase tracking-wide text-foreground/80">
+                          Gantry Angles
+                        </h4>
+                        <p className="text-[11px] text-muted-foreground/80">
+                          Reset all three axes to the original 0° pose.
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleResetCtAngles}
+                      >
+                        Reset Angles
+                      </Button>
+                    </div>
+
                     <label className="flex flex-col gap-1 text-xs text-muted-foreground md:col-span-2 xl:col-span-3">
-                    Gantry Tilt (deg)
+                    Pitch (deg)
                     <div className="flex items-center gap-3">
                       <input
                         type="range"
@@ -1991,6 +2002,7 @@ export default function SimulationPage() {
                           setCtParams((prev) => ({
                             ...prev,
                             gantryTiltDeg: Number(e.target.value),
+                            gantryPitchDeg: Number(e.target.value),
                           }))
                         }
                         className="flex-1 cursor-pointer accent-primary"
@@ -2005,6 +2017,7 @@ export default function SimulationPage() {
                           setCtParams((prev) => ({
                             ...prev,
                             gantryTiltDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
+                            gantryPitchDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
                           }))
                         }
                         className="w-20 rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
@@ -2015,6 +2028,80 @@ export default function SimulationPage() {
                     </div>
                     <span className="text-[11px] text-muted-foreground/80">
                       Range: -30° to 30°. Rotation is applied around the patient left-right axis.
+                    </span>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    Yaw (deg)
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="range"
+                        min={-30}
+                        max={30}
+                        step={1}
+                        value={ctParams.gantryYawDeg}
+                        onChange={(e) =>
+                          setCtParams((prev) => ({
+                            ...prev,
+                            gantryYawDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
+                          }))
+                        }
+                        className="flex-1 cursor-pointer accent-primary"
+                      />
+                      <input
+                        type="number"
+                        min={-30}
+                        max={30}
+                        step={1}
+                        value={ctParams.gantryYawDeg}
+                        onChange={(e) =>
+                          setCtParams((prev) => ({
+                            ...prev,
+                            gantryYawDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
+                          }))
+                        }
+                        className="w-20 rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                      />
+                    </div>
+                    <span className="text-[11px] text-muted-foreground/80">
+                      Range: -30° to 30°. Left/right turning around the anterior-posterior axis.
+                    </span>
+                  </label>
+
+                  <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    Roll (deg)
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="range"
+                        min={-30}
+                        max={30}
+                        step={1}
+                        value={ctParams.gantryRollDeg}
+                        onChange={(e) =>
+                          setCtParams((prev) => ({
+                            ...prev,
+                            gantryRollDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
+                          }))
+                        }
+                        className="flex-1 cursor-pointer accent-primary"
+                      />
+                      <input
+                        type="number"
+                        min={-30}
+                        max={30}
+                        step={1}
+                        value={ctParams.gantryRollDeg}
+                        onChange={(e) =>
+                          setCtParams((prev) => ({
+                            ...prev,
+                            gantryRollDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
+                          }))
+                        }
+                        className="w-20 rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+                      />
+                    </div>
+                    <span className="text-[11px] text-muted-foreground/80">
+                      Range: -30° to 30°. Side tilt around the head-to-feet axis.
                     </span>
                   </label>
 

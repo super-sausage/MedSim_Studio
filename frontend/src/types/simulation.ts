@@ -92,7 +92,10 @@ export type CtFovMm = 150 | 250 | 350 | 500;
 export type CtMatrixSize = 256 | 512 | 1024;
 
 export interface CtParamsPreviewParams {
-  gantryTiltDeg: number;
+  gantryTiltDeg?: number;
+  gantryPitchDeg: number;
+  gantryYawDeg: number;
+  gantryRollDeg: number;
   sliceThicknessMm: CtSliceThickness;
   doseLevel: CtDoseLevel;
   mAs: number;
@@ -124,7 +127,9 @@ export interface CtParamsPreviewMetadata {
   shape: number[];
   spacing: number[];
   huRange: [number, number];
-  gantryTiltDeg: number;
+  gantryPitchDeg: number;
+  gantryYawDeg: number;
+  gantryRollDeg: number;
   effectiveSliceThicknessMm: number;
   algorithmNotes?: string[];
   warnings?: string[];
