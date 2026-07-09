@@ -84,7 +84,7 @@ export type CtDoseLevel = 'low' | 'standard' | 'high';
 export type CtKernel = 'smooth' | 'soft' | 'standard' | 'lung' | 'bone' | 'sharp';
 export type CtContrastPhase = 'noncontrast' | 'arterial' | 'venous' | 'delayed';
 export type CtScanDirection = 'head_to_feet' | 'feet_to_head';
-export type CtPhantomSource = 'procedural' | 'atlas';
+export type CtPhantomSource = 'procedural' | 'atlas' | 'dicom';
 export type CtSliceThickness = 0.625 | 1.0 | 2.5 | 5.0 | 10.0;
 export type CtKvp = 80 | 100 | 120 | 140;
 export type CtPitch = 0.5 | 0.8 | 1.0 | 1.2 | 1.5;
@@ -92,7 +92,6 @@ export type CtFovMm = 150 | 250 | 350 | 500;
 export type CtMatrixSize = 256 | 512 | 1024;
 
 export interface CtParamsPreviewParams {
-  gantryTiltDeg?: number;
   gantryPitchDeg: number;
   gantryYawDeg: number;
   gantryRollDeg: number;
@@ -110,6 +109,8 @@ export interface CtParamsPreviewParams {
 export interface CtParamsPreviewRequest {
   source: CtPhantomSource;
   caseId?: string | null;
+  studyId?: string | null;
+  seriesId?: string | null;
   size: number;
   scanDirection: CtScanDirection;
   params: CtParamsPreviewParams;
@@ -135,6 +136,9 @@ export interface CtParamsPreviewMetadata {
   warnings?: string[];
   source?: CtPhantomSource;
   caseId?: string;
+  studyId?: string;
+  seriesId?: string;
+  spatialReference?: string;
   scanDirection?: CtScanDirection;
   previewStats?: {
     originalCenterSliceStats?: CtCenterSliceStats;
@@ -176,6 +180,7 @@ export interface StandardizedCtCaseVolume {
     [number, number, number],
     [number, number, number],
   ];
+  spatialReference?: string;
   huRange: [number, number];
   sliceCount: number;
   modality: 'CT';

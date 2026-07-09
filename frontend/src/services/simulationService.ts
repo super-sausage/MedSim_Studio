@@ -36,8 +36,10 @@ export interface PhantomMetadata {
   spacing: [number, number, number]; // (z, y, x) in mm
   windowPresets: Record<string, { windowLevel: number; windowWidth: number }>;
   bodyThresholdHU?: number; // voxels >= this HU belong to the body (≈ -500)
-  source?: 'procedural' | 'atlas';
+  source?: 'procedural' | 'atlas' | 'dicom';
   caseId?: string;
+  studyId?: string;
+  seriesId?: string;
   labelMap?: Record<number, string>; // organ index → name (atlas only)
   description: string;
 
@@ -244,15 +246,24 @@ export const simulationService = {
    * @param scanDirection Z-axis scan direction: 'head_to_feet' or 'feet_to_head'
    */
   getPhantom: (
-    source: 'procedural' | 'atlas' = 'procedural',
+    source: 'procedural' | 'atlas' | 'dicom' = 'procedural',
     size = 192,
     caseId = 's0001',
     scanDirection: 'head_to_feet' | 'feet_to_head' = 'head_to_feet',
+    studyId?: string | null,
+    seriesId?: string | null,
   ): Promise<PhantomResponse> =>
-    api.get<PhantomResponse>(
-      `/simulation/phantom?source=${source}&size=${size}&case_id=${caseId}&scan_direction=${scanDirection}`,
-      { timeout: 180000 },
-    ),
+    api.get<PhantomResponse>('/simulation/phantom', {
+      timeout: 180000,
+      params: {
+        source,
+        size,
+        case_id: caseId,
+        scan_direction: scanDirection,
+        ...(studyId ? { study_id: studyId } : {}),
+        ...(seriesId ? { series_id: seriesId } : {}),
+      },
+    }),
 
   /** Run CT scan parameter simulation preview for the current phantom */
   runCtParamsPreview: (request: CtParamsPreviewRequest): Promise<CtParamsPreviewResponse> =>

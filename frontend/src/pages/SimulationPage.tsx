@@ -263,7 +263,6 @@ const DEFAULT_FORM: {
 };
 
 const DEFAULT_CT_PARAMS: CtParamsPreviewParams = {
-  gantryTiltDeg: 0,
   gantryPitchDeg: 0,
   gantryYawDeg: 0,
   gantryRollDeg: 0,
@@ -372,6 +371,7 @@ export default function SimulationPage() {
   const [phantom, setPhantom] = useState<PhantomResponse | null>(null);
   const [phantomLoading, setPhantomLoading] = useState(false);
   const [phantomError, setPhantomError] = useState<string | null>(null);
+  const [ctWorkspaceSource, setCtWorkspaceSource] = useState<'atlas' | 'procedural' | 'dicom'>('atlas');
   const [phantomSize, setPhantomSize] = useState(192);
   const [loadedPhantomSize, setLoadedPhantomSize] = useState<number | null>(null);
   const [sliceIndex, setSliceIndex] = useState(0);
@@ -579,10 +579,26 @@ export default function SimulationPage() {
   const activeSliceData = ctParamsResult ? simulatedVolumeData : decodedPhantomData;
   const activeLabelData = ctParamsResult ? null : decodedLabelData;
   const totalSlices = activeVolumeShape?.[0] ?? 0;
-  const activeVolumeSourceLabel = ctParamsResult ? 'Simulated CT' : 'Atlas CT';
+  const activePreviewSource = ctParamsResult?.metadata.source ?? phantom?.metadata.source ?? 'atlas';
+  const activeVolumeSourceLabel = ctParamsResult
+    ? 'Simulated CT'
+    : activePreviewSource === 'dicom'
+      ? 'DICOM CT'
+      : activePreviewSource === 'procedural'
+        ? 'Procedural CT'
+        : 'Atlas CT';
   const activeSpacingLabel = activeVolumeSpacing
     ? activeVolumeSpacing.map((value) => value.toFixed(2)).join(' / ')
     : null;
+  const previewStats = ctParamsResult?.metadata.previewStats;
+  const originalCenterSliceStats = previewStats?.originalCenterSliceStats;
+  const simulatedCenterSliceStats = previewStats?.simulatedCenterSliceStats;
+  const ctWorkspaceSeriesList = useMemo(
+    () => seriesList.filter((series) => !series.modality || series.modality.toUpperCase() === 'CT'),
+    [seriesList],
+  );
+  const loadedWorkspaceStudyId = phantom?.metadata.studyId ?? null;
+  const loadedWorkspaceSeriesId = phantom?.metadata.seriesId ?? null;
 
   useEffect(() => {
     if (!activeVolumeShape) return;
@@ -727,6 +743,11 @@ export default function SimulationPage() {
   // -----------------------------------------------------------------------
 
   const handleGeneratePhantom = async () => {
+    if (ctWorkspaceSource === 'dicom' && !selectedSeriesId) {
+      setPhantomError('Select a DICOM CT series before loading the CT workspace.');
+      return;
+    }
+
     setPickedPosition(null);
     setPickingMode(false);
     setPhantomLoading(true);
@@ -739,10 +760,12 @@ export default function SimulationPage() {
     try {
       const size = phantomSize;
       const response = await simulationService.getPhantom(
-        'atlas',
+        ctWorkspaceSource,
         size,
         's0001',
         'head_to_feet',
+        ctWorkspaceSource === 'dicom' ? selectedStudyId : null,
+        ctWorkspaceSource === 'dicom' ? selectedSeriesId : null,
       );
       setPhantom(response);
       setLoadedPhantomSize(size);
@@ -788,7 +811,6 @@ export default function SimulationPage() {
   const handleResetCtAngles = useCallback(() => {
     setCtParams((prev) => ({
       ...prev,
-      gantryTiltDeg: 0,
       gantryPitchDeg: 0,
       gantryYawDeg: 0,
       gantryRollDeg: 0,
@@ -804,7 +826,7 @@ export default function SimulationPage() {
     }
 
     const currentSource = phantom.metadata.source ?? 'atlas';
-    if (currentSource !== 'atlas' && currentSource !== 'procedural') {
+    if (currentSource !== 'atlas' && currentSource !== 'procedural' && currentSource !== 'dicom') {
       setCtParamsError(`Unsupported source for CT parameter simulation: ${String(currentSource)}`);
       return;
     }
@@ -813,12 +835,6 @@ export default function SimulationPage() {
     const normalizedParams: CtParamsPreviewParams = {
       ...ctParams,
       ...overrideParams,
-      gantryPitchDeg:
-        overrideParams?.gantryPitchDeg
-        ?? overrideParams?.gantryTiltDeg
-        ?? ctParams.gantryPitchDeg
-        ?? ctParams.gantryTiltDeg
-        ?? 0,
       mAs: normalizedMAs,
     };
 
@@ -832,12 +848,15 @@ export default function SimulationPage() {
       const response = await simulationService.runCtParamsPreview({
         source: currentSource,
         caseId: currentSource === 'atlas' ? (phantom.metadata.caseId || 's0001') : null,
-        size: phantom.metadata.width,
+        studyId: currentSource === 'dicom' ? loadedWorkspaceStudyId : null,
+        seriesId: currentSource === 'dicom' ? loadedWorkspaceSeriesId : null,
+        size: loadedPhantomSize ?? Math.max(phantom.metadata.depth, phantom.metadata.height, phantom.metadata.width),
         scanDirection: 'head_to_feet',
         params: normalizedParams,
       });
       setCtParamsResult(response);
-      setSliceIndex(0);
+      const nextDepth = response.metadata.shape?.[0] ?? phantom.metadata.depth;
+      setSliceIndex((prev) => Math.min(prev, Math.max(nextDepth - 1, 0)));
       setPlaying(false);
     } catch (err: any) {
       console.error('[SimulationPage] CT parameter simulation failed:', err);
@@ -1650,7 +1669,7 @@ export default function SimulationPage() {
                         Axial Slice
                       </div>
                       <div className="mt-1 text-sm text-white/85">
-                        {activeVolumeShape ? `Slice ${sliceIndex + 1} / ${totalSlices}` : 'Ready for atlas load'}
+                        {activeVolumeShape ? `Slice ${sliceIndex + 1} / ${totalSlices}` : 'Ready for CT load'}
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2 text-[11px]">
@@ -1682,12 +1701,12 @@ export default function SimulationPage() {
                           <path d="M12 17v4" />
                         </svg>
                         <p className="text-sm text-white/40">
-                          Click "Generate Atlas CT" to load the real CT phantom.
+                          Load an atlas, procedural, or DICOM CT volume to start browsing.
                         </p>
                         {phantomLoading && (
                           <div className="flex items-center gap-2 text-xs text-white/50">
                             <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                            Generating phantom...
+                            Loading CT volume...
                           </div>
                         )}
                         {phantomError && (
@@ -1756,7 +1775,7 @@ export default function SimulationPage() {
                       ) : (
                         <div className="flex h-full items-center justify-center px-6 text-center">
                           <p className="max-w-xs text-sm text-white/30">
-                            Generate a phantom to view the synchronized 3D accumulation.
+                            Load a CT volume to view the synchronized 3D accumulation.
                           </p>
                         </div>
                       )}
@@ -1768,7 +1787,15 @@ export default function SimulationPage() {
                       <div className="text-[11px] uppercase tracking-[0.16em] text-white/45">Current Stack</div>
                       <div className="mt-1 text-sm font-medium text-white/85">{activeVolumeSourceLabel}</div>
                       <div className="mt-1 text-xs text-white/45">
-                        {ctParamsResult ? 'Showing the latest CT-parameter result.' : 'Showing the generated atlas phantom.'}
+                        {ctParamsResult
+                          ? 'Showing the latest CT-parameter result at the current slice.'
+                          : `Showing the loaded ${activeVolumeSourceLabel.toLowerCase()}.`}
+                        {phantom?.metadata.source === 'dicom'
+                          && selectedSeriesId
+                          && loadedWorkspaceSeriesId
+                          && selectedSeriesId !== loadedWorkspaceSeriesId
+                          ? ' Selected DICOM series has changed; reload CT volume to simulate the newly selected series.'
+                          : ''}
                       </div>
                     </div>
                     <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
@@ -1793,28 +1820,103 @@ export default function SimulationPage() {
             {/* ---- Compact toolbar ---- */}
             <div className="rounded-2xl border border-border/70 bg-card px-4 py-3 shadow-sm">
               <div className="flex flex-wrap items-center gap-4">
-              {/* Size selector */}
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground">Size:</span>
-                <select
-                  value={phantomSize}
-                  onChange={(e) => {
-                    setPhantomSize(Number(e.target.value));
-                    setCtParamsResult(null);
-                    setCtParamsError(null);
-                  }}
-                  disabled={phantomLoading}
-                  className="rounded border border-border bg-background px-2 py-1 text-xs"
-                >
-                  <option value={96}>96 Fast</option>
-                  <option value={160}>160 Balanced</option>
-                  <option value={192}>192 Detail</option>
-                  <option value={256}>256 Max</option>
-                </select>
-                <span className="text-[10px] text-muted-foreground/60">
-                  larger = clearer, slower
-                </span>
-              </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">Source:</span>
+                  {(['atlas', 'procedural', 'dicom'] as const).map((source) => (
+                    <button
+                      key={source}
+                      type="button"
+                      onClick={() => {
+                        setCtWorkspaceSource(source);
+                        setCtParamsResult(null);
+                        setCtParamsError(null);
+                        setPhantomError(null);
+                      }}
+                      className={`rounded px-2 py-1 text-xs transition-colors ${
+                        ctWorkspaceSource === source
+                          ? 'bg-primary text-primary-foreground'
+                          : 'bg-muted text-muted-foreground hover:bg-muted-foreground/20'
+                      }`}
+                      disabled={phantomLoading}
+                    >
+                      {source}
+                    </button>
+                  ))}
+                </div>
+
+                {ctWorkspaceSource === 'dicom' && (
+                  <>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground">Study:</span>
+                      <select
+                        value={selectedStudyId ?? ''}
+                        onChange={(e) => {
+                          setSelectedStudyId(e.target.value || null);
+                          setSelectedSeriesId(null);
+                          setCtParamsResult(null);
+                        }}
+                        disabled={loadingStudies || phantomLoading}
+                        className="max-w-[220px] rounded border border-border bg-background px-2 py-1 text-xs"
+                      >
+                        <option value="">{loadingStudies ? 'Loading studies...' : 'Select study'}</option>
+                        {studies.map((study) => (
+                          <option key={study.id} value={study.id}>
+                            {study.patientName || study.patientId || study.studyInstanceUid || study.id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground">Series:</span>
+                      <select
+                        value={selectedSeriesId ?? ''}
+                        onChange={(e) => {
+                          setSelectedSeriesId(e.target.value || null);
+                          setCtParamsResult(null);
+                        }}
+                        disabled={!selectedStudyId || loadingSeries || phantomLoading}
+                        className="max-w-[260px] rounded border border-border bg-background px-2 py-1 text-xs"
+                      >
+                        <option value="">
+                          {!selectedStudyId
+                            ? 'Select study first'
+                            : loadingSeries
+                              ? 'Loading series...'
+                              : 'Select CT series'}
+                        </option>
+                        {ctWorkspaceSeriesList.map((series) => (
+                          <option key={series.id} value={series.id}>
+                            {series.seriesNumber ? `#${series.seriesNumber} ` : ''}{series.seriesDescription || series.modality || series.id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </>
+                )}
+
+                {/* Size selector */}
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">Size:</span>
+                  <select
+                    value={phantomSize}
+                    onChange={(e) => {
+                      setPhantomSize(Number(e.target.value));
+                      setCtParamsResult(null);
+                      setCtParamsError(null);
+                    }}
+                    disabled={phantomLoading}
+                    className="rounded border border-border bg-background px-2 py-1 text-xs"
+                  >
+                    <option value={96}>96 Fast</option>
+                    <option value={160}>160 Balanced</option>
+                    <option value={192}>192 Detail</option>
+                    <option value={256}>256 Max</option>
+                  </select>
+                  <span className="text-[10px] text-muted-foreground/60">
+                    larger = clearer, slower
+                  </span>
+                </div>
 
               {/* Generate button */}
               <Button
@@ -1823,7 +1925,13 @@ export default function SimulationPage() {
                 onClick={handleGeneratePhantom}
                 disabled={phantomLoading}
               >
-                {phantomLoading ? 'Generating...' : 'Generate Atlas CT'}
+                {phantomLoading
+                  ? 'Loading...'
+                  : ctWorkspaceSource === 'atlas'
+                    ? 'Load Atlas CT'
+                    : ctWorkspaceSource === 'procedural'
+                      ? 'Load Procedural CT'
+                      : 'Load DICOM CT'}
               </Button>
 
               {/* Play / Pause */}
@@ -1933,7 +2041,9 @@ export default function SimulationPage() {
                   <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
                     {phantom.metadata.source === 'atlas'
                       ? `atlas · ${phantom.metadata.caseId || '—'}`
-                      : 'procedural'}
+                      : phantom.metadata.source === 'dicom'
+                        ? `dicom · ${ctParamsResult?.metadata.seriesId || loadedWorkspaceSeriesId || 'loaded series'}`
+                        : 'procedural'}
                   </span>
                 </>
               )}
@@ -1956,7 +2066,7 @@ export default function SimulationPage() {
                 <div className="border-t border-border/60 px-4 py-4">
                   <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
                     <p className="max-w-3xl text-xs text-muted-foreground">
-                      CT parameter simulation uses Real CT Atlas. Parameter changes are applied only when you click the run button. Angle controls support pitch, yaw, and roll.
+                      CT parameter simulation runs on the currently loaded CT volume. Parameter changes are applied only when you click the run button. Angle controls support pitch, yaw, and roll.
                     </p>
                     <Button
                       variant="default"
@@ -1997,12 +2107,11 @@ export default function SimulationPage() {
                         min={-30}
                         max={30}
                         step={1}
-                        value={ctParams.gantryTiltDeg}
+                        value={ctParams.gantryPitchDeg}
                         onChange={(e) =>
                           setCtParams((prev) => ({
                             ...prev,
-                            gantryTiltDeg: Number(e.target.value),
-                            gantryPitchDeg: Number(e.target.value),
+                            gantryPitchDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
                           }))
                         }
                         className="flex-1 cursor-pointer accent-primary"
@@ -2012,18 +2121,17 @@ export default function SimulationPage() {
                         min={-30}
                         max={30}
                         step={1}
-                        value={ctParams.gantryTiltDeg}
+                        value={ctParams.gantryPitchDeg}
                         onChange={(e) =>
                           setCtParams((prev) => ({
                             ...prev,
-                            gantryTiltDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
                             gantryPitchDeg: Math.max(-30, Math.min(30, Number(e.target.value) || 0)),
                           }))
                         }
                         className="w-20 rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
                       />
                       <span className="w-8 text-right text-xs text-muted-foreground">
-                        {ctParams.gantryTiltDeg}°
+                        {ctParams.gantryPitchDeg}°
                       </span>
                     </div>
                     <span className="text-[11px] text-muted-foreground/80">
@@ -2344,6 +2452,30 @@ export default function SimulationPage() {
                         </div>
                       </div>
 
+                      {originalCenterSliceStats && simulatedCenterSliceStats && (
+                        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                          <div className="rounded border border-border/70 bg-card px-3 py-2">
+                            <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Center Slice Before</div>
+                            <div className="mt-1 text-xs text-foreground">
+                              Slice {originalCenterSliceStats.sliceIndex + 1} · mean {originalCenterSliceStats.mean.toFixed(1)} HU · std {originalCenterSliceStats.std.toFixed(1)}
+                            </div>
+                            <div className="text-xs text-foreground">
+                              Min/Max: {originalCenterSliceStats.min.toFixed(1)} / {originalCenterSliceStats.max.toFixed(1)}
+                            </div>
+                          </div>
+
+                          <div className="rounded border border-border/70 bg-card px-3 py-2">
+                            <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Center Slice After</div>
+                            <div className="mt-1 text-xs text-foreground">
+                              Slice {simulatedCenterSliceStats.sliceIndex + 1} · mean {simulatedCenterSliceStats.mean.toFixed(1)} HU · std {simulatedCenterSliceStats.std.toFixed(1)}
+                            </div>
+                            <div className="text-xs text-foreground">
+                              Min/Max: {simulatedCenterSliceStats.min.toFixed(1)} / {simulatedCenterSliceStats.max.toFixed(1)}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
                       {ctParamsResult.standardizedCase && (
                         <div className="mt-3 rounded border border-border/70 bg-card px-3 py-2">
                           <div className="mb-2 flex items-center justify-between gap-3">
@@ -2368,6 +2500,7 @@ export default function SimulationPage() {
                             <div><span className="text-muted-foreground">source:</span> {ctParamsResult.standardizedCase.source}</div>
                             <div><span className="text-muted-foreground">shape:</span> {ctParamsResult.standardizedCase.volume.shape.join(' x ')}</div>
                             <div><span className="text-muted-foreground">spacing:</span> {ctParamsResult.standardizedCase.volume.spacing.join(', ')}</div>
+                            <div><span className="text-muted-foreground">spatial_reference:</span> {ctParamsResult.standardizedCase.volume.spatialReference ?? 'local_volume_space'}</div>
                             <div><span className="text-muted-foreground">hu_range:</span> {ctParamsResult.standardizedCase.volume.huRange[0].toFixed(1)} to {ctParamsResult.standardizedCase.volume.huRange[1].toFixed(1)}</div>
                             <div><span className="text-muted-foreground">slice_count:</span> {ctParamsResult.standardizedCase.volume.sliceCount}</div>
                             <div><span className="text-muted-foreground">dtype:</span> {ctParamsResult.standardizedCase.volume.dtype}</div>

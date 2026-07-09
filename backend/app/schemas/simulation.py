@@ -283,7 +283,7 @@ class CTParamsPreviewRequest(BaseModel):
     case_id: Optional[str] = "s0001"
     study_id: Optional[str] = None
     series_id: Optional[str] = None
-    size: int = Field(160, ge=64, le=192)
+    size: int = Field(160, ge=64, le=320)
     scan_direction: Literal["head_to_feet", "feet_to_head"] = "head_to_feet"
     params: CTParamsPreviewParams
 

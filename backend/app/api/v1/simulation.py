@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from PIL import Image
 
 import numpy as np
+from scipy.ndimage import zoom
 
 from app.database.session import get_db, SessionLocal
 from app.models.simulation import SimulationJob, LesionConfig, OrganConfig
@@ -47,6 +48,7 @@ from app.simulation.ct_params_simulator import simulate_ct_scan_params
 from app.simulation.phantom_generator import (
     generate_atlas_ct_phantom,
     generate_procedural_ct_phantom,
+    WINDOW_PRESETS,
 )
 from app.dicom.storage import get_storage_backend
 
@@ -362,29 +364,54 @@ def _get_cached_phantom_payload(
             scan_direction=scan_direction,
         )
 
-        response_content: Dict[str, Any] = {
-            "volume_base64": base64.b64encode(
-                np.asarray(ct_volume, dtype="<f4").tobytes()
-            ).decode("ascii"),
-            "metadata": metadata,
-            "label_base64": None,
-        }
-
-        if label_volume is not None:
-            response_content["label_base64"] = base64.b64encode(
-                np.asarray(label_volume, dtype=np.uint8).tobytes()
-            ).decode("ascii")
+        response_content = _build_workspace_volume_payload(
+            ct_volume,
+            metadata,
+            label_volume=label_volume,
+        )
 
         return response_content
 
     volume, _, metadata = generate_procedural_ct_phantom(size=size)
-    return {
+    return _build_workspace_volume_payload(volume, metadata)
+
+
+def _downsample_volume_to_max_dim(
+    volume: np.ndarray,
+    spacing: tuple[float, float, float],
+    max_dim: int,
+    *,
+    order: int = 1,
+) -> tuple[np.ndarray, tuple[float, float, float], float]:
+    """Downsample a zyx volume isotropically when it is larger than max_dim."""
+    current_max_dim = max(volume.shape)
+    if current_max_dim <= max_dim:
+        return volume.astype(np.float32, copy=False), spacing, 1.0
+
+    scale = float(max_dim) / float(current_max_dim)
+    resized = zoom(volume, (scale, scale, scale), order=order, mode="nearest")
+    new_spacing = tuple(float(axis_spacing / scale) for axis_spacing in spacing)
+    return resized.astype(np.float32, copy=False), new_spacing, scale
+
+
+def _build_workspace_volume_payload(
+    volume: np.ndarray,
+    metadata: Dict[str, Any],
+    *,
+    label_volume: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    response_content: Dict[str, Any] = {
         "volume_base64": base64.b64encode(
             np.asarray(volume, dtype="<f4").tobytes()
         ).decode("ascii"),
         "label_base64": None,
         "metadata": metadata,
     }
+    if label_volume is not None:
+        response_content["label_base64"] = base64.b64encode(
+            np.asarray(label_volume, dtype=np.uint8).tobytes()
+        ).decode("ascii")
+    return response_content
 
 
 def _build_standardized_ct_case(
@@ -428,6 +455,7 @@ def _build_standardized_ct_case(
             "body_part": body_part or "unknown",
             "image_kind": "simulated_ct",
             "image_data_field": "simulated_volume_base64",
+            "spatial_reference": metadata.get("spatial_reference", "local_volume_space"),
         },
         "simulation": {
             "type": "ct_scan_params",
@@ -1395,6 +1423,7 @@ async def preview_ct_scan_params(
             extra_metadata = {
                 "case_id": source_case_id,
                 "scan_direction": request.scan_direction,
+                "spatial_reference": "local_volume_space",
                 "phantom_metadata": {
                     "original_shape": phantom_metadata.get("original_shape"),
                     "output_shape": phantom_metadata.get("output_shape"),
@@ -1416,6 +1445,7 @@ async def preview_ct_scan_params(
             extra_metadata = {
                 "case_id": None,
                 "scan_direction": request.scan_direction,
+                "spatial_reference": "local_volume_space",
                 "phantom_metadata": {
                     "original_shape": phantom_metadata.get("original_shape"),
                     "output_shape": phantom_metadata.get("output_shape"),
@@ -1483,6 +1513,15 @@ async def preview_ct_scan_params(
             source_origin = dicom_metadata.get("origin")
             source_direction = dicom_metadata.get("direction")
             body_part = series.body_part_examined or "unknown"
+            original_shape = [int(dim) for dim in ct_volume.shape]
+            original_spacing = [float(v) for v in source_spacing]
+            ct_volume, resized_spacing, scale = _downsample_volume_to_max_dim(
+                ct_volume,
+                source_spacing,
+                request.size,
+                order=1,
+            )
+            source_spacing = resized_spacing
 
             if not series.modality:
                 standardized_notes.append(
@@ -1490,11 +1529,19 @@ async def preview_ct_scan_params(
                 )
             if source_origin is None or _normalize_origin(source_origin) == [0.0, 0.0, 0.0]:
                 standardized_notes.append(
-                    "origin defaults to [0, 0, 0] or partial z-only origin because complete DICOM patient-space origin is not fully reconstructed by the current volume builder."
+                    "origin is unavailable from the current DICOM metadata path and therefore defaults to [0, 0, 0]."
+                )
+            else:
+                standardized_notes.append(
+                    "origin is propagated from DICOM ImagePositionPatient in patient XYZ space."
                 )
             if source_direction is None or _normalize_direction(source_direction) == _identity_direction_matrix():
                 standardized_notes.append(
-                    "direction uses identity because the current volume builder does not reconstruct patient orientation from DICOM ImageOrientationPatient."
+                    "direction uses identity because DICOM ImageOrientationPatient was unavailable during volume reconstruction."
+                )
+            else:
+                standardized_notes.append(
+                    "direction is propagated from DICOM ImageOrientationPatient with volume-axis order z,y,x."
                 )
             if not series.body_part_examined:
                 standardized_notes.append(
@@ -1505,6 +1552,14 @@ async def preview_ct_scan_params(
                 "case_id": None,
                 "study_id": series.study_id,
                 "series_id": series.id,
+                "spatial_reference": dicom_metadata.get("spatial_reference", "dicom_patient_space"),
+                "phantom_metadata": {
+                    "original_shape": original_shape,
+                    "output_shape": [int(ct_volume.shape[0]), int(ct_volume.shape[1]), int(ct_volume.shape[2])],
+                    "original_spacing": original_spacing,
+                    "output_spacing": [float(v) for v in resized_spacing],
+                    "resample_scale": float(scale),
+                },
                 "dicom_metadata": {
                     "series_instance_uid": series.series_instance_uid,
                     "series_number": series.series_number,
@@ -1582,18 +1637,21 @@ async def preview_ct_scan_params(
 
 @router.get("/phantom")
 async def generate_ct_phantom(
-    source: str = Query("procedural", description="Phantom source: 'procedural' or 'atlas'"),
+    source: str = Query("procedural", description="Phantom source: 'procedural', 'atlas', or 'dicom'"),
     size: int = Query(192, ge=64, le=320, description="Volume max edge size in voxels"),
     case_id: str = Query("s0001", description="Atlas case ID (only used when source='atlas')"),
+    study_id: Optional[str] = Query(None, description="Study ID (used when source='dicom')"),
+    series_id: Optional[str] = Query(None, description="Series ID (used when source='dicom')"),
     scan_direction: str = Query(
         "head_to_feet",
         description="Z-axis scan direction: 'head_to_feet' (z=0=head/chest) or 'feet_to_head'",
     ),
+    db: Session = Depends(get_db),
 ):
     """
     Generate a CT phantom and return it as base64-encoded volume data.
 
-    Two sources are supported:
+    Three sources are supported:
 
     - **procedural** (default):
       Synthetic upper-body CT phantom built from geometric primitives
@@ -1610,22 +1668,105 @@ async def generate_ct_phantom(
       If it doesn't match `scan_direction` (default: head_to_feet), the
       volume is flipped so z=0 corresponds to the head/chest.
 
+    - **dicom**:
+      Loads a stored DICOM CT series, reconstructs the zyx volume in
+      patient space, and downsamples it to at most `size` on the longest
+      axis for workspace browsing performance.
+
     Returns:
         JSON with:
         - volumeBase64:  base64-encoded raw Float32 bytes (little-endian)
         - labelBase64:   base64-encoded raw Uint8 bytes (optional, atlas only)
         - metadata:      {width, height, depth, spacing, source, case_id?,
-                          originalShape, outputShape, originalSpacing,
+                          study_id?, series_id?, originalShape, outputShape, originalSpacing,
                           outputSpacing, scanAxis, scanDirection, flippedZ,
-                          labelNonzeroCounts?, sliceLabelPresence?,
+                          labelNonzeroCounts?, sliceLabelPresence?, origin?, direction?,
                           label_map?, windowPresets, bodyThresholdHU}
     """
     try:
-        if source not in {"atlas", "procedural"}:
+        if source not in {"atlas", "procedural", "dicom"}:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unsupported phantom source: {source}",
             )
+
+        if source == "dicom":
+            if not series_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="series_id is required when source='dicom'",
+                )
+
+            series_query = db.query(DicomSeries).filter(DicomSeries.id == series_id)
+            if study_id:
+                series_query = series_query.filter(DicomSeries.study_id == study_id)
+            series = series_query.first()
+            if not series:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Series {series_id} not found",
+                )
+            if series.modality and str(series.modality).upper() != "CT":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Series {series_id} modality '{series.modality}' is not supported for CT workspace loading",
+                )
+
+            instances = (
+                db.query(DicomInstance)
+                .filter(DicomInstance.series_id == series.id)
+                .order_by(DicomInstance.instance_number.asc().nulls_last())
+                .all()
+            )
+            if not instances:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"No DICOM instances found for series {series.id}",
+                )
+
+            storage = get_storage_backend()
+            volume, dicom_metadata = build_volume_from_dicom(storage, instances)
+            source_spacing = tuple(dicom_metadata.get("spacing", (1.0, 1.0, 1.0)))
+            original_shape = [int(dim) for dim in volume.shape]
+            original_spacing = [float(v) for v in source_spacing]
+            volume, resized_spacing, scale = _downsample_volume_to_max_dim(
+                volume,
+                source_spacing,
+                size,
+                order=1,
+            )
+
+            metadata = {
+                "width": int(volume.shape[2]),
+                "height": int(volume.shape[1]),
+                "depth": int(volume.shape[0]),
+                "spacing": [float(v) for v in resized_spacing],
+                "source": "dicom",
+                "study_id": series.study_id,
+                "series_id": series.id,
+                "series_description": series.series_description,
+                "body_part_examined": series.body_part_examined,
+                "modality": series.modality,
+                "origin": _normalize_origin(dicom_metadata.get("origin")),
+                "direction": _normalize_direction(dicom_metadata.get("direction")),
+                "spatial_reference": dicom_metadata.get("spatial_reference", "dicom_patient_space"),
+                "original_shape": original_shape,
+                "output_shape": [int(volume.shape[0]), int(volume.shape[1]), int(volume.shape[2])],
+                "original_spacing": original_spacing,
+                "output_spacing": [float(v) for v in resized_spacing],
+                "resample_scale": float(scale),
+                "window_presets": {
+                    name: {"windowLevel": float(p["window_level"]), "windowWidth": float(p["window_width"])}
+                    for name, p in WINDOW_PRESETS.items()
+                },
+                "body_threshold_hu": -500.0,
+                "description": (
+                    f"DICOM CT workspace volume from series {series.id}. "
+                    f"Loaded in patient space and resized to shape {volume.shape[0]}x{volume.shape[1]}x{volume.shape[2]} "
+                    f"for interactive browsing."
+                ),
+            }
+            return JSONResponse(content=_build_workspace_volume_payload(volume, metadata))
 
         response_content = _get_cached_phantom_payload(
             source=source,

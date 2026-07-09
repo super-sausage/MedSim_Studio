@@ -42,7 +42,7 @@ def build_volume_from_dicom(
 
     Reads each instance's pixel data via storage.get_object_bytes(),
     applies RescaleSlope / RescaleIntercept for HU conversion,
-    sorts slices by ImagePositionPatient (z-axis) or slice_location,
+    sorts slices using ImagePositionPatient / ImageOrientationPatient when available,
     and stacks into a 3D numpy array.
 
     Args:
@@ -52,7 +52,7 @@ def build_volume_from_dicom(
     Returns:
         Tuple of (volume_array, metadata_dict) where:
         - volume_array: np.ndarray of shape (z, y, x) with HU values (float32)
-        - metadata_dict: {"spacing": (z,y,x), "origin": (z,y,x), "direction": tuple}
+        - metadata_dict: {"spacing": (z,y,x), "origin": patient XYZ, "direction": tuple}
 
     Raises:
         ValueError: If no valid instances found or pixel data unreadable
@@ -60,11 +60,13 @@ def build_volume_from_dicom(
     if not instances:
         raise ValueError("No DICOM instances provided")
 
-    # Collect slices with their z-positions for sorting
-    slices: List[Tuple[float, np.ndarray]] = []
+    # Collect slices with their geometry for sorting and metadata reconstruction.
+    slices: List[Dict[str, Any]] = []
     slice_thickness: Optional[float] = None
     pixel_spacing: Optional[Tuple[float, float]] = None
     origin: Tuple[float, float, float] = DEFAULT_ORIGIN
+    row_direction: Optional[np.ndarray] = None
+    col_direction: Optional[np.ndarray] = None
 
     for inst in instances:
         if not inst.pixel_data_path:
@@ -105,10 +107,20 @@ def build_volume_from_dicom(
         if rescale_intercept is not None:
             pixel_array = pixel_array + float(rescale_intercept)
 
-        # Determine z-position for sorting
-        z_pos = _get_slice_z_position(ds, inst)
+        image_position = _extract_image_position(ds, inst)
+        image_orientation = _extract_image_orientation(ds, inst)
 
-        slices.append((z_pos, pixel_array))
+        if image_orientation is not None and row_direction is None and col_direction is None:
+            row_direction = image_orientation[:3]
+            col_direction = image_orientation[3:]
+
+        slices.append(
+            {
+                "sort_fallback": _get_slice_z_position(ds, inst),
+                "pixel_array": pixel_array,
+                "image_position": image_position,
+            }
+        )
 
         # Capture metadata from first valid slice
         if slice_thickness is None:
@@ -124,15 +136,42 @@ def build_volume_from_dicom(
     if not slices:
         raise ValueError("No valid DICOM slices could be read from storage backend")
 
-    # Sort slices by z-position
-    slices.sort(key=lambda x: x[0])
+    slice_direction: Optional[np.ndarray] = None
+    if row_direction is not None and col_direction is not None:
+        slice_direction = np.cross(row_direction, col_direction)
+        norm = float(np.linalg.norm(slice_direction))
+        if norm > 1e-6:
+            slice_direction = slice_direction / norm
+        else:
+            slice_direction = None
+
+    has_complete_image_positions = all(s["image_position"] is not None for s in slices)
+
+    if slice_direction is not None and has_complete_image_positions:
+        for slice_info in slices:
+            slice_info["sort_position"] = float(np.dot(slice_info["image_position"], slice_direction))
+        slices.sort(key=lambda s: s["sort_position"])
+    else:
+        slices.sort(key=lambda s: s["sort_fallback"])
 
     # Stack into 3D volume: shape (z, y, x)
-    volume = np.stack([s[1] for s in slices], axis=0)
+    volume = np.stack([s["pixel_array"] for s in slices], axis=0)
 
     # Compute spacing
-    if len(slices) > 1:
-        z_spacing = abs(slices[1][0] - slices[0][0])
+    slice_step_estimates: List[float] = []
+    if len(slices) > 1 and slice_direction is not None and has_complete_image_positions:
+        for prev_slice, next_slice in zip(slices[:-1], slices[1:]):
+            prev_pos = prev_slice["image_position"]
+            next_pos = next_slice["image_position"]
+            delta = next_pos - prev_pos
+            projected_step = abs(float(np.dot(delta, slice_direction)))
+            if projected_step > 1e-6:
+                slice_step_estimates.append(projected_step)
+
+    if slice_step_estimates:
+        z_spacing = float(np.median(slice_step_estimates))
+    elif len(slices) > 1:
+        z_spacing = abs(float(slices[1]["sort_fallback"]) - float(slices[0]["sort_fallback"]))
         if z_spacing < 1e-6:
             z_spacing = slice_thickness or 1.0
     else:
@@ -143,17 +182,31 @@ def build_volume_from_dicom(
 
     spacing = (z_spacing, y_spacing, x_spacing)
 
-    # Compute origin from first slice position
-    if slices:
-        origin_z = slices[0][0]
-        origin = (float(origin_z), 0.0, 0.0)
+    if slices and slices[0]["image_position"] is not None:
+        first_position = slices[0]["image_position"]
+        origin = (
+            float(first_position[0]),
+            float(first_position[1]),
+            float(first_position[2]),
+        )
+
+    if row_direction is None or col_direction is None or slice_direction is None:
+        direction = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    else:
+        # Store direction in volume-axis order (z, y, x) for this zyx array.
+        direction = (
+            float(slice_direction[0]), float(slice_direction[1]), float(slice_direction[2]),
+            float(row_direction[0]), float(row_direction[1]), float(row_direction[2]),
+            float(col_direction[0]), float(col_direction[1]), float(col_direction[2]),
+        )
 
     metadata = {
         "spacing": spacing,
         "origin": origin,
-        "direction": (1, 0, 0, 0, 1, 0, 0, 0, 1),  # identity
+        "direction": direction,
         "num_slices": len(slices),
         "source": "dicom",
+        "spatial_reference": "dicom_patient_space",
     }
 
     logger.info(
@@ -271,6 +324,51 @@ def _get_slice_z_position(ds, inst: DicomInstance) -> float:
         return float(inst.instance_number)
 
     return 0.0
+
+
+def _extract_image_position(ds, inst: DicomInstance) -> Optional[np.ndarray]:
+    """Return ImagePositionPatient as a float vector in patient XYZ space."""
+    ipp = getattr(ds, "ImagePositionPatient", None)
+    if ipp is not None:
+        try:
+            return np.array([float(ipp[0]), float(ipp[1]), float(ipp[2])], dtype=np.float64)
+        except (IndexError, TypeError, ValueError):
+            pass
+
+    if inst.image_position is not None:
+        try:
+            if isinstance(inst.image_position, (list, tuple)) and len(inst.image_position) >= 3:
+                return np.array(
+                    [
+                        float(inst.image_position[0]),
+                        float(inst.image_position[1]),
+                        float(inst.image_position[2]),
+                    ],
+                    dtype=np.float64,
+                )
+        except (IndexError, TypeError, ValueError):
+            pass
+
+    return None
+
+
+def _extract_image_orientation(ds, inst: DicomInstance) -> Optional[np.ndarray]:
+    """Return ImageOrientationPatient as six float direction cosines."""
+    iop = getattr(ds, "ImageOrientationPatient", None)
+    if iop is not None:
+        try:
+            return np.array([float(iop[idx]) for idx in range(6)], dtype=np.float64)
+        except (IndexError, TypeError, ValueError):
+            pass
+
+    if inst.image_orientation is not None:
+        try:
+            if isinstance(inst.image_orientation, (list, tuple)) and len(inst.image_orientation) >= 6:
+                return np.array([float(inst.image_orientation[idx]) for idx in range(6)], dtype=np.float64)
+        except (IndexError, TypeError, ValueError):
+            pass
+
+    return None
 
 
 def _safe_float(value, default: float = 1.0) -> float:

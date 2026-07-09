@@ -22,6 +22,13 @@ DEFAULT_MAS_BY_DOSE_LEVEL: Dict[str, int] = {
     "high": 300,
 }
 
+KVP_REFERENCE_FACTORS: Dict[int, Dict[str, float]] = {
+    80: {"mu_water": 0.0215, "contrast_gain": 1.18, "bone_hardening": 1.14},
+    100: {"mu_water": 0.0205, "contrast_gain": 1.09, "bone_hardening": 1.08},
+    120: {"mu_water": 0.0195, "contrast_gain": 1.00, "bone_hardening": 1.00},
+    140: {"mu_water": 0.0188, "contrast_gain": 0.93, "bone_hardening": 0.94},
+}
+
 
 def _center_slice_stats(volume: np.ndarray) -> Dict[str, float]:
     center_idx = int(volume.shape[0] // 2)
@@ -50,6 +57,34 @@ def _material_masks(volume: np.ndarray) -> Dict[str, np.ndarray]:
         "cancellous_bone": (volume >= 300.0) & (volume < 1000.0),
         "cortical_bone": volume >= 1000.0,
     }
+
+
+def _hu_to_relative_mu(volume: np.ndarray, kVp: int) -> np.ndarray:
+    params = KVP_REFERENCE_FACTORS[kVp]
+    mu_water = params["mu_water"]
+    rel_mu = mu_water * (1.0 + volume.astype(np.float32, copy=False) / 1000.0)
+    return np.clip(rel_mu, mu_water * 0.02, mu_water * 4.5).astype(np.float32, copy=False)
+
+
+def _projection_thickness_surrogate(mu_map: np.ndarray) -> np.ndarray:
+    centered_mu = np.clip(mu_map - float(np.percentile(mu_map, 4)), 0.0, None)
+    proj_y = gaussian_filter(np.sum(centered_mu, axis=1), sigma=(0.45, 0.9), mode="nearest")
+    proj_x = gaussian_filter(np.sum(centered_mu, axis=2), sigma=(0.45, 0.9), mode="nearest")
+
+    proj_y_norm = proj_y / max(float(np.percentile(proj_y, 99.0)), 1e-6)
+    proj_x_norm = proj_x / max(float(np.percentile(proj_x, 99.0)), 1e-6)
+
+    backproj_y = np.repeat(proj_y_norm[:, None, :], mu_map.shape[1], axis=1)
+    backproj_x = np.repeat(proj_x_norm[:, :, None], mu_map.shape[2], axis=2)
+    return (0.55 * backproj_y + 0.45 * backproj_x).astype(np.float32, copy=False)
+
+
+def _normalized_radial_map(shape: tuple[int, int, int]) -> np.ndarray:
+    _, ny, nx = shape
+    yy = np.linspace(-1.0, 1.0, ny, dtype=np.float32)[None, :, None]
+    xx = np.linspace(-1.0, 1.0, nx, dtype=np.float32)[None, None, :]
+    radial = np.sqrt(xx * xx + yy * yy)
+    return np.clip(radial, 0.0, 1.6).astype(np.float32, copy=False)
 
 
 def _resolve_params(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -287,15 +322,29 @@ def _apply_dose_noise(
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     reference_mas = 150.0
     actual_mas = max(float(resolved_params["mAs"]), 1.0)
-    base_sigma = 12.0 * np.sqrt(reference_mas / actual_mas)
-
     dose_level = resolved_params["dose_level"]
-    level_scale = {"low": 1.2, "standard": 1.0, "high": 0.85}[dose_level]
-    pitch_scale = float(np.sqrt(max(float(resolved_params["pitch"]), 0.1)))
+    level_scale = {"low": 0.72, "standard": 1.0, "high": 1.35}[dose_level]
+    pitch_scale = float(1.0 / np.sqrt(max(float(resolved_params["pitch"]), 0.1)))
     slice_thickness_scale = float(
-        np.sqrt(5.0 / max(float(resolved_params["slice_thickness_mm"]), 0.625))
+        np.sqrt(max(float(resolved_params["slice_thickness_mm"]), 0.625) / 5.0)
     )
-    sigma = base_sigma * level_scale * pitch_scale * slice_thickness_scale
+    kvp = int(resolved_params["kVp"])
+
+    effective_mas = actual_mas * level_scale * pitch_scale * slice_thickness_scale
+    photon_flux = max(22000.0 * (effective_mas / reference_mas) * (kvp / 120.0) ** 1.35, 2500.0)
+
+    mu_map = _hu_to_relative_mu(volume, kvp)
+    attenuation_proxy = _projection_thickness_surrogate(mu_map)
+    radial = _normalized_radial_map(volume.shape)
+    bowtie_fluence = np.clip(1.08 - 0.26 * radial * radial, 0.68, 1.12).astype(np.float32)
+
+    transmission = np.exp(-1.55 * attenuation_proxy).astype(np.float32)
+    expected_counts = np.clip(photon_flux * bowtie_fluence * transmission, 3.0, None).astype(np.float32)
+    noisy_counts = rng.poisson(expected_counts).astype(np.float32)
+    log_noise = np.log(expected_counts + 1.0) - np.log(noisy_counts + 1.0)
+
+    base_sigma = 13.5 * np.sqrt(reference_mas / max(effective_mas, 1.0))
+    sigma = base_sigma
 
     materials = _material_masks(volume)
     body_mask = ~materials["air"]
@@ -306,15 +355,31 @@ def _apply_dose_noise(
     sigma_map[materials["cancellous_bone"]] = sigma * 1.18
     sigma_map[materials["cortical_bone"]] = sigma * 1.28
 
-    # Blend fine-grain and correlated noise so low-dose images look less synthetic.
+    # Convert projection-domain log noise back into HU-like fluctuations.
+    projection_noise = (
+        log_noise
+        * sigma_map
+        * (0.85 + 0.25 * attenuation_proxy)
+    ).astype(np.float32, copy=False)
+
+    # Blend fine-grain and correlated detector/electronic noise so low-dose images look less synthetic.
     white_noise = rng.normal(0.0, 1.0, size=volume.shape).astype(np.float32)
     correlated_noise = gaussian_filter(
         rng.normal(0.0, 1.0, size=volume.shape).astype(np.float32),
         sigma=(0.25, 0.55, 0.55),
         mode="nearest",
     )
-    noise = sigma_map * (0.78 * white_noise + 0.22 * correlated_noise)
-    noisy = volume + noise
+    dense_structure_mask = (materials["cancellous_bone"] | materials["cortical_bone"]).astype(np.float32)
+    nz = volume.shape[0]
+    nx = volume.shape[2]
+    streak_seed = gaussian_filter(
+        rng.normal(0.0, 1.0, size=(nz, nx)).astype(np.float32),
+        sigma=(0.75, 1.4),
+        mode="nearest",
+    )[:, None, :]
+    streaks = streak_seed * gaussian_filter(dense_structure_mask, sigma=(0.0, 1.2, 0.0), mode="nearest")
+    detector_noise = sigma_map * (0.48 * white_noise + 0.16 * correlated_noise + 0.08 * streaks)
+    noisy = volume + projection_noise + detector_noise
 
     return noisy.astype(np.float32, copy=False), {
         "noise_sigma_hu": float(sigma),
@@ -324,7 +389,13 @@ def _apply_dose_noise(
         "dose_level_scale": float(level_scale),
         "pitch_noise_scale": float(pitch_scale),
         "slice_thickness_noise_scale": float(slice_thickness_scale),
-        "noise_model": "heteroscedastic_correlated_gaussian",
+        "effective_mAs": float(effective_mas),
+        "photon_flux_reference": float(photon_flux),
+        "bowtie_fluence_range": [
+            float(np.min(bowtie_fluence)),
+            float(np.max(bowtie_fluence)),
+        ],
+        "noise_model": "projection_domain_poisson_plus_detector_noise",
     }
 
 
@@ -334,6 +405,7 @@ def _apply_kvp_transform(
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     materials = _material_masks(volume)
     transformed = volume.copy()
+    params = KVP_REFERENCE_FACTORS[kVp]
 
     material_scales = {
         80: {
@@ -377,9 +449,40 @@ def _apply_kvp_transform(
             continue
         transformed[mask] = water_reference + (transformed[mask] - water_reference) * scale
 
+    # Approximate beam-hardening / spectral response with smooth nonlinear terms.
+    positive_hu = np.clip(transformed, 0.0, None)
+    dense_bone_mask = materials["cancellous_bone"] | materials["cortical_bone"]
+    transformed[dense_bone_mask] += (
+        np.power(np.clip(positive_hu[dense_bone_mask] / 1000.0, 0.0, 2.5), 1.15)
+        * 55.0
+        * (params["bone_hardening"] - 1.0)
+    )
+
+    vascular_mask = materials["vascular"]
+    if np.any(vascular_mask):
+        vascular_base = np.clip((positive_hu[vascular_mask] - 80.0) / 180.0, 0.0, 2.5)
+        transformed[vascular_mask] += (
+            np.power(vascular_base, 1.12)
+            * 42.0
+            * (params["contrast_gain"] - 1.0)
+        )
+
+    soft_mask = materials["soft"]
+    if np.any(soft_mask):
+        soft_base = np.clip((transformed[soft_mask] + 30.0) / 170.0, 0.0, 2.0)
+        transformed[soft_mask] += (
+            (soft_base - 0.5)
+            * 14.0
+            * (params["contrast_gain"] - 1.0)
+        )
+
+    edge_component = transformed - gaussian_filter(transformed, sigma=(0.0, 0.55, 0.55), mode="nearest")
+    transformed = transformed + edge_component * (params["contrast_gain"] - 1.0) * 0.12
+
     return transformed.astype(np.float32, copy=False), {
         "material_scales": {key: float(value) for key, value in material_scales.items()},
-        "kvp_model": "piecewise_material_hu_remap",
+        "mu_water_cm_inv": float(params["mu_water"]),
+        "kvp_model": "piecewise_material_hu_remap_plus_beam_hardening",
         "iodine_like_boost_applied": bool(kVp < 120),
         "vascular_contrast_scale": float(material_scales["vascular"]),
     }
@@ -393,22 +496,37 @@ def _apply_pitch_effect(
         return volume, {
             "z_sigma_voxels": 0.0,
             "artifact_amplitude_hu": 0.0,
+            "helical_blend_alpha": 0.0,
             "pitch_model": "identity",
         }
 
     sigma_voxels = (pitch - 1.0) * 0.8
     degraded = gaussian_filter1d(volume, sigma=sigma_voxels, axis=0, mode="nearest")
-    artifact_amplitude = min((pitch - 1.0) * 6.0, 4.0)
+    helical_blend_alpha = min((pitch - 1.0) * 0.34, 0.22)
+    if helical_blend_alpha > 0.0 and degraded.shape[0] > 3:
+        shifted_up = np.roll(degraded, -1, axis=0)
+        shifted_down = np.roll(degraded, 1, axis=0)
+        z_phase = np.linspace(0.0, 2.0 * np.pi, degraded.shape[0], dtype=np.float32)[:, None, None]
+        x_phase = np.linspace(0.0, 2.0 * np.pi * pitch, degraded.shape[2], dtype=np.float32)[None, None, :]
+        interpolation_mix = 0.5 + 0.5 * np.sin(z_phase + x_phase)
+        helical_interp = interpolation_mix * shifted_up + (1.0 - interpolation_mix) * shifted_down
+        degraded = degraded * (1.0 - helical_blend_alpha) + helical_interp * helical_blend_alpha
+
+    artifact_amplitude = min((pitch - 1.0) * 7.5, 6.5)
     if artifact_amplitude > 0.0 and degraded.shape[0] > 3:
-        z = np.linspace(0.0, 2.0 * np.pi, degraded.shape[0], dtype=np.float32)
-        ripple = np.sin(z * (1.0 + pitch * 0.35)).astype(np.float32)[:, None, None]
+        z = np.linspace(0.0, 2.0 * np.pi, degraded.shape[0], dtype=np.float32)[:, None, None]
+        x = np.linspace(0.0, 2.0 * np.pi * (0.55 + pitch * 0.25), degraded.shape[2], dtype=np.float32)[None, None, :]
+        ripple = np.sin(z * (1.0 + pitch * 0.35) + x)
+        z_gradient = np.gradient(degraded, axis=0).astype(np.float32, copy=False)
         body_mask = (degraded > -850.0).astype(np.float32)
-        degraded = degraded + ripple * body_mask * artifact_amplitude
+        artifact = ripple * body_mask * np.tanh(z_gradient / 110.0) * artifact_amplitude
+        degraded = degraded + artifact
 
     return degraded.astype(np.float32, copy=False), {
         "z_sigma_voxels": float(sigma_voxels),
         "artifact_amplitude_hu": float(artifact_amplitude),
-        "pitch_model": "z_blur_plus_interpolation_ripple",
+        "helical_blend_alpha": float(helical_blend_alpha),
+        "pitch_model": "helical_interpolation_blur_plus_windmill_artifact",
     }
 
 
@@ -460,6 +578,7 @@ def _apply_fov_effect(
         }
 
     zoom_factor = reference_fov / max(fov_mm, 1.0)
+    radial = _normalized_radial_map(volume.shape)
     if zoom_factor > 1.0:
         scaled = _resize_xy(volume, zoom_factor, order=1)
         result = _crop_or_pad_to_shape(scaled, (ny, nx))
@@ -473,6 +592,20 @@ def _apply_fov_effect(
         scaled = _resize_xy(volume, zoom_factor, order=1)
         result = _crop_or_pad_to_shape(scaled, (ny, nx))
         mode = "pad_and_resize"
+
+    fov_ratio = float(fov_mm / max(reference_fov, 1.0))
+    if fov_ratio < 1.0:
+        cupping_strength = min((1.0 - fov_ratio) * 28.0, 18.0)
+        peripheral_boost = np.power(np.clip(radial, 0.0, 1.0), 1.8).astype(np.float32)
+        body_mask = (result > -850.0).astype(np.float32)
+        result = result - body_mask * (1.0 - peripheral_boost) * cupping_strength
+
+        truncation_strength = min((1.0 - fov_ratio) * 14.0, 10.0)
+        edge_band = np.clip((radial - 0.72) / 0.28, 0.0, 1.0)
+        result = result + body_mask * edge_band * truncation_strength
+    else:
+        cupping_strength = 0.0
+        truncation_strength = 0.0
 
     label_result = label_volume
     if label_volume is not None:
@@ -488,6 +621,8 @@ def _apply_fov_effect(
         "mode": mode,
         "reference_fov_mm": float(reference_fov),
         "applied_zoom_factor": float(zoom_factor),
+        "cupping_strength_hu": float(cupping_strength),
+        "truncation_edge_boost_hu": float(truncation_strength),
     }
 
 
@@ -495,11 +630,28 @@ def _apply_matrix_effect(
     volume: np.ndarray,
     matrix_size: int,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
-    if matrix_size >= 512:
+    if matrix_size > 512:
+        # Higher display matrix at fixed FOV should look slightly crisper and less pixel-limited,
+        # even though this preview cannot invent true detector-domain information.
+        upscale_factor = matrix_size / 512.0
+        base_sigma = max((upscale_factor - 1.0) * 0.12, 0.0)
+        denoised = gaussian_filter(volume, sigma=(0.0, base_sigma, base_sigma), mode="nearest")
+        detail = volume - gaussian_filter(volume, sigma=(0.0, 0.4, 0.4), mode="nearest")
+        enhanced = denoised + min((upscale_factor - 1.0) * 0.18, 0.16) * detail
+        enhanced = _clipped_float32(enhanced)
+        return enhanced, {
+            "downsample_factor": 1.0,
+            "effective_matrix_size": int(matrix_size),
+            "matrix_model": "high_matrix_edge_enhancement",
+            "upscale_factor_reference": float(upscale_factor),
+            "edge_boost_amount": float(min((upscale_factor - 1.0) * 0.18, 0.16)),
+        }
+
+    if matrix_size == 512:
         return volume, {
             "downsample_factor": 1.0,
             "effective_matrix_size": int(matrix_size),
-            "matrix_model": "identity",
+            "matrix_model": "reference_512_identity",
         }
 
     scale = matrix_size / 512.0
@@ -530,20 +682,30 @@ def _apply_kernel_effect(
     volume: np.ndarray,
     kernel: str,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
+    radial = _normalized_radial_map(volume.shape)
+    body_mask = (volume > -850.0).astype(np.float32)
+    ring_phase = np.sin(radial * 34.0 + np.linspace(0.0, 2.0 * np.pi, volume.shape[0], dtype=np.float32)[:, None, None])
+
     if kernel in ("smooth", "soft"):
         sigma = 1.1 if kernel == "smooth" else 0.8
         filtered = gaussian_filter(volume, sigma=(0.0, sigma, sigma), mode="nearest")
+        ring_artifact = body_mask * ring_phase * (1.4 if kernel == "smooth" else 0.8)
+        filtered = filtered + ring_artifact
         return filtered.astype(np.float32, copy=False), {
-            "mode": "gaussian_blur",
+            "mode": "gaussian_blur_plus_ring_artifact",
             "sigma_xy": float(sigma),
+            "ring_artifact_hu": float(1.4 if kernel == "smooth" else 0.8),
             "kernel_family": "soft_tissue",
         }
 
     if kernel == "standard":
         filtered = gaussian_filter(volume, sigma=(0.0, 0.45, 0.45), mode="nearest")
+        ring_artifact = body_mask * ring_phase * 0.4
+        filtered = filtered + ring_artifact
         return filtered.astype(np.float32, copy=False), {
-            "mode": "mild_blur",
+            "mode": "mild_blur_plus_faint_ring_artifact",
             "sigma_xy": 0.45,
+            "ring_artifact_hu": 0.4,
             "kernel_family": "balanced",
         }
 
@@ -552,10 +714,17 @@ def _apply_kernel_effect(
         sharpened = volume + 0.55 * (volume - blurred)
         high_freq = volume - gaussian_filter(volume, sigma=(0.0, 0.25, 0.25), mode="nearest")
         sharpened = sharpened + 0.08 * high_freq
+        granular_noise = gaussian_filter(
+            np.random.default_rng(17).normal(0.0, 1.0, size=volume.shape).astype(np.float32),
+            sigma=(0.0, 0.35, 0.35),
+            mode="nearest",
+        )
+        sharpened = sharpened + body_mask * granular_noise * 2.4
         return _clipped_float32(sharpened), {
-            "mode": "unsharp_mask",
+            "mode": "unsharp_mask_plus_high_frequency_texture",
             "amount": 0.55,
             "pre_blur_sigma_xy": 0.5,
+            "texture_noise_hu": 2.4,
             "kernel_family": "lung",
         }
 
@@ -564,11 +733,15 @@ def _apply_kernel_effect(
         sharpened = volume + 0.9 * (volume - blurred)
         if kernel == "sharp":
             sharpened = sharpened - 0.08 * laplace(blurred, mode="nearest")
+        edge_mask = np.clip((radial - 0.64) / 0.36, 0.0, 1.0) * body_mask
+        ring_boost = ring_phase * edge_mask * (1.8 if kernel == "sharp" else 1.2)
+        sharpened = sharpened + ring_boost
         return _clipped_float32(sharpened), {
-            "mode": "strong_unsharp_mask",
+            "mode": "strong_unsharp_mask_plus_edge_ringing",
             "amount": 0.9,
             "pre_blur_sigma_xy": 0.7,
             "laplacian_boost": bool(kernel == "sharp"),
+            "edge_ringing_hu": float(1.8 if kernel == "sharp" else 1.2),
             "kernel_family": "high_resolution",
         }
 
@@ -609,6 +782,7 @@ def _apply_contrast_phase(
         return volume, {"mode": "identity", "used_label_volume": bool(label_volume is not None)}
 
     result = volume.copy()
+    baseline = volume.copy()
     phase_deltas = {
         "arterial": {
             9: 14.0,   # liver
@@ -666,6 +840,32 @@ def _apply_contrast_phase(
         result[organ_rich_mask] += phase_deltas["generic_soft"] * 0.35
         result[vascular_mask] += phase_deltas["generic_vascular"]
 
+    vascular_emphasis = {
+        "arterial": 1.0,
+        "venous": 0.7,
+        "delayed": 0.35,
+    }[contrast_phase]
+    washout_strength = {
+        "arterial": 0.12,
+        "venous": 0.18,
+        "delayed": 0.28,
+    }[contrast_phase]
+
+    vascular_component = np.clip(baseline - 110.0, 0.0, 220.0) / 220.0
+    organ_component = np.clip(baseline - 35.0, 0.0, 95.0) / 95.0
+    delayed_component = gaussian_filter(organ_component.astype(np.float32), sigma=(0.7, 1.0, 1.0), mode="nearest")
+
+    result += vascular_component.astype(np.float32) * 18.0 * vascular_emphasis
+    if contrast_phase == "delayed":
+        result += delayed_component.astype(np.float32) * 9.0
+        result -= vascular_component.astype(np.float32) * 8.0
+    elif contrast_phase == "venous":
+        result += delayed_component.astype(np.float32) * 3.0
+
+    # Approximate venous/delayed washout in strongly enhanced voxels.
+    enhancement = np.clip(result - baseline, 0.0, None)
+    result -= enhancement * washout_strength * np.clip(vascular_component + 0.2, 0.0, 1.2)
+
     # Mild phase-specific smoothing prevents enhancement from looking like simple voxel-wise brightening.
     phase_blend_sigma = {
         "arterial": 0.35,
@@ -679,7 +879,9 @@ def _apply_contrast_phase(
         "mode": "empirical_hu_boost",
         "used_label_volume": bool(label_based),
         "phase": contrast_phase,
-        "phase_model": "organ_weighted_empirical_enhancement",
+        "vascular_emphasis": float(vascular_emphasis),
+        "washout_strength": float(washout_strength),
+        "phase_model": "organ_weighted_empirical_enhancement_with_washin_washout",
     }
 
 
@@ -768,10 +970,11 @@ def simulate_ct_scan_params(
     approximation_notes = [
         "Image-domain approximation only; not a physics-based CT forward model.",
         "Gantry pitch/yaw/roll use spacing-aware 3D affine resampling in image space.",
-        "Dose and mAs use Gaussian noise scaling rather than quantum noise reconstruction.",
-        "kVp effect uses HU contrast remapping, not spectrum-dependent attenuation.",
-        "Pitch, slice thickness, FOV, and matrix effects are approximated with resampling and smoothing.",
-        "Contrast phase enhancement is empirical and may use coarse organ labels when available.",
+        "Dose and mAs use projection-inspired Poisson/log-count noise plus detector noise, not full reconstruction.",
+        "kVp effect uses material remapping plus empirical beam-hardening response, not spectrum-resolved attenuation.",
+        "Pitch, slice thickness, FOV, and matrix effects are approximated with helical interpolation, cupping/truncation effects, resampling, and smoothing.",
+        "1024 matrix uses a mild high-resolution edge model, not true detector-domain super-resolution.",
+        "Kernel and contrast-phase behavior remain empirical, with added texture/ringing and wash-in/washout trends.",
     ]
 
     standardized_output_notes = [
