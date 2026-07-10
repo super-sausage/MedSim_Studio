@@ -84,6 +84,54 @@ function formatOrganLabelName(name: string): string {
 //    visible range: [WL - WW/2,  WL + WW/2]
 // ---------------------------------------------------------------------------
 
+interface SlicePositionIndicatorProps {
+  sliceIndex: number;
+  scanStartIndex: number;
+  scanEndIndex: number;
+}
+
+/** Compact shoulder-to-waist guide for relating the axial image to its scan height. */
+function SlicePositionIndicator({
+  sliceIndex,
+  scanStartIndex,
+  scanEndIndex,
+}: SlicePositionIndicatorProps) {
+  const scanSpan = Math.max(scanEndIndex - scanStartIndex, 1);
+  const progress = Math.max(0, Math.min(1, (sliceIndex - scanStartIndex) / scanSpan));
+  const lineY = 38 + progress * 100;
+
+  return (
+    <div
+      className="pointer-events-none absolute right-3 top-3 z-10 rounded-xl border border-white/10 bg-slate-950/85 px-2.5 py-2 shadow-lg backdrop-blur-sm"
+      aria-label={`Current axial slice ${sliceIndex + 1}`}
+    >
+      <div className="mb-1 text-center text-[9px] font-medium uppercase tracking-[0.16em] text-slate-300/65">
+        Slice position
+      </div>
+      <svg viewBox="0 0 88 160" className="h-36 w-[78px]" role="img" aria-hidden="true">
+        <defs>
+          <linearGradient id="torso-guide-fill" x1="0" x2="1" y1="0" y2="1">
+            <stop offset="0" stopColor="#dbeafe" stopOpacity="0.9" />
+            <stop offset="1" stopColor="#67e8f9" stopOpacity="0.55" />
+          </linearGradient>
+        </defs>
+        <path
+          d="M26 30c-8 1-14 7-17 16l-5 19 13 4 7-15 3 28c1 12 4 25 8 38l-3 23h22l-3-23c4-13 7-26 8-38l3-28 7 15 13-4-5-19c-3-9-9-15-17-16l-10 4H36l-10-4Z"
+          fill="url(#torso-guide-fill)"
+        />
+        <path d="M44 36v82M28 80h32" fill="none" stroke="#0f172a" strokeOpacity="0.28" strokeWidth="1" />
+        <path d="M29 143h30" fill="none" stroke="#a5f3fc" strokeLinecap="round" strokeWidth="3" />
+        <text x="44" y="20" textAnchor="middle" fill="#cbd5e1" fontSize="8">SHOULDERS</text>
+        <text x="44" y="156" textAnchor="middle" fill="#cbd5e1" fontSize="8">WAIST</text>
+        <line x1="8" y1={lineY} x2="80" y2={lineY} stroke="#fb7185" strokeWidth="2.5" />
+        <circle cx="8" cy={lineY} r="2.5" fill="#fb7185" />
+        <circle cx="80" cy={lineY} r="2.5" fill="#fb7185" />
+      </svg>
+      <div className="mt-0.5 text-center text-[10px] tabular-nums text-rose-200/90">#{sliceIndex + 1}</div>
+    </div>
+  );
+}
+
 function applyWindowLevel(
   hu: number,
   windowLevel: number,
