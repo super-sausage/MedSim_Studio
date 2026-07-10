@@ -1,5 +1,188 @@
 # MedSim Studio Codex Project Context
 
+## Update 2026-07-10
+
+This section captures the latest `LUNG1` integration and CT workspace / visualization changes completed on 2026-07-10, including the follow-up scan-order fixes made later the same day.
+
+Latest local commit:
+
+- `3d3a1ce` - `Unify LUNG1 workspace flow and refine CT visualization`
+
+Important state:
+
+- this commit exists locally only
+- it has been committed but not pushed
+- the user plans to continue in a new conversation from this state
+
+### What Was Changed
+
+#### 1. Lung-first data unification
+
+- atlas/workspace defaults were switched from legacy `s0001` to `LUNG1-001`
+- available atlas cases now prioritize:
+  - `LUNG1-001`
+  - `LUNG1-002`
+  - `LUNG1-003`
+  - legacy `s0001`
+- `LUNG1-*` atlas loading now reads local sample DICOM data from:
+  - `data/lung_lobe_samples`
+
+Relevant files:
+
+- `backend/app/simulation/phantom_generator.py`
+- `backend/app/api/v1/simulation.py`
+- `backend/app/schemas/simulation.py`
+- `frontend/src/pages/SimulationPage.tsx`
+- `frontend/src/services/simulationService.ts`
+- `frontend/src/types/simulation.ts`
+
+#### 2. nnUNet lung-lobe label remapping
+
+- the `nnunet_lung_lobe` output is now remapped into the shared upper-body label ID space
+- raw lung-lobe labels `1..5` were mapped into atlas-aligned IDs:
+  - `1 -> 13` left lung upper lobe
+  - `2 -> 10` left lung lower lobe
+  - `3 -> 14` right lung upper lobe
+  - `4 -> 12` right lung middle lobe
+  - `5 -> 11` right lung lower lobe
+
+Relevant files:
+
+- `backend/app/ai/nnunet_lung_lobe/labels.py`
+- `backend/app/ai/nnunet_lung_lobe/__init__.py`
+- `backend/app/segmentation/ai/pipeline.py`
+
+#### 3. Pick/world-position alignment chain
+
+- the simulation page now stores both voxel pick position and centered world-mm position
+- when the active volume changes, the same picked world point is reprojected back into the current volume
+- this was added so the chain:
+  - load CT
+  - pick position
+  - run CT parameter simulation
+  - show same physical location
+  works more reliably
+
+Relevant files:
+
+- `frontend/src/pages/SimulationPage.tsx`
+- `frontend/src/services/simulationService.ts`
+- `backend/app/simulation/phantom_generator.py`
+- `backend/app/api/v1/simulation.py`
+
+#### 4. Current 3D visualization direction
+
+The user clarified the intended visualization goal:
+
+- bottom layer must be the original CT rendering
+- segmentation should only be a color overlay
+- `LUNG1` original CT is not "only lung lobes"
+- current useful path is:
+  - `LUNG1 original CT`
+  - plus `nnUNet` lung-lobe segmentation color overlay
+
+What the code currently does:
+
+- 3D view defaults to full-volume display
+- `Slice Sync` remains optional and disabled by default
+- organ/lung overlay colors were lightened
+- default segmentation overlay opacity was reduced to `0.045`
+- 3D default no longer forces the prior scan-style view by default
+
+Relevant files:
+
+- `frontend/src/pages/SimulationPage.tsx`
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+#### 5. CT browse / accumulation direction follow-up
+
+After the earlier `LUNG1` visualization pass, the user reported that the browsing / accumulation direction still felt wrong for CT usage.
+
+What was changed in the follow-up fix:
+
+- the axial slice browser no longer always starts from raw `slice 0`
+- the page now auto-detects the first and last "informative" body slices using the CT body threshold
+- initial slice position now jumps to the topmost meaningful body slice instead of potentially showing empty or misleading superior padding
+- slice playback now runs only across the informative body range rather than across the whole raw z extent
+- the right-side 3D accumulated CT view now enables slice-sync by default
+- the right-side 3D view now defaults to scan-view mode so the visible accumulation direction reads as `head/neck -> ribcage`
+
+Practical outcome:
+
+- left-side browsing now starts closer to the neck / upper chest instead of feeling like it begins from the middle of the body
+- right-side 3D volume now visibly accumulates by default instead of staying in full-volume mode
+- the intended visual direction is now:
+  - neck / upper chest first
+  - then downward toward ribcage / lower chest
+
+Relevant files:
+
+- `frontend/src/pages/SimulationPage.tsx`
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+### What The User Explicitly Rejected
+
+These directions were tried and should not be treated as final desired behavior:
+
+- making the 3D default into a mandatory "CT loading / accumulation" mode
+- replacing the CT-like appearance with a shell-like organ presentation
+- making the overlay too dark or too opaque
+- showing a view that feels like only lower-rib / lower-chest content is visible
+
+The user said the "CT loading" default change was bad and wanted the prior accepted version restored.
+
+### Current Known Issues / Open Questions
+
+#### 1. LUNG1 DICOM z ordering may still need deeper validation
+
+The frontend browse / accumulation behavior was adjusted so the page now behaves more like a CT scan from neck to ribcage, but the deeper source-of-truth question is not fully closed yet.
+
+What is improved:
+
+- frontend start slice selection is now body-aware
+- 3D accumulation is now on by default
+- 3D scan-view orientation was adjusted to better match the requested visual direction
+
+What may still need future validation:
+
+- whether the source DICOM series ordering itself is always anatomically correct for all real studies
+- whether `_normalize_dicom_scan_direction(...)` and the `LUNG1-*` lung-sample loader make the correct flip decision for every dataset
+- whether some remaining cases are really data-order issues rather than only camera / clipping perception issues
+
+#### 2. LUNG1 atlas path still does not provide a full organ label map
+
+- current `LUNG1-*` metadata uses `label_map: {}`
+- therefore the true useful segmentation overlay for `LUNG1` should come from model output, especially `nnunet_lung_lobe`
+- if future work wants visible lung-lobe overlay in the workspace automatically, the next step is likely to connect workspace loading with segmentation inference or cached segmentation results
+
+#### 3. Visualization target is now narrower and clearer
+
+The correct target for the next conversation is not "full-body multi-organ atlas style rendering".
+
+The correct target is:
+
+- keep `LUNG1` original CT visible as the main 3D body
+- overlay segmentation colors lightly
+- for now the segmentation of interest is mainly lung-lobe segmentation from `nnUNet`
+
+### Validation Already Run
+
+- `npx tsc --noEmit` passed multiple times during the frontend visualization adjustments
+- backend Python compile checks had already passed during the earlier `LUNG1` integration pass
+- `npx tsc --noEmit` also passed after the follow-up slice-range / 3D scan-direction fixes
+
+### Current Files Most Relevant For The Next Conversation
+
+- `CODEX_PROJECT_CONTEXT.md`
+- `backend/app/simulation/phantom_generator.py`
+- `backend/app/api/v1/simulation.py`
+- `backend/app/ai/nnunet_lung_lobe/labels.py`
+- `backend/app/segmentation/ai/pipeline.py`
+- `frontend/src/pages/SimulationPage.tsx`
+- `frontend/src/services/simulationService.ts`
+- `frontend/src/types/simulation.ts`
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
 ## Current Status
 
 This context file reflects the latest CT simulation, layout, Docker, and performance work completed in `D:\0proj\MedSim_Studio-dev` as of 2026-07-09.
@@ -15,6 +198,13 @@ The current simulation page is a simplified single-workspace CT page:
 - left: one main axial CT slice
 - right: one synchronized 3D accumulated body view
 - below: collapsible CT parameter controls
+
+Current browse / accumulation behavior:
+
+- left-side slice browsing starts at the first informative upper-body slice rather than blindly at raw z index `0`
+- autoplay advances through the informative body slice range only
+- right-side 3D CT accumulation is enabled by default
+- right-side 3D scan view is oriented to read as `head/neck -> ribcage`
 
 The current CT parameter simulation still supports manual execution only:
 

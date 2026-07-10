@@ -191,6 +191,49 @@ function centeredWorldMmToVoxel(
   ];
 }
 
+function findInformativeSliceRange(
+  volumeData: Float32Array,
+  shape: [number, number, number],
+  bodyThresholdHU = -500,
+): { startIndex: number; endIndex: number } {
+  const [depth, height, width] = shape;
+  const sliceSize = width * height;
+  const minBodyPixels = Math.max(32, Math.floor(sliceSize * 0.005));
+  let startIndex = 0;
+  let endIndex = Math.max(depth - 1, 0);
+
+  for (let z = 0; z < depth; z++) {
+    const offset = z * sliceSize;
+    let bodyPixels = 0;
+    for (let i = 0; i < sliceSize; i++) {
+      if (volumeData[offset + i] >= bodyThresholdHU) {
+        bodyPixels += 1;
+        if (bodyPixels >= minBodyPixels) {
+          startIndex = z;
+          z = depth;
+          break;
+        }
+      }
+    }
+  }
+
+  for (let z = depth - 1; z >= startIndex; z--) {
+    const offset = z * sliceSize;
+    let bodyPixels = 0;
+    for (let i = 0; i < sliceSize; i++) {
+      if (volumeData[offset + i] >= bodyThresholdHU) {
+        bodyPixels += 1;
+        if (bodyPixels >= minBodyPixels) {
+          endIndex = z;
+          return { startIndex, endIndex };
+        }
+      }
+    }
+  }
+
+  return { startIndex: 0, endIndex: Math.max(depth - 1, 0) };
+}
+
 function renderVolumeSliceToCanvas({
   canvas,
   width,
@@ -442,7 +485,7 @@ export default function SimulationPage() {
   const [sliceIndex, setSliceIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [playSpeed, setPlaySpeed] = useState(10); // slices per second
-  const [sync3DToSlice, setSync3DToSlice] = useState(false);
+  const [sync3DToSlice, setSync3DToSlice] = useState(true);
   const [activePreset, setActivePreset] = useState<WindowPreset>(WINDOW_PRESETS[0]);
   const [showLabelOverlay, setShowLabelOverlay] = useState(true);
   const [pickingMode, setPickingMode] = useState(false);
@@ -489,14 +532,6 @@ export default function SimulationPage() {
   // ---- Refs ----
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const playTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // ---- Reset slice index to 0 when a new phantom is loaded ----
-  useEffect(() => {
-    if (phantom) {
-      setSliceIndex(0);
-      setPlaying(false);
-    }
-  }, [phantom]);
 
   useEffect(() => {
     if (!ctParamsCopyState) return;
@@ -676,6 +711,11 @@ export default function SimulationPage() {
 
   const activeSliceData = ctParamsResult ? simulatedVolumeData : decodedPhantomData;
   const activeLabelData = ctParamsResult ? null : decodedLabelData;
+  const activeBodySliceRange = useMemo(() => {
+    if (!activeSliceData || !activeVolumeShape) return null;
+    const threshold = phantom?.metadata.bodyThresholdHU ?? -500;
+    return findInformativeSliceRange(activeSliceData, activeVolumeShape, threshold);
+  }, [activeSliceData, activeVolumeShape, phantom?.metadata.bodyThresholdHU]);
   const activePickedPosition = useMemo(() => {
     if (!pickedWorldPositionMm || !activeVolumeShape || !activeVolumeSpacing) {
       return pickedPosition;
@@ -701,6 +741,8 @@ export default function SimulationPage() {
     return decodedLabelData;
   }, [decodedLabelData, activeVolumeShape]);
   const totalSlices = activeVolumeShape?.[0] ?? 0;
+  const scanStartIndex = activeBodySliceRange?.startIndex ?? 0;
+  const scanEndIndex = activeBodySliceRange?.endIndex ?? Math.max(totalSlices - 1, 0);
   const activePreviewSource = ctParamsResult?.metadata.source ?? phantom?.metadata.source ?? 'atlas';
   const activeVolumeSourceLabel = ctParamsResult
     ? 'Simulated CT'
@@ -721,6 +763,7 @@ export default function SimulationPage() {
   );
   const loadedWorkspaceStudyId = phantom?.metadata.studyId ?? null;
   const loadedWorkspaceSeriesId = phantom?.metadata.seriesId ?? null;
+  const activeVolumeDatasetKey = ctParamsResult?.simulatedVolumeBase64 ?? phantom?.volumeBase64 ?? null;
 
   const organSegmentationOverlay = useMemo(() => {
     if (!showLabelOverlay || !phantom?.metadata?.labelMap || !activeSegmentationLabelData || !activeVolumeShape) {
@@ -783,6 +826,12 @@ export default function SimulationPage() {
       setSliceIndex(maxIndex);
     }
   }, [activeVolumeShape, sliceIndex]);
+
+  useEffect(() => {
+    if (!activeVolumeDatasetKey) return;
+    setSliceIndex(scanStartIndex);
+    setPlaying(false);
+  }, [activeVolumeDatasetKey, scanStartIndex]);
 
   useEffect(() => {
     if (!activeVolumeShape || !activeVolumeSpacing || !activeSliceData) {
@@ -852,7 +901,7 @@ export default function SimulationPage() {
     const intervalMs = 1000 / Math.max(playSpeed, 1);
     playTimerRef.current = setInterval(() => {
       setSliceIndex((prev) => {
-        const maxIdx = totalSlices - 1;
+        const maxIdx = scanEndIndex;
         if (prev >= maxIdx) {
           // Stop at end (loop disabled by default for MVP)
           setPlaying(false);
@@ -868,7 +917,7 @@ export default function SimulationPage() {
         playTimerRef.current = null;
       }
     };
-  }, [playing, playSpeed, totalSlices]);
+  }, [playing, playSpeed, scanEndIndex, totalSlices]);
 
   const refreshDicomStudies = useCallback(async () => {
     setLoadingStudies(true);
@@ -996,8 +1045,8 @@ export default function SimulationPage() {
       setPlaying(false);
     } else {
       // If at end, restart from top
-      if (sliceIndex >= totalSlices - 1) {
-        setSliceIndex(0);
+      if (sliceIndex >= scanEndIndex) {
+        setSliceIndex(scanStartIndex);
       }
       setPlaying(true);
     }
@@ -1066,8 +1115,6 @@ export default function SimulationPage() {
         params: normalizedParams,
       });
       setCtParamsResult(response);
-      const nextDepth = response.metadata.shape?.[0] ?? phantom.metadata.depth;
-      setSliceIndex((prev) => Math.min(prev, Math.max(nextDepth - 1, 0)));
       setPlaying(false);
     } catch (err: any) {
       console.error('[SimulationPage] CT parameter simulation failed:', err);
@@ -2400,6 +2447,7 @@ export default function SimulationPage() {
                         <VolumeRenderer
                           mode="synthetic"
                           showControls
+                          scanView
                           scanDirection="head_to_feet"
                           opacityPreset={
                             activePreset.label === 'Soft'
