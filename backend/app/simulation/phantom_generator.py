@@ -20,8 +20,10 @@ Usage — atlas:
 """
 
 import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
-from typing import Dict, Any, Tuple, Optional
 from scipy.ndimage import gaussian_filter, zoom
 
 # ---------------------------------------------------------------------------
@@ -38,6 +40,48 @@ WINDOW_PRESETS: Dict[str, Dict[str, float]] = {
     "lung": {"window_level": -600.0, "window_width": 1500.0},
     "bone": {"window_level": 500.0, "window_width": 2000.0},
 }
+
+DEFAULT_ATLAS_CASE_ID = "LUNG1-001"
+
+
+def get_project_root() -> str:
+    """Resolve the MedSim project root from env or this module location."""
+    return os.environ.get(
+        "MEDSIM_PROJECT_ROOT",
+        os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..")
+        ),
+    )
+
+
+def get_phantom_atlas_root() -> str:
+    """Return the atlas root directory under the current project."""
+    return os.path.join(get_project_root(), "models", "phantom_atlas")
+
+
+def get_lung_lobe_samples_root() -> str:
+    """Return the bundled lung sample dataset root used as the primary atlas source."""
+    return os.path.join(get_project_root(), "data", "lung_lobe_samples")
+
+
+def list_available_atlas_cases() -> list[str]:
+    """Enumerate lung-first atlas cases available for the CT workspace."""
+    case_ids: list[str] = []
+    lung_root = get_lung_lobe_samples_root()
+    if os.path.isdir(lung_root):
+        for entry in sorted(os.listdir(lung_root)):
+            case_dir = os.path.join(lung_root, entry)
+            if os.path.isdir(case_dir):
+                case_ids.append(entry)
+
+    atlas_root = get_phantom_atlas_root()
+    if os.path.isdir(atlas_root):
+        for entry in sorted(os.listdir(atlas_root)):
+            case_dir = os.path.join(atlas_root, entry)
+            ct_path = os.path.join(case_dir, "ct.nii.gz")
+            if os.path.isdir(case_dir) and os.path.isfile(ct_path) and entry not in case_ids:
+                case_ids.append(entry)
+    return case_ids
 
 # ---------------------------------------------------------------------------
 # Organ label map — index → name
@@ -398,7 +442,7 @@ def generate_procedural_ct_phantom(
 # ---------------------------------------------------------------------------
 
 def generate_atlas_ct_phantom(
-    case_id: str = "s0001",
+    case_id: str = DEFAULT_ATLAS_CASE_ID,
     size: int = 192,
     scan_direction: str = "head_to_feet",
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
@@ -437,8 +481,6 @@ def generate_atlas_ct_phantom(
                       fields (original_shape, scan_direction, flipped_z,
                       label_nonzero_counts, slice_label_presence, etc.).
     """
-    import nibabel as nib
-
     # ------------------------------------------------------------------
     # Validate scan_direction
     # ------------------------------------------------------------------
@@ -448,14 +490,17 @@ def generate_atlas_ct_phantom(
             f"Must be 'head_to_feet' or 'feet_to_head'."
         )
 
+    if _is_lung_sample_case(case_id):
+        return _generate_lung_sample_ct_phantom(
+            case_id=case_id,
+            size=size,
+            scan_direction=scan_direction,
+        )
+
+    import nibabel as nib
+
     # Resolve project root (2 levels up from this file, or from env)
-    project_root = os.environ.get(
-        "MEDSIM_PROJECT_ROOT",
-        os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "..")
-        ),
-    )
-    atlas_dir = os.path.join(project_root, "models", "phantom_atlas", case_id)
+    atlas_dir = os.path.join(get_phantom_atlas_root(), case_id)
     ct_path = os.path.join(atlas_dir, "ct.nii.gz")
     label_path = os.path.join(atlas_dir, "organs_label.nii.gz")
 
@@ -737,3 +782,264 @@ def generate_atlas_ct_phantom(
     }
 
     return ct_resampled, label_volume, metadata
+
+
+def _is_lung_sample_case(case_id: str) -> bool:
+    return os.path.isdir(os.path.join(get_lung_lobe_samples_root(), case_id))
+
+
+def _generate_lung_sample_ct_phantom(
+    case_id: str,
+    size: int,
+    scan_direction: str,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+    """Load a workspace CT volume from the bundled LUNG1-* DICOM samples."""
+    import logging
+    import pydicom
+
+    case_dir = Path(get_lung_lobe_samples_root()) / case_id
+    if not case_dir.is_dir():
+        raise FileNotFoundError(f"Lung sample case not found: {case_dir}")
+
+    ct_series_dir = _select_lung_ct_series_dir(case_dir)
+    dicom_paths = sorted(ct_series_dir.glob("*.dcm"))
+    if not dicom_paths:
+        raise FileNotFoundError(f"No DICOM files found in lung case series: {ct_series_dir}")
+
+    slices: list[dict[str, Any]] = []
+    slice_thickness: Optional[float] = None
+    pixel_spacing: Optional[Tuple[float, float]] = None
+    row_direction: Optional[np.ndarray] = None
+    col_direction: Optional[np.ndarray] = None
+
+    for dicom_path in dicom_paths:
+        ds = pydicom.dcmread(str(dicom_path), force=True)
+        if not hasattr(ds, "pixel_array"):
+            continue
+
+        pixel_array = ds.pixel_array.astype(np.float32)
+        slope = float(getattr(ds, "RescaleSlope", 1.0) or 1.0)
+        intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
+        pixel_array = pixel_array * slope + intercept
+
+        image_position = _safe_image_position(ds)
+        image_orientation = _safe_image_orientation(ds)
+        if image_orientation is not None and row_direction is None and col_direction is None:
+            row_direction = image_orientation[:3]
+            col_direction = image_orientation[3:]
+
+        slices.append(
+            {
+                "pixel_array": pixel_array,
+                "image_position": image_position,
+                "sort_fallback": _safe_sort_position(ds),
+            }
+        )
+
+        if slice_thickness is None:
+            slice_thickness = _safe_float(getattr(ds, "SliceThickness", None))
+        if pixel_spacing is None:
+            ps = getattr(ds, "PixelSpacing", None)
+            if ps is not None:
+                try:
+                    pixel_spacing = (float(ps[0]), float(ps[1]))
+                except (IndexError, TypeError, ValueError):
+                    pixel_spacing = None
+
+    if not slices:
+        raise ValueError(f"No readable DICOM image slices found for lung case {case_id}")
+
+    slice_direction: Optional[np.ndarray] = None
+    if row_direction is not None and col_direction is not None:
+        slice_direction = np.cross(row_direction, col_direction)
+        norm = float(np.linalg.norm(slice_direction))
+        if norm > 1e-6:
+            slice_direction = slice_direction / norm
+        else:
+            slice_direction = None
+
+    has_complete_positions = all(item["image_position"] is not None for item in slices)
+    if slice_direction is not None and has_complete_positions:
+        for item in slices:
+            item["sort_position"] = float(np.dot(item["image_position"], slice_direction))
+        slices.sort(key=lambda item: item["sort_position"])
+    else:
+        slices.sort(key=lambda item: item["sort_fallback"])
+
+    ct_volume = np.stack([item["pixel_array"] for item in slices], axis=0).astype(np.float32)
+    origin = [0.0, 0.0, 0.0]
+    if slices[0]["image_position"] is not None:
+        first_position = slices[0]["image_position"]
+        origin = [float(first_position[0]), float(first_position[1]), float(first_position[2])]
+
+    z_spacing = slice_thickness or 1.0
+    if slice_direction is not None and has_complete_positions and len(slices) > 1:
+        step_estimates: list[float] = []
+        for prev_item, next_item in zip(slices[:-1], slices[1:]):
+            delta = next_item["image_position"] - prev_item["image_position"]
+            projected_step = abs(float(np.dot(delta, slice_direction)))
+            if projected_step > 1e-6:
+                step_estimates.append(projected_step)
+        if step_estimates:
+            z_spacing = float(np.median(step_estimates))
+
+    y_spacing = pixel_spacing[0] if pixel_spacing else 1.0
+    x_spacing = pixel_spacing[1] if pixel_spacing else 1.0
+    orig_spacing = (float(z_spacing), float(y_spacing), float(x_spacing))
+
+    superior_component = float(slice_direction[2]) if slice_direction is not None else 0.0
+    natural_is_head_to_feet = superior_component < 0.0
+    need_flip = False
+    if abs(superior_component) >= 1e-6:
+        if scan_direction == "head_to_feet" and not natural_is_head_to_feet:
+            need_flip = True
+        elif scan_direction == "feet_to_head" and natural_is_head_to_feet:
+            need_flip = True
+    else:
+        logging.getLogger(__name__).warning(
+            "Lung case %s has no reliable superior-axis direction; z flip decision kept as default.",
+            case_id,
+        )
+
+    if need_flip:
+        ct_volume = ct_volume[::-1, :, :].copy()
+        if slice_direction is not None and len(slices) > 1:
+            shifted_origin = np.asarray(origin, dtype=np.float64) + slice_direction * z_spacing * float(len(slices) - 1)
+            origin = [float(shifted_origin[0]), float(shifted_origin[1]), float(shifted_origin[2])]
+
+    original_shape = ct_volume.shape
+    max_dim = max(original_shape)
+    zoom_factor = float(size) / float(max_dim) if max_dim > size else 1.0
+    if zoom_factor != 1.0:
+        ct_resampled = zoom(
+            ct_volume,
+            (zoom_factor, zoom_factor, zoom_factor),
+            order=1,
+            mode="constant",
+            cval=-1000.0,
+        ).astype(np.float32)
+    else:
+        ct_resampled = ct_volume.astype(np.float32, copy=False)
+
+    new_spacing = tuple(float(axis_spacing / zoom_factor) for axis_spacing in orig_spacing)
+    nz, ny, nx = ct_resampled.shape
+    direction = (
+        [float(slice_direction[0]), float(slice_direction[1]), float(slice_direction[2])]
+        if slice_direction is not None
+        else [1.0, 0.0, 0.0]
+    )
+    if need_flip:
+        direction = [-direction[0], -direction[1], -direction[2]]
+
+    row_direction_values = (
+        [float(row_direction[0]), float(row_direction[1]), float(row_direction[2])]
+        if row_direction is not None
+        else [0.0, 1.0, 0.0]
+    )
+    col_direction_values = (
+        [float(col_direction[0]), float(col_direction[1]), float(col_direction[2])]
+        if col_direction is not None
+        else [0.0, 0.0, 1.0]
+    )
+
+    metadata: Dict[str, Any] = {
+        "width": int(nx),
+        "height": int(ny),
+        "depth": int(nz),
+        "spacing": [float(new_spacing[0]), float(new_spacing[1]), float(new_spacing[2])],
+        "source": "atlas",
+        "case_id": case_id,
+        "original_shape": [int(original_shape[0]), int(original_shape[1]), int(original_shape[2])],
+        "output_shape": [int(nz), int(ny), int(nx)],
+        "original_spacing": [float(orig_spacing[0]), float(orig_spacing[1]), float(orig_spacing[2])],
+        "output_spacing": [float(new_spacing[0]), float(new_spacing[1]), float(new_spacing[2])],
+        "scan_axis": "z",
+        "scan_direction": scan_direction,
+        "flipped_z": need_flip,
+        "origin": origin,
+        "direction": [direction, row_direction_values, col_direction_values],
+        "spatial_reference": "dicom_patient_space",
+        "label_map": {},
+        "label_nonzero_counts": {},
+        "slice_label_presence": {},
+        "window_presets": {
+            name: {"windowLevel": float(p["window_level"]), "windowWidth": float(p["window_width"])}
+            for name, p in WINDOW_PRESETS.items()
+        },
+        "body_threshold_hu": -500.0,
+        "description": (
+            f"Lung sample CT phantom from case {case_id}. "
+            f"Loaded from local DICOM series {ct_series_dir.name} and resized to shape "
+            f"{nz}x{ny}x{nx} for workspace browsing and CT parameter simulation."
+        ),
+    }
+
+    return ct_resampled, None, metadata
+
+
+def _select_lung_ct_series_dir(case_dir: Path) -> Path:
+    study_dirs = sorted([path for path in case_dir.iterdir() if path.is_dir()])
+    if not study_dirs:
+        raise FileNotFoundError(f"No study directory found for lung case {case_dir.name}")
+
+    best_candidate: Optional[tuple[int, int, Path]] = None
+    for study_dir in study_dirs:
+        for series_dir in sorted([path for path in study_dir.iterdir() if path.is_dir()]):
+            dicom_paths = list(series_dir.glob("*.dcm"))
+            if not dicom_paths:
+                continue
+
+            series_name = series_dir.name.lower()
+            non_segmentation_score = 0 if "segmentation" in series_name else 1
+            score = (non_segmentation_score, len(dicom_paths))
+            if best_candidate is None or score > (best_candidate[0], best_candidate[1]):
+                best_candidate = (score[0], score[1], series_dir)
+
+    if best_candidate is None:
+        raise FileNotFoundError(f"No DICOM series found for lung case {case_dir.name}")
+
+    return best_candidate[2]
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_sort_position(ds: Any) -> float:
+    image_position = _safe_image_position(ds)
+    if image_position is not None:
+        return float(image_position[2])
+
+    instance_number = _safe_float(getattr(ds, "InstanceNumber", None))
+    if instance_number is not None:
+        return instance_number
+
+    return 0.0
+
+
+def _safe_image_position(ds: Any) -> Optional[np.ndarray]:
+    image_position = getattr(ds, "ImagePositionPatient", None)
+    if image_position is None:
+        return None
+
+    try:
+        return np.asarray(
+            [float(image_position[0]), float(image_position[1]), float(image_position[2])],
+            dtype=np.float64,
+        )
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _safe_image_orientation(ds: Any) -> Optional[np.ndarray]:
+    image_orientation = getattr(ds, "ImageOrientationPatient", None)
+    if image_orientation is None:
+        return None
+
+    try:
+        return np.asarray([float(image_orientation[idx]) for idx in range(6)], dtype=np.float64)
+    except (IndexError, TypeError, ValueError):
+        return None

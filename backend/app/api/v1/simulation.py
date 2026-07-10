@@ -55,6 +55,7 @@ from app.simulation.ct_params_simulator import simulate_ct_scan_params
 from app.simulation.phantom_generator import (
     generate_atlas_ct_phantom,
     generate_procedural_ct_phantom,
+    list_available_atlas_cases,
     WINDOW_PRESETS,
 )
 from app.dicom.storage import get_storage_backend
@@ -354,6 +355,61 @@ def _normalize_direction(direction: Optional[Any]) -> List[List[float]]:
             except (TypeError, ValueError):
                 return _identity_direction_matrix()
     return _identity_direction_matrix()
+
+
+def _normalize_dicom_scan_direction(
+    volume: np.ndarray,
+    metadata: Dict[str, Any],
+    scan_direction: str,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    """Normalize DICOM z ordering to the requested head/feet convention."""
+    normalized_metadata = dict(metadata)
+    direction_matrix = _normalize_direction(normalized_metadata.get("direction"))
+    slice_direction = np.asarray(direction_matrix[0], dtype=np.float64)
+    slice_direction_norm = float(np.linalg.norm(slice_direction))
+    superior_component = 0.0
+    if slice_direction_norm > 1e-6:
+        slice_direction = slice_direction / slice_direction_norm
+        superior_component = float(slice_direction[2])
+
+    normalized_metadata["scan_direction"] = scan_direction
+    normalized_metadata["dicom_superior_component"] = superior_component
+
+    # DICOM patient Z increases toward the head (superior).
+    # If slice index increases toward superior, z=0 is feet-side and must be flipped
+    # for the workspace's default head_to_feet convention.
+    natural_is_head_to_feet = superior_component < 0.0
+    need_flip = False
+    if abs(superior_component) >= 1e-6:
+        if scan_direction == "head_to_feet" and not natural_is_head_to_feet:
+            need_flip = True
+        elif scan_direction == "feet_to_head" and natural_is_head_to_feet:
+            need_flip = True
+
+    normalized_metadata["flipped_z"] = need_flip
+
+    if not need_flip:
+        return volume, normalized_metadata
+
+    flipped = volume[::-1, :, :].copy()
+
+    origin = _normalize_origin(normalized_metadata.get("origin"))
+    z_spacing = float(normalized_metadata.get("spacing", (1.0, 1.0, 1.0))[0])
+    if slice_direction_norm > 1e-6 and volume.shape[0] > 1:
+        new_origin = (
+            np.asarray(origin, dtype=np.float64)
+            + slice_direction * z_spacing * float(volume.shape[0] - 1)
+        )
+        normalized_metadata["origin"] = [float(v) for v in new_origin]
+
+        flipped_direction = [
+            [-direction_matrix[0][0], -direction_matrix[0][1], -direction_matrix[0][2]],
+            direction_matrix[1],
+            direction_matrix[2],
+        ]
+        normalized_metadata["direction"] = flipped_direction
+
+    return flipped, normalized_metadata
 
 
 @lru_cache(maxsize=8)
@@ -1054,6 +1110,11 @@ async def preview_lesion_on_dicom(
 
         storage = get_storage_backend()
         volume, metadata = build_volume_from_dicom(storage, instances)
+        volume, metadata = _normalize_dicom_scan_direction(
+            volume,
+            metadata,
+            request.scan_direction,
+        )
 
         # 鈹€鈹€ 2. Generate lesion 鈹€鈹€
         generator = LesionGenerator()
@@ -1360,6 +1421,11 @@ async def preview_lesion_on_dicom_3d(
 
         storage = get_storage_backend()
         volume, metadata = build_volume_from_dicom(storage, instances)
+        volume, metadata = _normalize_dicom_scan_direction(
+            volume,
+            metadata,
+            request.scan_direction,
+        )
         original_shape = volume.shape  # (z, y, x)
         original_spacing = tuple(metadata.get("spacing", (1.0, 1.0, 1.0)))
 
@@ -1838,21 +1904,35 @@ async def preview_ct_scan_params(
         extra_metadata: Dict[str, Any] = {}
 
         if request.source == "atlas":
-            source_case_id = request.case_id or "s0001"
+            source_case_id = request.case_id or "LUNG1-001"
             ct_volume, label_volume, phantom_metadata = generate_atlas_ct_phantom(
                 case_id=source_case_id,
                 size=request.size,
                 scan_direction=request.scan_direction,
             )
             source_spacing = tuple(phantom_metadata.get("spacing", (1.0, 1.0, 1.0)))
-            standardized_notes.extend([
-                "origin uses default [0, 0, 0] because atlas origin is not propagated in this preview response.",
-                "direction uses identity matrix because atlas direction is not propagated in this preview response.",
-            ])
+            source_origin = phantom_metadata.get("origin")
+            source_direction = phantom_metadata.get("direction")
+            if source_origin is None or _normalize_origin(source_origin) == [0.0, 0.0, 0.0]:
+                standardized_notes.append(
+                    "origin uses default [0, 0, 0] because atlas origin is not propagated in this preview response."
+                )
+            else:
+                standardized_notes.append(
+                    "origin is propagated from the source atlas volume."
+                )
+            if source_direction is None or _normalize_direction(source_direction) == _identity_direction_matrix():
+                standardized_notes.append(
+                    "direction uses identity matrix because atlas direction is not propagated in this preview response."
+                )
+            else:
+                standardized_notes.append(
+                    "direction is propagated from the source atlas volume."
+                )
             extra_metadata = {
                 "case_id": source_case_id,
                 "scan_direction": request.scan_direction,
-                "spatial_reference": "local_volume_space",
+                "spatial_reference": phantom_metadata.get("spatial_reference", "local_volume_space"),
                 "phantom_metadata": {
                     "original_shape": phantom_metadata.get("original_shape"),
                     "output_shape": phantom_metadata.get("output_shape"),
@@ -1937,6 +2017,11 @@ async def preview_ct_scan_params(
                     detail=f"Failed to build DICOM volume for series {series.id}: {str(e)[:300]}",
                 ) from e
 
+            ct_volume, dicom_metadata = _normalize_dicom_scan_direction(
+                ct_volume,
+                dicom_metadata,
+                request.scan_direction,
+            )
             source_case_id = series.id
             source_spacing = tuple(dicom_metadata.get("spacing", (1.0, 1.0, 1.0)))
             source_origin = dicom_metadata.get("origin")
@@ -1955,6 +2040,14 @@ async def preview_ct_scan_params(
             if not series.modality:
                 standardized_notes.append(
                     "DICOM series modality is missing in metadata; CT compatibility could not be verified beyond HU reconstruction."
+                )
+            if dicom_metadata.get("flipped_z"):
+                standardized_notes.append(
+                    f"DICOM z-axis was flipped to satisfy scan_direction={request.scan_direction} so z=0 matches the requested head/feet convention."
+                )
+            else:
+                standardized_notes.append(
+                    f"DICOM z-axis already matched scan_direction={request.scan_direction}; no z flip was applied."
                 )
             if source_origin is None or _normalize_origin(source_origin) == [0.0, 0.0, 0.0]:
                 standardized_notes.append(
@@ -1981,6 +2074,7 @@ async def preview_ct_scan_params(
                 "case_id": None,
                 "study_id": series.study_id,
                 "series_id": series.id,
+                "scan_direction": request.scan_direction,
                 "spatial_reference": dicom_metadata.get("spatial_reference", "dicom_patient_space"),
                 "phantom_metadata": {
                     "original_shape": original_shape,
@@ -1988,6 +2082,7 @@ async def preview_ct_scan_params(
                     "original_spacing": original_spacing,
                     "output_spacing": [float(v) for v in resized_spacing],
                     "resample_scale": float(scale),
+                    "flipped_z": bool(dicom_metadata.get("flipped_z", False)),
                 },
                 "dicom_metadata": {
                     "series_instance_uid": series.series_instance_uid,
@@ -1998,6 +2093,7 @@ async def preview_ct_scan_params(
                     "image_count": series.image_count,
                     "instance_count": len(instances),
                     "builder_num_slices": dicom_metadata.get("num_slices"),
+                    "superior_component": dicom_metadata.get("dicom_superior_component"),
                 },
             }
 
@@ -2068,7 +2164,7 @@ async def preview_ct_scan_params(
 async def generate_ct_phantom(
     source: str = Query("procedural", description="Phantom source: 'procedural', 'atlas', or 'dicom'"),
     size: int = Query(192, ge=64, le=320, description="Volume max edge size in voxels"),
-    case_id: str = Query("s0001", description="Atlas case ID (only used when source='atlas')"),
+    case_id: str = Query("LUNG1-001", description="Atlas case ID (only used when source='atlas')"),
     study_id: Optional[str] = Query(None, description="Study ID (used when source='dicom')"),
     series_id: Optional[str] = Query(None, description="Series ID (used when source='dicom')"),
     scan_direction: str = Query(
@@ -2155,6 +2251,11 @@ async def generate_ct_phantom(
 
             storage = get_storage_backend()
             volume, dicom_metadata = build_volume_from_dicom(storage, instances)
+            volume, dicom_metadata = _normalize_dicom_scan_direction(
+                volume,
+                dicom_metadata,
+                scan_direction,
+            )
             source_spacing = tuple(dicom_metadata.get("spacing", (1.0, 1.0, 1.0)))
             original_shape = [int(dim) for dim in volume.shape]
             original_spacing = [float(v) for v in source_spacing]
@@ -2184,6 +2285,8 @@ async def generate_ct_phantom(
                 "original_spacing": original_spacing,
                 "output_spacing": [float(v) for v in resized_spacing],
                 "resample_scale": float(scale),
+                "scan_direction": scan_direction,
+                "flipped_z": bool(dicom_metadata.get("flipped_z", False)),
                 "window_presets": {
                     name: {"windowLevel": float(p["window_level"]), "windowWidth": float(p["window_width"])}
                     for name, p in WINDOW_PRESETS.items()
@@ -2217,6 +2320,19 @@ async def generate_ct_phantom(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Phantom generation failed: {str(e)}",
         )
+
+
+@router.get("/atlas-cases")
+async def list_atlas_cases():
+    """Return atlas case ids available for CT workspace loading."""
+    case_ids = list_available_atlas_cases()
+    return {
+        "items": [
+            {"case_id": case_id, "label": case_id}
+            for case_id in case_ids
+        ],
+        "count": len(case_ids),
+    }
 
 
 # ---------------------------------------------------------------------------

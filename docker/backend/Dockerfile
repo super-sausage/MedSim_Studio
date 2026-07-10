@@ -12,23 +12,40 @@ WORKDIR /app
 ARG APT_MIRROR
 ARG PIP_INDEX_URL
 ARG PIP_TRUSTED_HOST=pypi.org
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # System dependencies for medical imaging libraries
-RUN if [ -n "${APT_MIRROR}" ]; then \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    if [ -n "${APT_MIRROR:-}" ]; then \
         sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
         sed -i "s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
-    fi && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libglvnd0 \
-    libglx0 \
-    libglib2.0-0t64 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libgomp1 \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+    else \
+        sed -i "s|http://deb.debian.org|https://deb.debian.org|g" /etc/apt/sources.list.d/debian.sources && \
+        sed -i "s|http://security.debian.org|https://security.debian.org|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/80-medisim-retries; \
+    for attempt in 1 2 3; do \
+        apt-get update && \
+        apt-get install -y --no-install-recommends --fix-missing \
+            build-essential \
+            libglvnd0 \
+            libglx0 \
+            libglib2.0-0t64 \
+            libsm6 \
+            libxext6 \
+            libxrender1 \
+            libgomp1 \
+            wget && \
+        break; \
+        echo "APT install attempt ${attempt} failed; retrying..." >&2; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep 5; \
+    done; \
+    rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies with BuildKit pip cache and local wheel mount.
 # Mount ./downloads/ at build time so pip finds the pre-downloaded CUDA
@@ -79,21 +96,37 @@ FROM python:3.11-slim AS runner
 WORKDIR /app
 
 ARG APT_MIRROR
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 # Runtime system dependencies only
-RUN if [ -n "${APT_MIRROR}" ]; then \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    if [ -n "${APT_MIRROR:-}" ]; then \
         sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
         sed -i "s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
-    fi && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    libglvnd0 \
-    libglx0 \
-    libglib2.0-0t64 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+    else \
+        sed -i "s|http://deb.debian.org|https://deb.debian.org|g" /etc/apt/sources.list.d/debian.sources && \
+        sed -i "s|http://security.debian.org|https://security.debian.org|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/80-medisim-retries; \
+    for attempt in 1 2 3; do \
+        apt-get update && \
+        apt-get install -y --no-install-recommends --fix-missing \
+            libglvnd0 \
+            libglx0 \
+            libglib2.0-0t64 \
+            libsm6 \
+            libxext6 \
+            libxrender1 \
+            libgomp1 && \
+        break; \
+        echo "APT install attempt ${attempt} failed; retrying..." >&2; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep 5; \
+    done; \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
@@ -103,7 +136,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY backend/ .
 
 # Create necessary directories
-RUN mkdir -p /tmp/uploads /app/ai-models /app/static
+RUN mkdir -p /tmp/uploads /app/ai-models /app/custom-models /app/static
 
 # Copy custom-trained MONAI UNet weights to a path NOT overridden by volumes
 # (/app/ai-models is mounted as a named volume in docker-compose, which

@@ -25,6 +25,11 @@ x-backend-env: &backend-env
   TOTALSEGMENTATOR_FAST: ${TOTALSEGMENTATOR_FAST:-false}
   MEDSIM_PROJECT_ROOT: ${MEDSIM_PROJECT_ROOT:-/app}
 
+x-build-args: &build-args
+  APT_MIRROR: ${APT_MIRROR:-}
+  PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+  PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+
 x-service-defaults: &service-defaults
   restart: unless-stopped
   networks:
@@ -36,18 +41,20 @@ services:
       context: ./frontend
       dockerfile: ../docker/frontend/Dockerfile
       args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
         VITE_API_BASE_URL: /api/v1
     ports:
       - "5173:80"
     depends_on:
       backend:
-        condition: service_started
+        condition: service_healthy
     <<: *service-defaults
 
   backend:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
+      args: *build-args
     ports:
       - "8000:8000"
     environment: *backend-env

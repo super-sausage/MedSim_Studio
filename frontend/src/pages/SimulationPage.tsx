@@ -6,6 +6,7 @@ import type { PhantomResponse, DicomLesionPreviewResponse } from '@/services/sim
 import { VolumeRenderer } from '@vtk/volumeRendering/VolumeRenderer';
 import { dicomService } from '@/services/dicomService';
 import type {
+  AtlasCaseOption,
   CtParamsPreviewParams,
   CtParamsPreviewResponse,
   Lesion3DPreviewRequest,
@@ -40,30 +41,40 @@ const WINDOW_PRESETS: WindowPreset[] = [
 // ---------------------------------------------------------------------------
 
 const ORGAN_COLORS: Record<number, [number, number, number]> = {
-  1: [255, 255, 0],   // left_adrenal_gland — yellow
-  2: [255, 255, 0],   // right_adrenal_gland — yellow
-  3: [139, 69, 19],   // colon — brown
-  4: [255, 192, 203], // duodenum — pink
-  5: [173, 216, 230], // esophagus — light blue
-  6: [0, 255, 0],     // gallbladder — green
-  7: [255, 165, 0],   // left_kidney — orange
-  8: [255, 165, 0],   // right_kidney — orange
-  9: [139, 0, 0],     // liver — dark red
-  10: [0, 200, 255],  // left_lung_lower_lobe — cyan
-  11: [0, 200, 255],  // right_lung_lower_lobe — cyan
-  12: [0, 200, 255],  // right_lung_middle_lobe — cyan
-  13: [100, 200, 255],// left_lung_upper_lobe — light cyan
-  14: [100, 200, 255],// right_lung_upper_lobe — light cyan
-  15: [255, 255, 100],// pancreas — light yellow
-  16: [255, 182, 193],// small_bowel — light pink
-  17: [128, 0, 128],  // spleen — purple
-  18: [210, 180, 140],// stomach — tan
-  19: [0, 255, 255],  // trachea — cyan
-  20: [0, 0, 255],    // urinary_bladder — blue
+  1: [250, 233, 143],  // left_adrenal_gland
+  2: [250, 233, 143],  // right_adrenal_gland
+  3: [205, 156, 130],  // colon
+  4: [246, 196, 206],  // duodenum
+  5: [177, 219, 242],  // esophagus
+  6: [168, 224, 162],  // gallbladder
+  7: [255, 204, 143],  // left_kidney
+  8: [255, 204, 143],  // right_kidney
+  9: [223, 143, 128],  // liver
+  10: [136, 221, 235], // left_lung_lower_lobe
+  11: [136, 221, 235], // right_lung_lower_lobe
+  12: [136, 221, 235], // right_lung_middle_lobe
+  13: [181, 237, 245], // left_lung_upper_lobe
+  14: [181, 237, 245], // right_lung_upper_lobe
+  15: [248, 226, 141], // pancreas
+  16: [239, 198, 213], // small_bowel
+  17: [198, 160, 218], // spleen
+  18: [220, 191, 166], // stomach
+  19: [199, 241, 255], // trachea
+  20: [147, 177, 241], // urinary_bladder
 };
 
 /** Semi-transparency alpha for organ label overlay (0-1) */
 const LABEL_OVERLAY_ALPHA = 0.35;
+const LESION_LABEL_BASE = 100;
+
+const ORGAN_LABEL_PRIORITY = [9, 7, 8, 10, 11, 12, 13, 14, 17, 15, 19, 20, 18, 6, 5, 3, 4, 16, 1, 2];
+
+function formatOrganLabelName(name: string): string {
+  return name
+    .split('_')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
 
 // ---------------------------------------------------------------------------
 // HU → grayscale helper
@@ -132,6 +143,52 @@ function buildVtkVolumePayload(
     dims: [width, height, depth],
     vtkSpacing: [spacing[2], spacing[1], spacing[0]],
   };
+}
+
+function getCenteredVolumeOriginMm(
+  shape: [number, number, number],
+  spacing: [number, number, number],
+): [number, number, number] {
+  const [depth, height, width] = shape;
+  const [spz, spy, spx] = spacing;
+
+  return [
+    -((width - 1) * spx) / 2,
+    -((height - 1) * spy) / 2,
+    -((depth - 1) * spz) / 2,
+  ];
+}
+
+function voxelToCenteredWorldMm(
+  voxel: [number, number, number],
+  shape: [number, number, number],
+  spacing: [number, number, number],
+): [number, number, number] {
+  const [x, y, z] = voxel;
+  const [spz, spy, spx] = spacing;
+  const [originX, originY, originZ] = getCenteredVolumeOriginMm(shape, spacing);
+
+  return [
+    originX + x * spx,
+    originY + y * spy,
+    originZ + z * spz,
+  ];
+}
+
+function centeredWorldMmToVoxel(
+  world: [number, number, number],
+  shape: [number, number, number],
+  spacing: [number, number, number],
+): [number, number, number] {
+  const [worldX, worldY, worldZ] = world;
+  const [spz, spy, spx] = spacing;
+  const [originX, originY, originZ] = getCenteredVolumeOriginMm(shape, spacing);
+
+  return [
+    (worldX - originX) / spx,
+    (worldY - originY) / spy,
+    (worldZ - originZ) / spz,
+  ];
 }
 
 function renderVolumeSliceToCanvas({
@@ -345,6 +402,9 @@ export default function SimulationPage() {
   const [selectedSeriesId, setSelectedSeriesId] = useState<string | null>(null);
   const [loadingStudies, setLoadingStudies] = useState(false);
   const [loadingSeries, setLoadingSeries] = useState(false);
+  const [atlasCases, setAtlasCases] = useState<AtlasCaseOption[]>([]);
+  const [loadingAtlasCases, setLoadingAtlasCases] = useState(false);
+  const [selectedAtlasCaseId, setSelectedAtlasCaseId] = useState('LUNG1-001');
 
   // ---- Form state ----
   const [form, setForm] = useState(DEFAULT_FORM);
@@ -382,10 +442,12 @@ export default function SimulationPage() {
   const [sliceIndex, setSliceIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [playSpeed, setPlaySpeed] = useState(10); // slices per second
+  const [sync3DToSlice, setSync3DToSlice] = useState(false);
   const [activePreset, setActivePreset] = useState<WindowPreset>(WINDOW_PRESETS[0]);
   const [showLabelOverlay, setShowLabelOverlay] = useState(true);
   const [pickingMode, setPickingMode] = useState(false);
   const [pickedPosition, setPickedPosition] = useState<{ x: number; y: number; z: number } | null>(null);
+  const [pickedWorldPositionMm, setPickedWorldPositionMm] = useState<[number, number, number] | null>(null);
   const [ctParams, setCtParams] = useState<CtParamsPreviewParams>(DEFAULT_CT_PARAMS);
   const [mAsInput, setMAsInput] = useState(String(DEFAULT_CT_PARAMS.mAs));
   const [ctParamsLoading, setCtParamsLoading] = useState(false);
@@ -499,7 +561,7 @@ export default function SimulationPage() {
 
     for (let li = 0; li < lesions.length && li < LESION_OVERLAY_COLORS.length; li++) {
       const lesion = lesions[li];
-      const labelIdx = li + 1;
+      const labelIdx = LESION_LABEL_BASE + li + 1;
       labels.push({
         index: labelIdx,
         name: `Lesion ${li + 1}: ${lesionTypeLabel[lesion.type]}`,
@@ -614,6 +676,30 @@ export default function SimulationPage() {
 
   const activeSliceData = ctParamsResult ? simulatedVolumeData : decodedPhantomData;
   const activeLabelData = ctParamsResult ? null : decodedLabelData;
+  const activePickedPosition = useMemo(() => {
+    if (!pickedWorldPositionMm || !activeVolumeShape || !activeVolumeSpacing) {
+      return pickedPosition;
+    }
+
+    const [x, y, z] = centeredWorldMmToVoxel(
+      pickedWorldPositionMm,
+      activeVolumeShape,
+      activeVolumeSpacing,
+    );
+    const clampedX = Math.max(0, Math.min(Math.round(x), activeVolumeShape[2] - 1));
+    const clampedY = Math.max(0, Math.min(Math.round(y), activeVolumeShape[1] - 1));
+    const clampedZ = Math.max(0, Math.min(Math.round(z), activeVolumeShape[0] - 1));
+
+    return { x: clampedX, y: clampedY, z: clampedZ };
+  }, [activeVolumeShape, activeVolumeSpacing, pickedPosition, pickedWorldPositionMm]);
+  const activeSegmentationLabelData = useMemo(() => {
+    if (!decodedLabelData || !activeVolumeShape) return null;
+
+    const expectedVoxelCount = activeVolumeShape[0] * activeVolumeShape[1] * activeVolumeShape[2];
+    if (decodedLabelData.length !== expectedVoxelCount) return null;
+
+    return decodedLabelData;
+  }, [decodedLabelData, activeVolumeShape]);
   const totalSlices = activeVolumeShape?.[0] ?? 0;
   const activePreviewSource = ctParamsResult?.metadata.source ?? phantom?.metadata.source ?? 'atlas';
   const activeVolumeSourceLabel = ctParamsResult
@@ -635,6 +721,60 @@ export default function SimulationPage() {
   );
   const loadedWorkspaceStudyId = phantom?.metadata.studyId ?? null;
   const loadedWorkspaceSeriesId = phantom?.metadata.seriesId ?? null;
+
+  const organSegmentationOverlay = useMemo(() => {
+    if (!showLabelOverlay || !phantom?.metadata?.labelMap || !activeSegmentationLabelData || !activeVolumeShape) {
+      return null;
+    }
+
+    const availableLabels = Object.entries(phantom.metadata.labelMap)
+      .map(([key, value]) => [Number(key), value] as const)
+      .filter(([index]) => index > 0 && !!ORGAN_COLORS[index]);
+
+    if (availableLabels.length === 0) return null;
+
+    const orderedLabels = ORGAN_LABEL_PRIORITY
+      .filter((index) => availableLabels.some(([availableIndex]) => availableIndex === index))
+      .map((index) => {
+        const rawName = availableLabels.find(([availableIndex]) => availableIndex === index)?.[1] ?? `Label ${index}`;
+        return {
+          index,
+          name: formatOrganLabelName(rawName),
+          color: ORGAN_COLORS[index],
+        };
+      });
+
+    return {
+      // Keep the original CT body rendering intact and overlay label colors
+      // as a lightweight translucent volume instead of a separate 3D shell.
+      mask: Float32Array.from(activeSegmentationLabelData),
+      labels: orderedLabels,
+    };
+  }, [activeSegmentationLabelData, activeVolumeShape, phantom?.metadata?.labelMap, showLabelOverlay]);
+
+  const compositeSegmentationOverlay = useMemo(() => {
+    const organMask = organSegmentationOverlay?.mask ?? null;
+    const organLabels = organSegmentationOverlay?.labels ?? [];
+    const lesionMask = lesionOverlay?.mask ?? null;
+    const lesionLabels = lesionOverlay?.labels ?? [];
+
+    if (!organMask && !lesionMask) return null;
+    if (!organMask) return lesionOverlay;
+    if (!lesionMask) return organSegmentationOverlay;
+    if (organMask.length !== lesionMask.length) return organSegmentationOverlay;
+
+    const combinedMask = new Float32Array(organMask);
+    for (let i = 0; i < lesionMask.length; i++) {
+      if (lesionMask[i] > 0) {
+        combinedMask[i] = lesionMask[i];
+      }
+    }
+
+    return {
+      mask: combinedMask,
+      labels: [...organLabels, ...lesionLabels],
+    };
+  }, [lesionOverlay, organSegmentationOverlay]);
 
   useEffect(() => {
     if (!activeVolumeShape) return;
@@ -687,15 +827,15 @@ export default function SimulationPage() {
       windowWidth,
       labelData: activeLabelData,
       showLabelOverlay: showLabelOverlay && !ctParamsResult,
-      pickedPosition,
+      pickedPosition: activePickedPosition,
     });
   }, [
     activePreset,
     activeSliceData,
     activeLabelData,
+    activePickedPosition,
     activeVolumeShape,
     ctParamsResult,
-    pickedPosition,
     showLabelOverlay,
     sliceIndex,
   ]);
@@ -730,6 +870,36 @@ export default function SimulationPage() {
     };
   }, [playing, playSpeed, totalSlices]);
 
+  const refreshDicomStudies = useCallback(async () => {
+    setLoadingStudies(true);
+    try {
+      const res = await dicomService.getStudies(1, 50);
+      setStudies(res.items ?? []);
+    } catch {
+      // Silently ignore 鈥?studies fetch is non-critical
+    } finally {
+      setLoadingStudies(false);
+    }
+  }, []);
+
+  const refreshAtlasCases = useCallback(async () => {
+    setLoadingAtlasCases(true);
+    try {
+      const res = await simulationService.getAtlasCases();
+      const nextItems = res.items ?? [];
+      setAtlasCases(nextItems);
+      if (nextItems.length > 0) {
+        setSelectedAtlasCaseId((prev) =>
+          nextItems.some((item) => item.caseId === prev) ? prev : nextItems[0].caseId,
+        );
+      }
+    } catch {
+      // Silently ignore 鈥?atlas listing is non-critical
+    } finally {
+      setLoadingAtlasCases(false);
+    }
+  }, []);
+
   // ---- Load available DICOM studies on mount ----
   useEffect(() => {
     let mounted = true;
@@ -747,6 +917,10 @@ export default function SimulationPage() {
     loadStudies();
     return () => { mounted = false; };
   }, []);
+
+  useEffect(() => {
+    void refreshAtlasCases();
+  }, [refreshAtlasCases]);
 
   // ---- Load series when a study is selected ----
   useEffect(() => {
@@ -785,6 +959,7 @@ export default function SimulationPage() {
     }
 
     setPickedPosition(null);
+    setPickedWorldPositionMm(null);
     setPickingMode(false);
     setPhantomLoading(true);
     setPhantomError(null);
@@ -798,7 +973,7 @@ export default function SimulationPage() {
       const response = await simulationService.getPhantom(
         ctWorkspaceSource,
         size,
-        's0001',
+        selectedAtlasCaseId,
         'head_to_feet',
         ctWorkspaceSource === 'dicom' ? selectedStudyId : null,
         ctWorkspaceSource === 'dicom' ? selectedSeriesId : null,
@@ -883,7 +1058,7 @@ export default function SimulationPage() {
     try {
       const response = await simulationService.runCtParamsPreview({
         source: currentSource,
-        caseId: currentSource === 'atlas' ? (phantom.metadata.caseId || 's0001') : null,
+        caseId: currentSource === 'atlas' ? (phantom.metadata.caseId || 'LUNG1-001') : null,
         studyId: currentSource === 'dicom' ? loadedWorkspaceStudyId : null,
         seriesId: currentSource === 'dicom' ? loadedWorkspaceSeriesId : null,
         size: loadedPhantomSize ?? Math.max(phantom.metadata.depth, phantom.metadata.height, phantom.metadata.width),
@@ -915,7 +1090,7 @@ export default function SimulationPage() {
   const handleDownloadCtParamsJson = useCallback(() => {
     if (!ctParamsResult) return;
     try {
-      const caseId = phantom?.metadata.caseId || 's0001';
+      const caseId = phantom?.metadata.caseId || 'LUNG1-001';
       const filename = `ct_params_simulation_${caseId}_${formatTimestampForFilename(new Date())}.json`;
       const blob = new Blob([JSON.stringify(ctParamsResult.paramsJson, null, 2)], {
         type: 'application/json;charset=utf-8',
@@ -988,6 +1163,13 @@ export default function SimulationPage() {
 
       // Store absolute phantom coords (for crosshair display)
       setPickedPosition({ x: clampedX, y: clampedY, z: clampedZ });
+      setPickedWorldPositionMm(
+        voxelToCenteredWorldMm(
+          [clampedX, clampedY, clampedZ],
+          activeVolumeShape,
+          activeVolumeSpacing ?? [1, 1, 1],
+        ),
+      );
 
       // Store absolute phantom coords (for display in number inputs, works for same-volume synthetic)
       updateForm('centerX', clampedX);
@@ -995,16 +1177,17 @@ export default function SimulationPage() {
       updateForm('centerZ', clampedZ);
 
       // Store normalized coords (0-1) for cross-volume scaling (e.g., phantom → DICOM)
-      const normX = width > 0 ? clampedX / width : 0;
-      const normY = height > 0 ? clampedY / height : 0;
-      const normZ = depth > 0 ? clampedZ / depth : 0;
+      const normX = width > 1 ? clampedX / (width - 1) : 0;
+      const normY = height > 1 ? clampedY / (height - 1) : 0;
+      const normZ = depth > 1 ? clampedZ / (depth - 1) : 0;
       updateForm('normalizedCenterX', normX);
       updateForm('normalizedCenterY', normY);
       updateForm('normalizedCenterZ', normZ);
+      setSourceType(activePreviewSource === 'dicom' ? 'dicom' : 'synthetic');
       setPickingMode(false);
       setActiveTab('lesion');
     },
-    [activeVolumeShape, pickingMode, sliceIndex, updateForm],
+    [activePreviewSource, activeVolumeShape, activeVolumeSpacing, pickingMode, sliceIndex, updateForm],
   );
 
   /** Add a lesion from the current form values */
@@ -1027,9 +1210,9 @@ export default function SimulationPage() {
     ) {
       const series = seriesList.find((s) => s.id === selectedSeriesId);
       if (series) {
-        cx = form.normalizedCenterX * series.columns;
-        cy = form.normalizedCenterY * series.rows;
-        cz = form.normalizedCenterZ * series.imageCount;
+        cx = form.normalizedCenterX * Math.max(series.columns - 1, 0);
+        cy = form.normalizedCenterY * Math.max(series.rows - 1, 0);
+        cz = form.normalizedCenterZ * Math.max(series.imageCount - 1, 0);
       }
     }
 
@@ -1142,6 +1325,60 @@ export default function SimulationPage() {
     setMeshPreviewOpen(true);
 
     try {
+      if (activeVolumeShape && activeVolumeSpacing && vtkVolumeData && vtkDims) {
+        const mesh: Lesion3DPreviewResponse = await simulationService.previewLesion3D({
+          lesionType: form.lesionType,
+          shape: form.shape,
+          centerX: 0,
+          centerY: 0,
+          centerZ: 0,
+          radiusX: radius,
+          radiusY: radius,
+          radiusZ: radius,
+          huMean: form.huMean,
+          huStd: form.huStd,
+          marginSharpness: form.marginSharpness,
+          spiculationDegree: form.spiculationDegree,
+          previewSize: 64,
+          spacing: [
+            activeVolumeSpacing[0],
+            activeVolumeSpacing[1],
+            activeVolumeSpacing[2],
+          ],
+        });
+
+        const [depth, height, width] = activeVolumeShape;
+        const cx = form.centerX > 0 ? Math.min(form.centerX, width - 1) : width / 2;
+        const cy = form.centerY > 0 ? Math.min(form.centerY, height - 1) : height / 2;
+        const cz = form.centerZ > 0 ? Math.min(form.centerZ, depth - 1) : depth / 2;
+        const [targetX, targetY, targetZ] = voxelToCenteredWorldMm(
+          [cx, cy, cz],
+          activeVolumeShape,
+          activeVolumeSpacing,
+        );
+
+        const tx = targetX - mesh.center[0];
+        const ty = targetY - mesh.center[1];
+        const tz = targetZ - mesh.center[2];
+        const translatedVertices = mesh.vertices.map(
+          (v) => [v[0] + tx, v[1] + ty, v[2] + tz] as [number, number, number],
+        );
+
+        setPreviewPhantomData(vtkVolumeData);
+        setPreviewPhantomDims(vtkDims);
+        setPreviewPhantomSpacing(vtkSpacing ?? [activeVolumeSpacing[2], activeVolumeSpacing[1], activeVolumeSpacing[0]]);
+        setMeshPreviewData({
+          id: 'preview',
+          vertices: translatedVertices,
+          faces: mesh.faces,
+          normals: mesh.normals,
+          opacity: 1.0,
+          color: [1, 0.35, 0.35],
+          visible: true,
+        });
+        return;
+      }
+
       // Shared lesion params
       const lesionParams = {
         lesionType: form.lesionType,
@@ -1170,6 +1407,7 @@ export default function SimulationPage() {
         const result: DicomLesion3DPreviewResponse =
           await simulationService.previewLesionOnDicom3D({
             seriesId: selectedSeriesId,
+            scanDirection: 'head_to_feet',
             ...lesionParams,
             previewSize: 192,
           });
@@ -1242,7 +1480,16 @@ export default function SimulationPage() {
     } finally {
       setMeshPreviewLoading(false);
     }
-  }, [form, sourceType, selectedSeriesId]);
+  }, [
+    activeVolumeShape,
+    activeVolumeSpacing,
+    form,
+    sourceType,
+    selectedSeriesId,
+    vtkDims,
+    vtkSpacing,
+    vtkVolumeData,
+  ]);
 
   /** Remove a lesion by index */
   const handleRemoveLesion = useCallback(
@@ -1305,6 +1552,7 @@ export default function SimulationPage() {
         lesion,
         40,
         400,
+        'head_to_feet',
       );
       // Combine stats into a summary string
       const stats = `HU: ${res.huMean.toFixed(0)} ± ${res.huStd.toFixed(0)} · Range: [${res.huMin.toFixed(0)}, ${res.huMax.toFixed(0)}] · Volume: ${res.volumeMm3.toFixed(0)} mm³ · Slice ${res.sliceIndex + 1}/${res.totalSlices}`;
@@ -1353,7 +1601,7 @@ export default function SimulationPage() {
     ): LesionMeshData | null => {
       if (!phantom || !activeVolumeShape) return null;
 
-      const sp = phantom.metadata.spacing; // [sp_z, sp_y, sp_x]
+      const sp = activeVolumeSpacing ?? phantom.metadata.spacing; // [sp_z, sp_y, sp_x]
       const [depth, height, width] = activeVolumeShape;
       const lesion = lesions[lesionIndex];
       if (!lesion) return null;
@@ -1369,9 +1617,11 @@ export default function SimulationPage() {
       const clampedZ = lz > 0 ? Math.min(lz, depth - 1) : depth / 2;
 
       // Target physical position in CT phantom (x, y, z) mm
-      const targetX = clampedX * sp[2];
-      const targetY = clampedY * sp[1];
-      const targetZ = clampedZ * sp[0];
+      const [targetX, targetY, targetZ] = voxelToCenteredWorldMm(
+        [clampedX, clampedY, clampedZ],
+        activeVolumeShape,
+        sp,
+      );
 
       // Mesh center in its own preview volume physical space
       const meshCx = mesh.center[0];
@@ -1399,7 +1649,7 @@ export default function SimulationPage() {
         visible: lesionOverlayVisibleMap[lesionIndex] !== false,
       };
     },
-    [phantom, activeVolumeShape, lesions, lesionOverlayOpacity, lesionOverlayVisibleMap],
+    [phantom, activeVolumeShape, activeVolumeSpacing, lesions, lesionOverlayOpacity, lesionOverlayVisibleMap],
   );
 
   /**
@@ -1416,7 +1666,7 @@ export default function SimulationPage() {
       return;
     }
 
-    const sp = phantom.metadata.spacing;
+    const sp = activeVolumeSpacing ?? phantom.metadata.spacing;
 
     setLesionOverlayLoading(true);
     setLesionOverlayError(null);
@@ -1454,9 +1704,11 @@ export default function SimulationPage() {
         const ly = lesion.center[1] > 0 ? Math.min(lesion.center[1], height - 1) : height / 2;
         const lz = lesion.center[2] > 0 ? Math.min(lesion.center[2], depth - 1) : depth / 2;
 
-        const targetX = lx * sp[2];
-        const targetY = ly * sp[1];
-        const targetZ = lz * sp[0];
+        const [targetX, targetY, targetZ] = voxelToCenteredWorldMm(
+          [lx, ly, lz],
+          activeVolumeShape,
+          sp,
+        );
 
         const tx = targetX - mesh.center[0];
         const ty = targetY - mesh.center[1];
@@ -1825,6 +2077,7 @@ export default function SimulationPage() {
                     size="sm"
                     onClick={() => {
                       setPickedPosition(null);
+                      setPickedWorldPositionMm(null);
                       setPickingMode(true);
                       setActiveTab('phantom');
                     }}
@@ -2050,9 +2303,14 @@ export default function SimulationPage() {
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2 text-[11px]">
-                      {pickedPosition && (
+                      {activePickedPosition && (
                         <span className="rounded-full border border-red-400/20 bg-red-400/10 px-2.5 py-1 text-red-200/80">
-                          Pick ({pickedPosition.x}, {pickedPosition.y}, z={pickedPosition.z})
+                          Pick ({activePickedPosition.x}, {activePickedPosition.y}, z={activePickedPosition.z})
+                        </span>
+                      )}
+                      {pickedWorldPositionMm && (
+                        <span className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-2.5 py-1 text-emerald-200/80">
+                          World ({pickedWorldPositionMm[0].toFixed(1)}, {pickedWorldPositionMm[1].toFixed(1)}, {pickedWorldPositionMm[2].toFixed(1)}) mm
                         </span>
                       )}
                       {pickingMode && (
@@ -2113,17 +2371,28 @@ export default function SimulationPage() {
                     <div className="flex items-center justify-between gap-2 border-b border-white/10 px-4 py-3">
                       <div>
                         <div className="text-xs font-semibold uppercase tracking-[0.18em] text-white/55">
-                          3D Accumulation
+                          3D Volume
                         </div>
                         <div className="mt-1 text-sm text-white/85">
-                          Progressive body build-up synced to the current slice
+                          Original CT rendering with segmentation color overlay
                         </div>
                       </div>
-                      {ctParamsLoading && (
-                        <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2.5 py-1 text-[11px] text-cyan-200/85">
-                          Running simulation...
-                        </span>
-                      )}
+                      <div className="flex items-center gap-2">
+                        <label className="flex items-center gap-1.5 text-[11px] text-white/60 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={sync3DToSlice}
+                            onChange={(e) => setSync3DToSlice(e.target.checked)}
+                            className="accent-primary"
+                          />
+                          Slice Sync
+                        </label>
+                        {ctParamsLoading && (
+                          <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2.5 py-1 text-[11px] text-cyan-200/85">
+                            Running simulation...
+                          </span>
+                        )}
+                      </div>
                     </div>
 
                     <div className="min-h-0 flex-1">
@@ -2131,7 +2400,6 @@ export default function SimulationPage() {
                         <VolumeRenderer
                           mode="synthetic"
                           showControls
-                          scanView
                           scanDirection="head_to_feet"
                           opacityPreset={
                             activePreset.label === 'Soft'
@@ -2143,11 +2411,11 @@ export default function SimulationPage() {
                           syntheticData={vtkVolumeData}
                           syntheticDims={vtkDims}
                           syntheticSpacing={vtkSpacing ?? undefined}
-                          syntheticClipIndex={sliceIndex}
+                          syntheticClipIndex={sync3DToSlice ? sliceIndex : undefined}
                           syntheticClipDirection="low_to_high"
                           syntheticScanAxis="z"
-                          segmentationMask={lesionOverlay?.mask ?? null}
-                          segmentationLabels={lesionOverlay?.labels ?? null}
+                          segmentationMask={compositeSegmentationOverlay?.mask ?? null}
+                          segmentationLabels={compositeSegmentationOverlay?.labels ?? null}
                           lesionMeshes={lesionOverlayMeshes.length > 0 ? lesionOverlayMeshes : null}
                         />
                       ) : (
@@ -2185,9 +2453,13 @@ export default function SimulationPage() {
                     </div>
                     <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
                       <div className="text-[11px] uppercase tracking-[0.16em] text-white/45">Playback</div>
-                      <div className="mt-1 text-sm font-medium text-white/85">{playSpeed} fps</div>
+                      <div className="mt-1 text-sm font-medium text-white/85">
+                        {sync3DToSlice ? `${playSpeed} fps` : 'Full Volume'}
+                      </div>
                       <div className="mt-1 text-xs text-white/45">
-                        {playing ? 'Auto-scrolling slices' : 'Manual browsing'}
+                        {sync3DToSlice
+                          ? (playing ? 'Auto-scrolling slices' : 'Manual slice-synced accumulation')
+                          : 'Showing the full CT volume'}
                       </div>
                     </div>
                   </div>
@@ -2221,6 +2493,45 @@ export default function SimulationPage() {
                     </button>
                   ))}
                 </div>
+
+                {ctWorkspaceSource === 'atlas' && (
+                  <>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground">Atlas:</span>
+                      <select
+                        value={selectedAtlasCaseId}
+                        onChange={(e) => {
+                          setSelectedAtlasCaseId(e.target.value);
+                          setCtParamsResult(null);
+                          setPhantomError(null);
+                        }}
+                        disabled={loadingAtlasCases || phantomLoading || atlasCases.length === 0}
+                        className="max-w-[220px] rounded border border-border bg-background px-2 py-1 text-xs"
+                      >
+                        {atlasCases.length === 0 ? (
+                          <option value="LUNG1-001">
+                            {loadingAtlasCases ? 'Loading atlas cases...' : 'No atlas cases found'}
+                          </option>
+                        ) : (
+                          atlasCases.map((atlasCase) => (
+                            <option key={atlasCase.caseId} value={atlasCase.caseId}>
+                              {atlasCase.label}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </div>
+
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void refreshAtlasCases()}
+                      disabled={loadingAtlasCases || phantomLoading}
+                    >
+                      {loadingAtlasCases ? 'Refreshing...' : 'Refresh Atlas'}
+                    </Button>
+                  </>
+                )}
 
                 {ctWorkspaceSource === 'dicom' && (
                   <>
@@ -2270,6 +2581,15 @@ export default function SimulationPage() {
                         ))}
                       </select>
                     </div>
+
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void refreshDicomStudies()}
+                      disabled={loadingStudies || phantomLoading}
+                    >
+                      {loadingStudies ? 'Refreshing...' : 'Refresh DICOM'}
+                    </Button>
                   </>
                 )}
 

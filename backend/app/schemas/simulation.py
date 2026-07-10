@@ -107,6 +107,7 @@ class SimulationPreviewResponse(BaseModel):
 class DicomLesionPreviewRequest(BaseModel):
     """Request to preview a lesion on a real DICOM series."""
     series_id: str
+    scan_direction: Literal["head_to_feet", "feet_to_head"] = "head_to_feet"
     lesion: LesionConfigCreate
     window_center: float = 40
     window_width: float = 400
@@ -280,7 +281,7 @@ class CTParamsPreviewRequest(BaseModel):
     """Request payload for CT parameter preview."""
 
     source: str = "atlas"
-    case_id: Optional[str] = "s0001"
+    case_id: Optional[str] = "LUNG1-001"
     study_id: Optional[str] = None
     series_id: Optional[str] = None
     size: int = Field(160, ge=64, le=320)
@@ -442,6 +443,7 @@ class DicomLesion3DPreviewRequest(BaseModel):
     normalized_center_x: float = Field(0.0, description="Normalized center X (0-1, 0=auto)")
     normalized_center_y: float = Field(0.0, description="Normalized center Y (0-1, 0=auto)")
     normalized_center_z: float = Field(0.0, description="Normalized center Z (0-1, 0=auto)")
+    scan_direction: Literal["head_to_feet", "feet_to_head"] = "head_to_feet"
     preview_size: int = Field(192, ge=64, le=320, description="Max edge size in voxels for preview downsampling")
 
 

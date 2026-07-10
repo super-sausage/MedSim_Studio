@@ -209,6 +209,16 @@ export interface CtParamsPreviewResponse {
   standardizedCase: StandardizedCtCase;
 }
 
+export interface AtlasCaseOption {
+  caseId: string;
+  label: string;
+}
+
+export interface AtlasCaseListResponse {
+  items: AtlasCaseOption[];
+  count: number;
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4/5: 3D Lesion Mesh Preview Types
 // ---------------------------------------------------------------------------
@@ -322,6 +332,7 @@ export interface LesionInPhantomPreviewResponse {
 
 export interface DicomLesion3DPreviewRequest {
   seriesId: string;
+  scanDirection?: CtScanDirection;
   lesionType: LesionType;
   shape: LesionShape;
   radiusX: number;

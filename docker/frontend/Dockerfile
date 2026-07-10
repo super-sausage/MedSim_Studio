@@ -11,21 +11,23 @@ WORKDIR /app
 
 ARG NPM_REGISTRY
 
-# Copy package.json only. The lockfile is Windows-generated, so let npm
-# resolve Linux-specific optional dependencies during the image build.
-COPY package.json ./
+# Copy manifest + lockfile first so dependency installs stay cacheable.
+COPY package.json package-lock.json ./
 
-# Install dependencies.
-# If NPM_REGISTRY build-arg is set, use it as the npm registry;
-# otherwise the default registry is used.
-# Limit Node memory to avoid OOM on low-RAM Docker hosts.
+# Install dependencies. The lockfile was generated on Windows, and `npm ci`
+# can miss Linux-only optional native packages such as Rollup binaries in this
+# setup, so use `npm install` here for cross-platform container reliability.
+# If NPM_REGISTRY build-arg is set, use it as the npm registry; otherwise the
+# default registry is used. Limit Node memory to avoid OOM on low-RAM hosts.
 ENV NODE_OPTIONS="--max-old-space-size=2048"
-RUN if [ -n "${NPM_REGISTRY}" ]; then \
+RUN --mount=type=cache,target=/root/.npm \
+    if [ -n "${NPM_REGISTRY}" ]; then \
         npm config set registry "${NPM_REGISTRY}"; \
     else \
         npm config set registry "https://registry.npmmirror.com"; \
     fi && \
-    npm install --timeout=120000 --no-audit --no-fund --legacy-peer-deps
+    npm install --timeout=120000 --no-audit --no-fund --legacy-peer-deps && \
+    npm install --timeout=120000 --no-audit --no-fund --legacy-peer-deps @rollup/rollup-linux-x64-gnu@4.60.4
 
 # ---- Stage 2: Build ----
 FROM node:20-slim AS builder
@@ -36,6 +38,7 @@ ARG VITE_API_BASE_URL=/api/v1
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 
 COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/package*.json ./
 COPY . .
 
 # Build the application

@@ -1,5 +1,6 @@
 import { api } from './api';
 import type {
+  AtlasCaseListResponse,
   CtParamsPreviewRequest,
   CtParamsPreviewResponse,
   Lesion3DPreviewRequest,
@@ -58,6 +59,13 @@ export interface PhantomMetadata {
   scanDirection?: string;                      // "head_to_feet" or "feet_to_head"
   flippedZ?: boolean;                          // true if z-axis was flipped
   niftiRz?: number;                            // raw S-component of NIfTI z-axis (debug)
+  origin?: [number, number, number];
+  direction?: [
+    [number, number, number],
+    [number, number, number],
+    [number, number, number],
+  ];
+  spatialReference?: string;
 
   // ---- Label statistics (atlas mode, when labels available) ----
   labelNonzeroCounts?: Record<number, number>; // label_id → voxel count
@@ -185,6 +193,10 @@ export interface DicomLesionPreviewResponse {
 // ---------------------------------------------------------------------------
 
 export const simulationService = {
+  /** List atlas cases available for CT workspace loading */
+  getAtlasCases: () =>
+    api.get<AtlasCaseListResponse>('/simulation/atlas-cases'),
+
   /** Create a new simulation job */
   createJob: (config: Partial<SimulationJob>) =>
     api.post<SimulationJob>('/simulation/jobs', toBackendJob(config)),
@@ -211,9 +223,11 @@ export const simulationService = {
     lesion: LesionConfig,
     windowCenter = 40,
     windowWidth = 400,
+    scanDirection: 'head_to_feet' | 'feet_to_head' = 'head_to_feet',
   ) =>
     api.post<DicomLesionPreviewResponse>('/simulation/preview/lesion-on-dicom', {
       series_id: seriesId,
+      scan_direction: scanDirection,
       lesion: toBackendLesion(lesion),
       window_center: windowCenter,
       window_width: windowWidth,
@@ -248,13 +262,13 @@ export const simulationService = {
    *
    * @param source        'procedural' (default) or 'atlas'
    * @param size          Volume max edge size in voxels (64–320, default 192)
-   * @param caseId        Atlas case ID, e.g. 's0001' (only used with source='atlas')
+   * @param caseId        Atlas case ID, e.g. 'LUNG1-001' (only used with source='atlas')
    * @param scanDirection Z-axis scan direction: 'head_to_feet' or 'feet_to_head'
    */
   getPhantom: (
     source: 'procedural' | 'atlas' | 'dicom' = 'procedural',
     size = 192,
-    caseId = 's0001',
+    caseId = 'LUNG1-001',
     scanDirection: 'head_to_feet' | 'feet_to_head' = 'head_to_feet',
     studyId?: string | null,
     seriesId?: string | null,

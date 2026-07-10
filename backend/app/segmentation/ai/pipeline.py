@@ -93,6 +93,7 @@ def run_full_segmentation(
             from app.ai.nnunet_lung_lobe import (
                 run_nnunet_lung_lobe,
                 is_available as lung_available,
+                remap_lung_lobe_labels_to_upper_body,
             )
             if not lung_available():
                 raise RuntimeError(
@@ -104,6 +105,7 @@ def run_full_segmentation(
                 volume=volume,
                 spacing=spacing,
             )
+            label_map = remap_lung_lobe_labels_to_upper_body(label_map)
         except Exception as e:
             logger.error("[PIPELINE] Job %s: nnUNet lung lobe FAILED: %s",
                          job_id, e, exc_info=True)
@@ -254,6 +256,11 @@ def run_full_segmentation(
         "num_labels": int(label_map.max()),
         "source_model": model_name,
         "detect_lesions": detect_lesions,
+        "label_space": (
+            "upper_body_atlas"
+            if model_name and model_name.lower() in ("nnunet_lung_lobe", "nnunet703_lunglobes")
+            else "model_native"
+        ),
     }
 
     logger.info("[PIPELINE] Job %s: DONE (total %.1fs)", job_id, _time.time() - _t0)

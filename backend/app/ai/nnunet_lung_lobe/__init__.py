@@ -4,6 +4,8 @@ Exposes:
   - run_nnunet_lung_lobe(): main inference entry point
   - is_available(): check that the model folder exists
   - CustomModelNotAvailableError
+  - remap_lung_lobe_labels_to_upper_body(): remap raw 5-lobe labels into the
+    unified upper-body atlas label space used elsewhere in the project
 """
 
 from app.ai.nnunet_lung_lobe.segmenter import (
@@ -11,9 +13,11 @@ from app.ai.nnunet_lung_lobe.segmenter import (
     is_available,
     CustomModelNotAvailableError,
 )
+from app.ai.nnunet_lung_lobe.labels import remap_lung_lobe_labels_to_upper_body
 
 __all__ = [
     "run_nnunet_lung_lobe",
     "is_available",
     "CustomModelNotAvailableError",
+    "remap_lung_lobe_labels_to_upper_body",
 ]

@@ -66,9 +66,8 @@ interface LesionMeshProp {
 // ---------------------------------------------------------------------------
 
 /** Default peak opacity for segmentation overlay (0..1).
- *  Lower values make the overlay more transparent so underlying CT
- *  anatomy (vessels, bronchi, texture) remains visible. */
-const DEFAULT_SEG_OPACITY = 0.25;
+ *  This should tint the CT volume, not replace it visually. */
+const DEFAULT_SEG_OPACITY = 0.045;
 
 /** Half-band width around integer label values in the opacity transfer
  *  function.  Keeps the function sharp at each label while preventing
