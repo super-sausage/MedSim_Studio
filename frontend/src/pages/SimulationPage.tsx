@@ -116,11 +116,11 @@ function SlicePositionIndicator({
           </linearGradient>
         </defs>
         <path
-          d="M26 30c-8 1-14 7-17 16l-5 19 13 4 7-15 3 28c1 12 4 25 8 38l-3 23h22l-3-23c4-13 7-26 8-38l3-28 7 15 13-4-5-19c-3-9-9-15-17-16l-10 4H36l-10-4Z"
+          d="M25 31c-8 1-14 7-17 16L4 65l13 4 7-15v86h40V54l7 15 13-4-4-18c-3-9-9-15-17-16l-9 3H34l-9-3Z"
           fill="url(#torso-guide-fill)"
         />
         <path d="M44 36v82M28 80h32" fill="none" stroke="#0f172a" strokeOpacity="0.28" strokeWidth="1" />
-        <path d="M29 143h30" fill="none" stroke="#a5f3fc" strokeLinecap="round" strokeWidth="3" />
+        <path d="M24 140h40" fill="none" stroke="#a5f3fc" strokeLinecap="round" strokeWidth="3" />
         <text x="44" y="20" textAnchor="middle" fill="#cbd5e1" fontSize="8">SHOULDERS</text>
         <text x="44" y="156" textAnchor="middle" fill="#cbd5e1" fontSize="8">WAIST</text>
         <line x1="8" y1={lineY} x2="80" y2={lineY} stroke="#fb7185" strokeWidth="2.5" />
@@ -2546,30 +2546,37 @@ export default function SimulationPage() {
                       </div>
                     </div>
 
-                    <div className="min-h-0 flex-1">
+                    <div className="relative min-h-0 flex-1">
                       {vtkVolumeData && vtkDims ? (
-                        <VolumeRenderer
-                          mode="synthetic"
-                          showControls
-                          scanView
-                          scanDirection="head_to_feet"
-                          opacityPreset={
-                            activePreset.label === 'Soft'
-                              ? 'ct-soft-tissue'
-                              : activePreset.label === 'Lung'
-                                ? 'ct-lung'
-                                : 'ct-bone'
-                          }
-                          syntheticData={vtkVolumeData}
-                          syntheticDims={vtkDims}
-                          syntheticSpacing={vtkSpacing ?? undefined}
-                          syntheticClipIndex={sync3DToSlice ? sliceIndex : undefined}
-                          syntheticClipDirection="low_to_high"
-                          syntheticScanAxis="z"
-                          segmentationMask={compositeSegmentationOverlay?.mask ?? null}
-                          segmentationLabels={compositeSegmentationOverlay?.labels ?? null}
-                          lesionMeshes={lesionOverlayMeshes.length > 0 ? lesionOverlayMeshes : null}
-                        />
+                        <>
+                          <VolumeRenderer
+                            mode="synthetic"
+                            showControls
+                            scanView
+                            scanDirection="head_to_feet"
+                            opacityPreset={
+                              activePreset.label === 'Soft'
+                                ? 'ct-soft-tissue'
+                                : activePreset.label === 'Lung'
+                                  ? 'ct-lung'
+                                  : 'ct-bone'
+                            }
+                            syntheticData={vtkVolumeData}
+                            syntheticDims={vtkDims}
+                            syntheticSpacing={vtkSpacing ?? undefined}
+                            syntheticClipIndex={sync3DToSlice ? sliceIndex : undefined}
+                            syntheticClipDirection="low_to_high"
+                            syntheticScanAxis="z"
+                            segmentationMask={compositeSegmentationOverlay?.mask ?? null}
+                            segmentationLabels={compositeSegmentationOverlay?.labels ?? null}
+                            lesionMeshes={lesionOverlayMeshes.length > 0 ? lesionOverlayMeshes : null}
+                          />
+                          <SlicePositionIndicator
+                            sliceIndex={sliceIndex}
+                            scanStartIndex={scanStartIndex}
+                            scanEndIndex={scanEndIndex}
+                          />
+                        </>
                       ) : (
                         <div className="flex h-full items-center justify-center px-6 text-center">
                           <p className="max-w-xs text-sm text-white/30">
