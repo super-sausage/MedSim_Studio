@@ -9,16 +9,23 @@ FROM node:20-slim AS deps
 
 WORKDIR /app
 
-ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG NPM_REGISTRY
 
 # Copy package.json only. The lockfile is Windows-generated, so let npm
 # resolve Linux-specific optional dependencies during the image build.
 COPY package.json ./
 
-# Install dependencies with a cacheable npm directory.
-RUN --mount=type=cache,target=/root/.npm \
-    npm config set registry ${NPM_REGISTRY} && \
-    npm install --timeout=300000 --no-audit --no-fund --legacy-peer-deps
+# Install dependencies.
+# If NPM_REGISTRY build-arg is set, use it as the npm registry;
+# otherwise the default registry is used.
+# Limit Node memory to avoid OOM on low-RAM Docker hosts.
+ENV NODE_OPTIONS="--max-old-space-size=2048"
+RUN if [ -n "${NPM_REGISTRY}" ]; then \
+        npm config set registry "${NPM_REGISTRY}"; \
+    else \
+        npm config set registry "https://registry.npmmirror.com"; \
+    fi && \
+    npm install --timeout=120000 --no-audit --no-fund --legacy-peer-deps
 
 # ---- Stage 2: Build ----
 FROM node:20-slim AS builder

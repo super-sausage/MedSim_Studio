@@ -295,3 +295,204 @@ class CTParamsPreviewResponse(BaseModel):
     metadata: Dict[str, Any]
     params_json: Dict[str, Any]
     standardized_case: Dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# 3D Lesion Mesh Preview schemas — Phase 4/5
+# ---------------------------------------------------------------------------
+
+
+class MeshBounds(BaseModel):
+    """Axis-aligned bounding box in physical (x, y, z) mm."""
+    min: List[float] = Field(..., min_length=3, max_length=3)
+    max: List[float] = Field(..., min_length=3, max_length=3)
+
+
+class Lesion3DPreviewRequest(BaseModel):
+    """Request for 3D mesh preview of a lesion configuration.
+
+    Mirrors LesionConfigCreate / DebugLesionRequest fields so the frontend
+    can send the same lesion parameters used in the 2D preview.
+    """
+    lesion_type: str = Field("tumor", description="Type of lesion")
+    shape: str = Field("spherical", description="Geometric shape")
+    center_x: float = Field(0.0, description="Center X (voxel, 0=auto-center)")
+    center_y: float = Field(0.0, description="Center Y (voxel, 0=auto-center)")
+    center_z: float = Field(0.0, description="Center Z (voxel, 0=auto-center)")
+    radius_x: float = Field(10.0, description="Radius X (mm)")
+    radius_y: float = Field(10.0, description="Radius Y (mm)")
+    radius_z: float = Field(10.0, description="Radius Z (mm)")
+    hu_mean: float = Field(40.0, description="Mean HU")
+    hu_std: float = Field(20.0, description="HU standard deviation")
+    margin_sharpness: float = Field(0.8, ge=0, le=1)
+    spiculation_degree: float = Field(0.0, ge=0, le=1)
+
+    # Mesh / mask mode
+    mesh_path: Optional[str] = Field(
+        None, description="Path to mesh file — enables mesh mode"
+    )
+    mask_path: Optional[str] = Field(
+        None, description="Path to NIfTI mask — enables mask mode"
+    )
+
+    # Preview volume control
+    preview_size: int = Field(
+        64, ge=32, le=256,
+        description="Preview volume edge size in voxels (isotropic)"
+    )
+    spacing: Optional[List[float]] = Field(
+        None, description="Voxel spacing [z, y, x] in mm. Defaults to [1.0, 1.0, 1.0]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lesion-in-Phantom 3D Preview schemas
+# ---------------------------------------------------------------------------
+
+
+class LesionInPhantomPreviewRequest(BaseModel):
+    """Request to preview a lesion embedded inside a CT phantom body.
+
+    Generates a procedural CT phantom (upper-body anatomy), places the
+    lesion inside (auto-placed in the right lung if center is not specified),
+    and returns both the phantom volume and the lesion mesh.
+
+    Center coordinates can be provided in two ways (mutually exclusive):
+      1. normalized_center (recommended): 0-1 range, the backend scales them
+         to its own phantom dimensions.
+      2. center_x/y/z: raw voxel coordinates. Only use when the caller knows
+         the exact phantom dimensions being generated.
+    """
+    lesion_type: str = Field("tumor", description="Type of lesion")
+    shape: str = Field("spherical", description="Geometric shape")
+    radius_x: float = Field(15.0, description="Radius X (mm)")
+    radius_y: float = Field(15.0, description="Radius Y (mm)")
+    radius_z: float = Field(15.0, description="Radius Z (mm)")
+    hu_mean: float = Field(40.0, description="Mean HU")
+    hu_std: float = Field(20.0, description="HU standard deviation")
+    margin_sharpness: float = Field(0.8, ge=0, le=1)
+    spiculation_degree: float = Field(0.0, ge=0, le=1)
+    phantom_size: int = Field(160, ge=64, le=320, description="Phantom cube edge size in voxels")
+    center_x: float = Field(0.0, description="Center X in phantom voxel space (0=auto)")
+    center_y: float = Field(0.0, description="Center Y in phantom voxel space (0=auto)")
+    center_z: float = Field(0.0, description="Center Z in phantom voxel space (0=auto)")
+    normalized_center_x: float = Field(0.0, description="Normalized center X (0-1, overrides center_x if > 0)")
+    normalized_center_y: float = Field(0.0, description="Normalized center Y (0-1, overrides center_y if > 0)")
+    normalized_center_z: float = Field(0.0, description="Normalized center Z (0-1, overrides center_z if > 0)")
+
+
+class LesionInPhantomPreviewResponse(BaseModel):
+    """Response with CT phantom volume data + lesion triangle mesh.
+
+    The phantom volume is returned as base64-encoded raw Float32 bytes
+    in (z, y, x) axis order (x fastest). The lesion mesh vertices are
+    in physical mm (x, y, z) and are already offset so they align with
+    the VTK volume origin used by VolumeRenderer (centered volume).
+
+    The frontend can pass the volume directly to VolumeRenderer as
+    ``syntheticData`` with ``mode='synthetic'`` and overlay the mesh
+    via ``lesionMeshes``.
+    """
+    phantom_volume_base64: str = Field(
+        ..., description="Base64-encoded raw Float32 volume data (z, y, x, little-endian)"
+    )
+    phantom_shape: List[int] = Field(
+        ..., min_length=3, max_length=3, description="Volume shape [z, y, x] in voxels"
+    )
+    phantom_spacing: List[float] = Field(
+        ..., min_length=3, max_length=3, description="Voxel spacing [z, y, x] in mm"
+    )
+    lesion_vertices: List[List[float]] = Field(
+        ..., description="N×3 vertex positions in physical (x, y, z) mm, in VTK centered space"
+    )
+    lesion_faces: List[List[int]] = Field(
+        ..., description="M×3 triangle indices into vertices"
+    )
+    lesion_normals: List[List[float]] = Field(
+        ..., description="N×3 per-vertex normal vectors"
+    )
+    lesion_center_mm: List[float] = Field(
+        ..., min_length=3, max_length=3, description="Center of lesion bounding box [cx, cy, cz] in mm"
+    )
+    lesion_volume_mm3: float = Field(0.0, description="Approximate enclosed volume in mm³")
+
+
+# ---------------------------------------------------------------------------
+# DICOM 3D Lesion Preview — lesion embedded in real DICOM volume
+# ---------------------------------------------------------------------------
+
+
+class DicomLesion3DPreviewRequest(BaseModel):
+    """Request to preview a lesion embedded inside a real DICOM volume in 3D.
+
+    The endpoint loads the DICOM series, downsamples to a manageable size,
+    generates the lesion at the specified position, and returns both the
+    modified volume and the lesion triangle mesh.
+    """
+    series_id: str = Field(..., description="DICOM series ID to load")
+    lesion_type: str = Field("tumor", description="Type of lesion")
+    shape: str = Field("spherical", description="Geometric shape")
+    radius_x: float = Field(15.0, description="Radius X (mm)")
+    radius_y: float = Field(15.0, description="Radius Y (mm)")
+    radius_z: float = Field(15.0, description="Radius Z (mm)")
+    hu_mean: float = Field(40.0, description="Mean HU")
+    hu_std: float = Field(20.0, description="HU standard deviation")
+    margin_sharpness: float = Field(0.8, ge=0, le=1)
+    spiculation_degree: float = Field(0.0, ge=0, le=1)
+    normalized_center_x: float = Field(0.0, description="Normalized center X (0-1, 0=auto)")
+    normalized_center_y: float = Field(0.0, description="Normalized center Y (0-1, 0=auto)")
+    normalized_center_z: float = Field(0.0, description="Normalized center Z (0-1, 0=auto)")
+    preview_size: int = Field(192, ge=64, le=320, description="Max edge size in voxels for preview downsampling")
+
+
+class DicomLesion3DPreviewResponse(BaseModel):
+    """Response with downsampled DICOM volume + embedded lesion triangle mesh.
+
+    The volume is downsampled so its largest dimension is <= preview_size.
+    The lesion mesh vertices are offset to align with the VTK centered volume
+    origin so the frontend can render them directly on top of each other.
+    """
+    volume_base64: str = Field(
+        ..., description="Base64-encoded raw Float32 volume data (z, y, x, little-endian)"
+    )
+    volume_shape: List[int] = Field(
+        ..., min_length=3, max_length=3, description="Volume shape [z, y, x] in voxels"
+    )
+    volume_spacing: List[float] = Field(
+        ..., min_length=3, max_length=3, description="Voxel spacing [z, y, x] in mm"
+    )
+    lesion_vertices: List[List[float]] = Field(
+        ..., description="N×3 vertex positions in physical (x, y, z) mm, in VTK centered space"
+    )
+    lesion_faces: List[List[int]] = Field(
+        ..., description="M×3 triangle indices into vertices"
+    )
+    lesion_normals: List[List[float]] = Field(
+        ..., description="N×3 per-vertex normal vectors"
+    )
+    lesion_center_mm: List[float] = Field(
+        ..., min_length=3, max_length=3, description="Center of lesion bounding box [cx, cy, cz] in mm"
+    )
+    lesion_volume_mm3: float = Field(0.0, description="Approximate enclosed volume in mm³")
+
+
+class Lesion3DPreviewResponse(BaseModel):
+    """3D triangle mesh of a lesion, ready for vtk.js rendering."""
+    vertices: List[List[float]] = Field(
+        ..., description="N×3 vertex positions in physical (x, y, z) mm"
+    )
+    faces: List[List[int]] = Field(
+        ..., description="M×3 triangle indices into vertices"
+    )
+    normals: List[List[float]] = Field(
+        ..., description="N×3 per-vertex normal vectors"
+    )
+    bounds: MeshBounds = Field(
+        ..., description="Axis-aligned bounding box in physical mm"
+    )
+    center: List[float] = Field(
+        ..., description="Center of bounding box [cx, cy, cz] in mm"
+    )
+    volume_mm3: float = Field(
+        0.0, description="Approximate enclosed volume in mm³"
+    )

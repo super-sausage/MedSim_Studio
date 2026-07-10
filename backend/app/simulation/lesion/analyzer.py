@@ -11,6 +11,9 @@ Provides morphology metrics independent of how the lesion was generated:
   - Surface area (mm²)              — from mask boundary via Marching Cubes
   - Sphericity                      — (π^(1/3) * (6V)^(2/3)) / A
 
+Also provides ``extract_mesh()`` for 3D mesh extraction via Marching Cubes,
+used by the /preview/lesion-3d API endpoint.
+
 Design
 ------
 - Pure function interface: `analyze(mask, hu_volume, spacing) -> dict`
@@ -19,7 +22,7 @@ Design
 """
 
 import logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -230,3 +233,110 @@ def _compute_sphericity(volume_mm3: float, surface_area_mm2: float) -> float:
         return 0.0
     numerator = np.pi ** (1.0 / 3.0) * (6.0 * volume_mm3) ** (2.0 / 3.0)
     return float(numerator / surface_area_mm2)
+
+
+# ---------------------------------------------------------------------------
+# 3D Mesh extraction — used by /preview/lesion-3d
+# ---------------------------------------------------------------------------
+
+
+def extract_mesh(
+    lesion_mask: np.ndarray,
+    spacing: Optional[Tuple[float, float, float]] = None,
+) -> Dict[str, Any]:
+    """
+    Extract a 3D triangle mesh from a binary lesion mask via Marching Cubes.
+
+    The mask should be the raw lesion volume (before writing into a CT
+    background) — i.e. the output of ``LesionGenerator.generate_lesion()``
+    thresholded with ``!= 0``.
+
+    Args:
+        lesion_mask: Binary mask (z, y, x), dtype bool or numeric.
+        spacing:     Voxel spacing (z, y, x) in mm. Defaults to (1, 1, 1).
+
+    Returns:
+        dict with keys:
+            vertices:   List of [x, y, z] vertex positions in mm (physical space)
+            faces:      List of [i, j, k] triangle indices
+            normals:    List of [nx, ny, nz] per-vertex normals
+            bounds:     {min: [x, y, z], max: [x, y, z]} in mm
+            center:     [cx, cy, cz] in mm (center of bounding box)
+            volume_mm3: Approximate enclosed volume in mm³
+
+    Raises:
+        RuntimeError: If scikit-image is not installed or marching_cubes fails.
+    """
+    if not _HAVE_SKIMAGE:
+        raise RuntimeError(
+            "scikit-image is required for mesh extraction. "
+            "Install with: pip install scikit-image"
+        )
+
+    mask = lesion_mask.astype(bool)
+    if not mask.any():
+        return {
+            "vertices": [],
+            "faces": [],
+            "normals": [],
+            "bounds": {"min": [0, 0, 0], "max": [0, 0, 0]},
+            "center": [0, 0, 0],
+            "volume_mm3": 0.0,
+        }
+
+    if spacing is None:
+        spacing = (1.0, 1.0, 1.0)
+
+    try:
+        # marching_cubes returns (verts, faces, normals, values) in (row, col, depth)
+        # order matching our (z, y, x) convention when spacing=(spacing_z, ...)
+        verts, faces, normals, _ = marching_cubes(
+            mask.astype(float),
+            level=0.5,
+            spacing=spacing,  # (z, y, x) — matches our convention
+            method="lewiner",
+        )
+
+        # verts are (N, 3) in (z, y, x) order from skimage.
+        # Convert to (x, y, z) for vtk.js / standard graphics convention.
+        verts_xyz = verts[:, [2, 1, 0]]  # (z, y, x) → (x, y, z)
+        normals_xyz = normals[:, [2, 1, 0]]
+
+        # Bounds in physical (x, y, z)
+        v_min = verts_xyz.min(axis=0).tolist()
+        v_max = verts_xyz.max(axis=0).tolist()
+        center = [
+            (v_min[0] + v_max[0]) / 2.0,
+            (v_min[1] + v_max[1]) / 2.0,
+            (v_min[2] + v_max[2]) / 2.0,
+        ]
+
+        # Compute volume via mesh_surface_area is not volume.
+        # Approximate enclosed volume from mask voxel count.
+        voxel_volume_mm3 = spacing[0] * spacing[1] * spacing[2]
+        volume_mm3 = float(np.sum(mask)) * voxel_volume_mm3
+
+        # Deduplicate vertices to reduce payload size
+        # (marching_cubes can produce shared vertices — we keep as-is for
+        #  simplicity; the frontend Float32Array approach handles duplicates fine)
+
+        result = {
+            "vertices": verts_xyz.astype(np.float32).tolist(),
+            "faces": faces.astype(np.int32).tolist(),
+            "normals": normals_xyz.astype(np.float32).tolist(),
+            "bounds": {"min": v_min, "max": v_max},
+            "center": center,
+            "volume_mm3": round(volume_mm3, 2),
+        }
+
+        logger.debug(
+            "extract_mesh: %d vertices, %d faces, volume=%.1f mm³",
+            len(result["vertices"]),
+            len(result["faces"]),
+            volume_mm3,
+        )
+        return result
+
+    except Exception as e:
+        logger.exception("Marching cubes mesh extraction failed")
+        raise RuntimeError(f"Mesh extraction failed: {e}") from e

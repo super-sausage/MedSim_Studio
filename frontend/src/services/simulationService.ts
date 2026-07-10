@@ -2,6 +2,12 @@ import { api } from './api';
 import type {
   CtParamsPreviewRequest,
   CtParamsPreviewResponse,
+  Lesion3DPreviewRequest,
+  Lesion3DPreviewResponse,
+  LesionInPhantomRequest,
+  LesionInPhantomPreviewResponse,
+  DicomLesion3DPreviewRequest,
+  DicomLesion3DPreviewResponse,
   LesionConfig,
   SimulationJob,
 } from '@/types/simulation';
@@ -268,6 +274,64 @@ export const simulationService = {
   /** Run CT scan parameter simulation preview for the current phantom */
   runCtParamsPreview: (request: CtParamsPreviewRequest): Promise<CtParamsPreviewResponse> =>
     api.post<CtParamsPreviewResponse>('/simulation/ct-params/preview', request, {
+      timeout: 180000,
+    }),
+
+  /**
+   * Preview a lesion as a 3D triangle mesh.
+   *
+   * The backend generates the lesion volume, runs Marching Cubes,
+   * and returns vertices/faces/normals for direct vtk.js rendering.
+   *
+   * @param lesion  Lesion parameters (same form fields used in 2D preview)
+   * @returns       Mesh geometry (vertices, faces, normals, bounds, center, volumeMm3)
+   */
+  previewLesion3D: (lesion: Lesion3DPreviewRequest): Promise<Lesion3DPreviewResponse> =>
+    api.post<Lesion3DPreviewResponse>('/simulation/preview/lesion-3d', lesion, {
+      timeout: 60000,
+    }),
+
+  /**
+   * Generate a lesion embedded inside a CT phantom body for 3D preview.
+   *
+   * The backend:
+   *   1. Generates a procedural upper-body CT phantom (lungs, bones, organs)
+   *   2. Places the lesion inside (auto-placed in the right lung if center=0)
+   *   3. Bakes the lesion HU values into the phantom volume
+   *   4. Extracts the lesion mesh via Marching Cubes
+   *   5. Returns both the phantom volume (base64) and the lesion mesh
+   *
+   * The mesh vertices are pre-offset to align with VTK's centered volume
+   * origin, so the frontend can pass them directly to VolumeRenderer
+   * as mode='synthetic' syntheticData + lesionMeshes without any transform.
+   *
+   * @param params  Lesion parameters + phantom configuration
+   * @returns       Phantom volume + lesion mesh in aligned coordinate space
+   */
+  previewLesionInPhantom: (
+    params: LesionInPhantomRequest,
+  ): Promise<LesionInPhantomPreviewResponse> =>
+    api.post<LesionInPhantomPreviewResponse>('/simulation/preview/lesion-in-phantom', params, {
+      timeout: 120000,
+    }),
+
+  /**
+   * Generate a 3D preview of a lesion embedded inside a real DICOM volume.
+   *
+   * The backend loads the DICOM series, downsamples to a manageable size,
+   * generates the lesion at the specified normalized position, bakes it
+   * into the volume, and returns both the volume and the lesion mesh.
+   *
+   * The mesh vertices are pre-offset to align with VTK's centered volume
+   * origin for direct overlay in VolumeRenderer mode='synthetic'.
+   *
+   * @param params  Lesion parameters with seriesId + normalized center
+   * @returns       Downsampled DICOM volume + lesion mesh
+   */
+  previewLesionOnDicom3D: (
+    params: DicomLesion3DPreviewRequest,
+  ): Promise<DicomLesion3DPreviewResponse> =>
+    api.post<DicomLesion3DPreviewResponse>('/simulation/preview/lesion-on-dicom-3d', params, {
       timeout: 180000,
     }),
 };

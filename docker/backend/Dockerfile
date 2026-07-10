@@ -9,20 +9,23 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-ARG APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ARG APT_MIRROR
+ARG PIP_INDEX_URL
+ARG PIP_TRUSTED_HOST=pypi.org
 
-# System dependencies for medical imaging libraries (using Tsinghua mirror)
-RUN sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
-    sed -i "s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
+# System dependencies for medical imaging libraries
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
+        sed -i "s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
     apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libgl1 \
-    libglib2.0-0 \
+    libglvnd0 \
+    libglx0 \
+    libglib2.0-0t64 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
     wget \
     && rm -rf /var/lib/apt/lists/*
@@ -49,8 +52,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=bind,source=./downloads,target=/downloads \
     pip install \
     --find-links=/downloads \
-    --index-url ${PIP_INDEX_URL} \
-    --trusted-host ${PIP_TRUSTED_HOST} \
+    ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} \
+    ${PIP_TRUSTED_HOST:+--trusted-host ${PIP_TRUSTED_HOST}} \
     --timeout 600 \
     torch==2.1.2+cu121
 
@@ -64,8 +67,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     echo "torch==2.1.2+cu121" > /tmp/torch-pin.txt && \
     pip install \
-    --index-url ${PIP_INDEX_URL} \
-    --trusted-host ${PIP_TRUSTED_HOST} \
+    ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} \
+    ${PIP_TRUSTED_HOST:+--trusted-host ${PIP_TRUSTED_HOST}} \
     --timeout 600 \
     --no-cache-dir \
     --constraint /tmp/torch-pin.txt \
@@ -75,17 +78,20 @@ FROM python:3.11-slim AS runner
 
 WORKDIR /app
 
-ARG APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
+ARG APT_MIRROR
 
-# Runtime system dependencies only (using Tsinghua mirror)
-RUN sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
-    sed -i "s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
+# Runtime system dependencies only
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
+        sed -i "s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
     apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglib2.0-0 \
+    libglvnd0 \
+    libglx0 \
+    libglib2.0-0t64 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 

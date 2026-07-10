@@ -33,14 +33,21 @@ from app.schemas.simulation import (
     SimulationPreviewResponse,
     DicomLesionPreviewRequest,
     DicomLesionPreviewResponse,
+    DicomLesion3DPreviewRequest,
+    DicomLesion3DPreviewResponse,
     DebugLesionRequest,
     DebugLesionResponse,
     LesionAnalysisRequest,
     LesionAnalysisResponse,
+    Lesion3DPreviewRequest,
+    Lesion3DPreviewResponse,
+    LesionInPhantomPreviewRequest,
+    LesionInPhantomPreviewResponse,
     CTParamsPreviewRequest,
     CTParamsPreviewResponse,
 )
 from app.simulation.lesion.generator import LesionGenerator
+from app.simulation.lesion.analyzer import extract_mesh
 from app.simulation.organ.simulator import OrganSimulator
 from app.simulation.volume_builder import build_volume_from_dicom, build_synthetic_volume
 from app.simulation.exporter import export_nrrd, export_nifti, export_dicom_zip
@@ -919,6 +926,107 @@ async def preview_lesion(config: dict):
         )
 
 
+@router.post("/preview/lesion-3d", response_model=Lesion3DPreviewResponse)
+async def preview_lesion_3d(request: Lesion3DPreviewRequest):
+    """
+    Generate a 3D triangle mesh preview of a lesion configuration.
+
+    Returns vertices, faces, and normals suitable for direct rendering
+    in vtk.js via vtkPolyData + vtkActor.
+
+    Supports all 5 shape types (spherical, ellipsoidal, lobulated,
+    spiculated, irregular) as well as MeshGenerator and MaskGenerator modes.
+
+    The preview volume is auto-sized based on lesion radii to balance
+    mesh quality and performance.
+    """
+    try:
+        # ── 1. Resolve spacing ──
+        spacing = tuple(request.spacing or [1.0, 1.0, 1.0])
+        if len(spacing) != 3:
+            spacing = (1.0, 1.0, 1.0)
+
+        # ── 2. Auto-size preview volume ──
+        # Ensure the volume is large enough to contain the lesion + margin
+        max_radius_mm = max(
+            abs(request.radius_x or 10),
+            abs(request.radius_y or 10),
+            abs(request.radius_z or 10),
+        )
+        min_spacing = min(spacing)
+        edge_voxels = max(
+            request.preview_size,
+            int(2.0 * max_radius_mm / min_spacing * 1.6 + 12),  # +margin
+        )
+        # Keep within bounds
+        edge_voxels = min(edge_voxels, 256)
+        volume_shape = (edge_voxels, edge_voxels, edge_voxels)
+
+        # ── 3. Normalise center (0 → auto-center) ──
+        cz, cy, cx = request.center_z, request.center_y, request.center_x
+        if cz == 0.0 and cy == 0.0 and cx == 0.0:
+            cz = float(volume_shape[0] // 2)
+            cy = float(volume_shape[1] // 2)
+            cx = float(volume_shape[2] // 2)
+
+        config_dict = {
+            "lesion_type": request.lesion_type,
+            "shape": request.shape,
+            "center_x": cx,
+            "center_y": cy,
+            "center_z": cz,
+            "radius_x": request.radius_x,
+            "radius_y": request.radius_y,
+            "radius_z": request.radius_z,
+            "hu_mean": request.hu_mean,
+            "hu_std": request.hu_std,
+            "margin_sharpness": request.margin_sharpness,
+            "spiculation_degree": request.spiculation_degree,
+        }
+
+        # ── 4. Generate lesion volume ──
+        generator = LesionGenerator()
+        lesion_vol = generator.generate_lesion(
+            volume_shape=volume_shape,
+            config=config_dict,
+            spacing=spacing,
+            mesh_path=request.mesh_path,
+            mask_path=request.mask_path,
+        )
+
+        # ── 5. Extract binary mask ──
+        lesion_mask = lesion_vol != 0
+
+        if not lesion_mask.any():
+            return Lesion3DPreviewResponse(
+                vertices=[],
+                faces=[],
+                normals=[],
+                bounds={"min": [0, 0, 0], "max": [0, 0, 0]},
+                center=[0, 0, 0],
+                volume_mm3=0.0,
+            )
+
+        # ── 6. Extract 3D mesh via Marching Cubes ──
+        mesh_data = extract_mesh(lesion_mask, spacing=spacing)
+
+        return Lesion3DPreviewResponse(
+            vertices=mesh_data["vertices"],
+            faces=mesh_data["faces"],
+            normals=mesh_data["normals"],
+            bounds=mesh_data["bounds"],
+            center=mesh_data["center"],
+            volume_mm3=mesh_data["volume_mm3"],
+        )
+
+    except Exception as e:
+        logger.exception("3D lesion preview endpoint failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"3D lesion preview failed: {str(e)[:500]}",
+        )
+
+
 @router.post("/preview/lesion-on-dicom", response_model=DicomLesionPreviewResponse)
 async def preview_lesion_on_dicom(
     request: DicomLesionPreviewRequest,
@@ -1065,6 +1173,327 @@ async def preview_lesion_on_dicom(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"DICOM lesion preview failed: {str(e)[:300]}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Lesion-in-Phantom 3D Preview — CT phantom body + embedded lesion
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/preview/lesion-in-phantom",
+    response_model=LesionInPhantomPreviewResponse,
+)
+async def preview_lesion_in_phantom(request: LesionInPhantomPreviewRequest):
+    """
+    Generate a lesion embedded inside a CT phantom body for 3D preview.
+
+    Step-by-step:
+      1. Generate a procedural upper-body CT phantom (lungs, bones, organs).
+      2. Auto-place the lesion in the right lung if center not specified.
+      3. Generate the lesion voxels and bake them into the phantom volume.
+      4. Extract the lesion triangle mesh via Marching Cubes.
+      5. Offset mesh vertices so they align with VTK's centered volume origin.
+
+    Returns both the phantom volume (base64) and the lesion mesh geometry,
+    ready for frontend VolumeRenderer in mode='synthetic' with lesionMeshes.
+    """
+    try:
+        # ── 1. Generate CT phantom ──
+        volume, _, metadata = generate_procedural_ct_phantom(
+            size=request.phantom_size,
+        )
+        shape = volume.shape  # (z, y, x)
+        spacing = tuple(metadata["spacing"])  # (sz, sy, sx)
+
+        # ── 2. Determine lesion center in phantom voxel space ──
+        # Priority: normalized_center (0-1) > raw center > auto-place
+        ncx, ncy, ncz = (
+            request.normalized_center_x,
+            request.normalized_center_y,
+            request.normalized_center_z,
+        )
+        if ncx > 0 and ncy > 0 and ncz > 0:
+            # Scale normalized coords to this phantom's dimensions
+            cz = ncz * float(shape[0])
+            cy = ncy * float(shape[1])
+            cx = ncx * float(shape[2])
+            logger.info(
+                "Lesion position from normalized coords: (%.3f, %.3f, %.33) → voxel (%.1f, %.1f, %.1f)",
+                ncx, ncy, ncz, cx, cy, cz,
+            )
+        else:
+            cz, cy, cx = request.center_z, request.center_y, request.center_x
+            if cz == 0.0 and cy == 0.0 and cx == 0.0:
+                # Auto-place in the right lung region
+                # Phantom normalized coords: lungs in upper ~60% (zn < 0.2)
+                # Right lung center ≈ (0.35, 0.0) normalized → voxel
+                cz = float(shape[0]) * 0.33   # ~1/3 from top (upper chest)
+                cy = float(shape[1]) * 0.50   # mid anterior-posterior
+                cx = float(shape[2]) * 0.65   # ~2/3 from left → right lung
+
+        # ── 3. Generate lesion in phantom space ──
+        config_dict = {
+            "lesion_type": request.lesion_type,
+            "shape": request.shape,
+            "center_x": cx,
+            "center_y": cy,
+            "center_z": cz,
+            "radius_x": request.radius_x,
+            "radius_y": request.radius_y,
+            "radius_z": request.radius_z,
+            "hu_mean": request.hu_mean,
+            "hu_std": request.hu_std,
+            "margin_sharpness": request.margin_sharpness,
+            "spiculation_degree": request.spiculation_degree,
+        }
+        generator = LesionGenerator()
+        lesion_vol = generator.generate_lesion(
+            volume_shape=shape,
+            config=config_dict,
+            spacing=spacing,
+        )
+
+        # ── 4. Bake lesion into phantom ──
+        lesion_mask = lesion_vol != 0
+        result_volume = volume.copy()
+        result_volume[lesion_mask] = lesion_vol[lesion_mask]
+
+        logger.info(
+            "Lesion-in-phantom: size=%s lesion_voxels=%d center=(%.1f, %.1f, %.1f)",
+            list(shape), int(lesion_mask.sum()), cz, cy, cx,
+        )
+
+        # ── 5. Extract lesion mesh ──
+        mesh_data = extract_mesh(lesion_mask, spacing=spacing)
+
+        # ── 6. Offset mesh vertices to match VTK centered volume origin ──
+        # VolumeRenderer.centerVolumeOrigin([x, y, z], [sx, sy, sz]) returns:
+        #   ox = -((x-1) * sx) / 2
+        #   oy = -((y-1) * sy) / 2
+        #   oz = -((z-1) * sz) / 2
+        # mesh vertices are in physical mm where voxel 0 → (0,0,0)
+        # so we add the centered origin to each vertex.
+        sx, sy, sz = spacing[2], spacing[1], spacing[0]  # (z,y,x) → (x,y,z)
+        dx, dy, dz = shape[2], shape[1], shape[0]
+        origin_x = -((dx - 1) * sx) / 2.0
+        origin_y = -((dy - 1) * sy) / 2.0
+        origin_z = -((dz - 1) * sz) / 2.0
+
+        raw_verts = mesh_data["vertices"]  # list of [x, y, z] in local mm
+        centered_verts = [
+            [v[0] + origin_x, v[1] + origin_y, v[2] + origin_z]
+            for v in raw_verts
+        ]
+
+        centered_center = mesh_data["center"].copy()
+        centered_center[0] += origin_x
+        centered_center[1] += origin_y
+        centered_center[2] += origin_z
+
+        # ── 7. Encode volume ──
+        volume_b64 = base64.b64encode(
+            np.asarray(result_volume, dtype="<f4").tobytes()
+        ).decode("ascii")
+
+        return LesionInPhantomPreviewResponse(
+            phantom_volume_base64=volume_b64,
+            phantom_shape=list(shape),
+            phantom_spacing=list(spacing),
+            lesion_vertices=centered_verts,
+            lesion_faces=mesh_data["faces"],
+            lesion_normals=mesh_data["normals"],
+            lesion_center_mm=centered_center,
+            lesion_volume_mm3=mesh_data["volume_mm3"],
+        )
+
+    except Exception as e:
+        logger.exception("Lesion-in-phantom preview failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lesion-in-phantom preview failed: {str(e)[:500]}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# DICOM 3D Lesion Preview — lesion embedded in real DICOM volume
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/preview/lesion-on-dicom-3d",
+    response_model=DicomLesion3DPreviewResponse,
+)
+async def preview_lesion_on_dicom_3d(
+    request: DicomLesion3DPreviewRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Generate a 3D preview of a lesion embedded inside a real DICOM volume.
+
+    Step-by-step:
+      1. Load the DICOM series and build a 3D volume.
+      2. Downsample the volume to ``preview_size`` (manageable for base64 transfer).
+      3. Map the normalized center coords to the downsampled voxel space.
+      4. Generate the lesion at that position (mm radii, HU values).
+      5. Bake the lesion into the downsampled volume.
+      6. Extract the lesion triangle mesh via Marching Cubes.
+      7. Offset mesh vertices to align with VTK's centered volume origin.
+
+    Returns the downsampled volume (base64) + lesion mesh geometry,
+    ready for frontend VolumeRenderer in mode='synthetic' with lesionMeshes.
+    """
+    try:
+        # ── 1. Load DICOM instances ──
+        instances = (
+            db.query(DicomInstance)
+            .filter(DicomInstance.series_id == request.series_id)
+            .order_by(DicomInstance.instance_number.asc().nulls_last())
+            .all()
+        )
+        if not instances:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Series {request.series_id} not found",
+            )
+
+        storage = get_storage_backend()
+        volume, metadata = build_volume_from_dicom(storage, instances)
+        original_shape = volume.shape  # (z, y, x)
+        original_spacing = tuple(metadata.get("spacing", (1.0, 1.0, 1.0)))
+
+        logger.info(
+            "DICOM 3D preview: original shape=%s spacing=%s",
+            list(original_shape), list(original_spacing),
+        )
+
+        # ── 2. Downsample to preview_size if needed ──
+        max_dim = max(original_shape)
+        if max_dim > request.preview_size:
+            scale = request.preview_size / max_dim
+            new_shape = tuple(
+                max(1, int(round(d * scale))) for d in original_shape
+            )
+            from skimage.transform import resize
+            volume_resized = resize(
+                volume.astype(np.float32),
+                new_shape,
+                order=1,          # linear interpolation
+                preserve_range=True,
+                anti_aliasing=True,
+            )
+            new_spacing = (
+                original_spacing[0] * original_shape[0] / new_shape[0],
+                original_spacing[1] * original_shape[1] / new_shape[1],
+                original_spacing[2] * original_shape[2] / new_shape[2],
+            )
+            logger.info(
+                "DICOM 3D preview: downsampled %s → %s, spacing %s → %s",
+                list(original_shape), list(new_shape),
+                [f"{s:.3f}" for s in original_spacing],
+                [f"{s:.3f}" for s in new_spacing],
+            )
+            shape = new_shape
+            spacing = new_spacing
+            result_volume = volume_resized.astype(np.float32)
+        else:
+            shape = original_shape
+            spacing = original_spacing
+            result_volume = volume.copy()
+
+        # ── 3. Determine lesion center in the (downsampled) volume ──
+        ncx, ncy, ncz = (
+            request.normalized_center_x,
+            request.normalized_center_y,
+            request.normalized_center_z,
+        )
+        if ncx > 0 and ncy > 0 and ncz > 0:
+            cx = ncx * float(shape[2])   # x = width
+            cy = ncy * float(shape[1])   # y = height
+            cz = ncz * float(shape[0])   # z = depth
+            logger.info(
+                "DICOM 3D: normalized (%.3f, %.3f, %.3f) → voxel (%.1f, %.1f, %.1f)  shape=%s",
+                ncx, ncy, ncz, cx, cy, cz, list(shape),
+            )
+        else:
+            cz = float(shape[0]) * 0.4
+            cy = float(shape[1]) * 0.5
+            cx = float(shape[2]) * 0.5
+
+        # ── 4. Generate lesion ──
+        config_dict = {
+            "lesion_type": request.lesion_type,
+            "shape": request.shape,
+            "center_x": cx,
+            "center_y": cy,
+            "center_z": cz,
+            "radius_x": request.radius_x,
+            "radius_y": request.radius_y,
+            "radius_z": request.radius_z,
+            "hu_mean": request.hu_mean,
+            "hu_std": request.hu_std,
+            "margin_sharpness": request.margin_sharpness,
+            "spiculation_degree": request.spiculation_degree,
+        }
+        generator = LesionGenerator()
+        lesion_vol = generator.generate_lesion(
+            volume_shape=shape,
+            config=config_dict,
+            spacing=spacing,
+        )
+        lesion_mask = lesion_vol != 0
+
+        # ── 5. Bake lesion into volume ──
+        result_volume[lesion_mask] = lesion_vol[lesion_mask]
+        logger.info(
+            "DICOM 3D preview: lesion generated — voxels=%d center=(%.1f, %.1f, %.1f)",
+            int(lesion_mask.sum()), cz, cy, cx,
+        )
+
+        # ── 6. Extract lesion mesh ──
+        mesh_data = extract_mesh(lesion_mask, spacing=spacing)
+
+        # ── 7. Offset mesh vertices to VTK centered volume origin ──
+        sx, sy, sz = spacing[2], spacing[1], spacing[0]  # (z,y,x) → (x,y,z)
+        dx, dy, dz = shape[2], shape[1], shape[0]
+        origin_x = -((dx - 1) * sx) / 2.0
+        origin_y = -((dy - 1) * sy) / 2.0
+        origin_z = -((dz - 1) * sz) / 2.0
+
+        raw_verts = mesh_data["vertices"]
+        centered_verts = [
+            [v[0] + origin_x, v[1] + origin_y, v[2] + origin_z]
+            for v in raw_verts
+        ]
+        centered_center = mesh_data["center"].copy()
+        centered_center[0] += origin_x
+        centered_center[1] += origin_y
+        centered_center[2] += origin_z
+
+        # ── 8. Encode volume ──
+        volume_b64 = base64.b64encode(
+            np.asarray(result_volume, dtype="<f4").tobytes()
+        ).decode("ascii")
+
+        return DicomLesion3DPreviewResponse(
+            volume_base64=volume_b64,
+            volume_shape=list(shape),
+            volume_spacing=list(spacing),
+            lesion_vertices=centered_verts,
+            lesion_faces=mesh_data["faces"],
+            lesion_normals=mesh_data["normals"],
+            lesion_center_mm=centered_center,
+            lesion_volume_mm3=mesh_data["volume_mm3"],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("DICOM 3D lesion preview failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"DICOM 3D lesion preview failed: {str(e)[:500]}",
         )
 
 

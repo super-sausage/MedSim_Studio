@@ -2,9 +2,9 @@ import { useRef, useEffect, useState, useCallback } from 'react';
 
 // ---------------------------------------------------------------------------
 // vtk.js imports
-// Profile must load first to register GPU volume ray cast mapper backends
+// Profile must load first to register GPU mappers (Volume + Geometry for mesh)
 // ---------------------------------------------------------------------------
-import '@kitware/vtk.js/Rendering/Profiles/Volume';
+import '@kitware/vtk.js/Rendering/Profiles/All';
 
 import vtkRenderWindow from '@kitware/vtk.js/Rendering/Core/RenderWindow';
 import vtkRenderer from '@kitware/vtk.js/Rendering/Core/Renderer';
@@ -20,6 +20,8 @@ import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 import vtkPlane from '@kitware/vtk.js/Common/DataModel/Plane';
 
 import { loadDicomVolume, type DicomVolumeData } from './dicomVolumeLoader';
+import { createLesionActor } from '../mesh/createLesionActor';
+import type { LesionActorResult } from '../mesh/createLesionActor';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,6 +43,24 @@ interface SegmentationLabelDef {
   color: [number, number, number]; // RGB 0-255
 }
 
+/** A single lesion mesh for rendering overlay or standalone preview */
+interface LesionMeshProp {
+  /** Unique ID for React tracking */
+  id: string;
+  /** N×3 vertex positions in physical (x, y, z) mm */
+  vertices: number[][];
+  /** M×3 triangle face indices (0-based) */
+  faces: number[][];
+  /** N×3 per-vertex normal vectors */
+  normals: number[][];
+  /** Opacity 0..1 (default 1.0) */
+  opacity?: number;
+  /** RGB color components 0..1 (default [1, 0.3, 0.3]) */
+  color?: [number, number, number];
+  /** Visibility toggle (default true) */
+  visible?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -56,8 +76,8 @@ const DEFAULT_SEG_OPACITY = 0.25;
 const LABEL_HALF_BAND = 0.45;
 
 interface VolumeRendererProps {
-  /** Render mode: synthetic phantom (default) or real DICOM series */
-  mode?: 'synthetic' | 'dicom';
+  /** Render mode: synthetic phantom (default), real DICOM series, or standalone mesh preview */
+  mode?: 'synthetic' | 'dicom' | 'mesh';
   /** DICOM series ID — required when mode='dicom' */
   seriesId?: string;
   /** Initial opacity function preset */
@@ -106,6 +126,13 @@ interface VolumeRendererProps {
    * 'head_to_feet' (default) or 'feet_to_head'.
    */
   scanDirection?: 'head_to_feet' | 'feet_to_head';
+  /**
+   * Lesion meshes to render.
+   * In mode='mesh': rendered standalone on dark background.
+   * In mode='synthetic'|'dicom': overlaid on the CT volume.
+   * Supports multiple lesions for multi-lesion scenarios.
+   */
+  lesionMeshes?: LesionMeshProp[] | null;
 }
 
 /** Shape of a transfer function preset */
@@ -361,6 +388,7 @@ export function VolumeRenderer({
   syntheticScanAxis = 'z',
   scanView = false,
   scanDirection = 'head_to_feet',
+  lesionMeshes,
 }: VolumeRendererProps) {
   // ---- DOM ref ----
   const containerRef = useRef<HTMLDivElement>(null);
@@ -371,11 +399,11 @@ export function VolumeRenderer({
     renderer: any;
     openglRW: any;
     interactor: any;
-    volume: any;
-    mapper: any;
-    imageData: any;
-    colorTransfer: any;
-    piecewiseFunc: any;
+    volume?: any;
+    mapper?: any;
+    imageData?: any;
+    colorTransfer?: any;
+    piecewiseFunc?: any;
   } | null>(null);
 
   // ---- Segmentation overlay volume ref (separate from main CT volume) ----
@@ -386,6 +414,9 @@ export function VolumeRenderer({
     colorTransfer: any;
     piecewiseFunc: any;
   } | null>(null);
+
+  // ---- Mesh actor refs (lesion mesh lifecycle management) ----
+  const meshActorRef = useRef<LesionActorResult[]>([]);
 
   // ---- UI state ----
   const [isReady, setIsReady] = useState(false);
@@ -412,6 +443,56 @@ export function VolumeRenderer({
       setClip({ x: 0, y: 0, z: 0 });
 
       try {
+        // ------ mesh mode: standalone lesion preview (no CT volume) ------
+        if (mode === 'mesh') {
+          if (cancelled) return;
+
+          const rect = container.getBoundingClientRect();
+          console.log('[VolumeRenderer] mesh init: container rect', {
+            w: rect.width,
+            h: rect.height,
+            top: rect.top,
+            left: rect.left,
+          });
+
+          const renderWindow = vtkRenderWindow.newInstance();
+          const renderer = vtkRenderer.newInstance();
+          renderer.setBackground(0.08, 0.08, 0.12);
+          renderWindow.addRenderer(renderer);
+
+          const openglRW = vtkOpenGLRenderWindow.newInstance();
+          openglRW.setContainer(container);
+          const { width, height } = rect;
+          openglRW.setSize(Math.max(width, 1), Math.max(height, 1));
+          renderWindow.addView(openglRW);
+
+          // Debug: check created canvas
+          const debugCanvas = openglRW.getCanvas();
+          console.log('[VolumeRenderer] canvas after creation:', {
+            exists: !!debugCanvas,
+            tag: debugCanvas?.tagName,
+            width: debugCanvas?.width,
+            height: debugCanvas?.height,
+            parentTag: debugCanvas?.parentElement?.tagName,
+          });
+
+          const interactor = vtkRenderWindowInteractor.newInstance();
+          interactor.setView(openglRW);
+          interactor.initialize();
+          interactor.setInteractorStyle(vtkInteractorStyleTrackballCamera.newInstance());
+          interactor.bindEvents(container);
+
+          renderWindow.render();
+
+          vtkRef.current = { renderWindow, renderer, openglRW, interactor };
+
+          if (!cancelled) {
+            setIsReady(true);
+            setIsLoading(false);
+          }
+          return; // ← skip all volume-related setup
+        }
+
         // ------ acquire volume data ------
         let volData: {
           scalarData: Float32Array;
@@ -624,6 +705,9 @@ export function VolumeRenderer({
   useEffect(() => {
     const state = vtkRef.current;
     if (!state || !isReady) return;
+
+    // Skip if no volume (mesh-only mode — no CT volume to apply presets to)
+    if (!state.volume) return;
 
     const newColor = vtkColorTransferFunction.newInstance();
     const newOpacity = vtkPiecewiseFunction.newInstance();
@@ -902,6 +986,94 @@ export function VolumeRenderer({
   }, [segmentationOpacity, isReady]);
 
   // ------------------------------------------------------------------
+  // 4c. Lesion mesh actors — create/update/cleanup per lesionMeshes prop
+  //      Works in all modes: standalone (mode='mesh') or overlaid on CT
+  //      (mode='synthetic'|'dicom').
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const renderer = vtkRef.current?.renderer;
+    const renderWindow = vtkRef.current?.renderWindow;
+    if (!renderer || !renderWindow || !isReady) return;
+
+    console.log('[VolumeRenderer] lesion effect triggered', {
+      lesionMeshes: lesionMeshes?.map(m => ({ id: m.id, v: m.vertices?.length, f: m.faces?.length })),
+      mode,
+      hasActorRef: meshActorRef.current.length,
+    });
+
+    // Cleanup previous mesh actors (remove from scene + GPU memory)
+    for (const item of meshActorRef.current) {
+      renderer.removeActor(item.actor);
+      try { item.actor.delete(); } catch (_) { /* noop */ }
+      try { item.mapper.delete(); } catch (_) { /* noop */ }
+      try { item.polyData.delete(); } catch (_) { /* noop */ }
+    }
+    meshActorRef.current = [];
+
+    // No meshes to show — just re-render and exit
+    if (!lesionMeshes || lesionMeshes.length === 0) {
+      renderWindow.render();
+      return;
+    }
+
+    // Create actors for every visible mesh
+    const actors: LesionActorResult[] = [];
+    for (const mesh of lesionMeshes) {
+      if (mesh.visible === false) continue; // skip hidden
+
+      try {
+        const result = createLesionActor(mesh.vertices, mesh.faces, mesh.normals, {
+          opacity: mesh.opacity ?? 1.0,
+          color: mesh.color ?? [1, 0.3, 0.3],
+          visible: true,
+        });
+        const bounds = result.actor.getBounds();
+        console.log('[VolumeRenderer] created actor', mesh.id, {
+          bounds,
+          nVertices: mesh.vertices.length,
+          nFaces: mesh.faces.length,
+        });
+        renderer.addActor(result.actor);
+        actors.push(result);
+      } catch (err) {
+        console.error('[VolumeRenderer] Failed to create lesion actor for mesh', mesh.id, err);
+      }
+    }
+    meshActorRef.current = actors;
+
+    // Standalone mesh mode: frame camera to the combined mesh bounding box
+    if (mode === 'mesh' && actors.length > 0 && containerRef.current) {
+      resetCameraToMesh(renderer, actors, containerRef.current);
+      const cam = renderer.getActiveCamera();
+      console.log('[VolumeRenderer] camera position after reset:', {
+        pos: cam.getPosition(),
+        fp: cam.getFocalPoint(),
+      });
+    }
+
+    renderWindow.render();
+    // Check canvas dimensions
+    if (mode === 'mesh') {
+      const gl = vtkRef.current?.openglRW?.getCanvas?.();
+      if (gl) {
+        console.log('[VolumeRenderer] canvas size:', gl.width, 'x', gl.height);
+      }
+      // Check WebGL context
+      try {
+        const canvas = vtkRef.current?.openglRW?.getCanvas?.();
+        if (canvas) {
+          const ctx = canvas.getContext('webgl2') || canvas.getContext('webgl');
+          console.log('[VolumeRenderer] WebGL context:', !!ctx, 'canvas parent:', canvas.parentElement?.className);
+          console.log('[VolumeRenderer] canvas CSS:', getComputedStyle(canvas).width, getComputedStyle(canvas).height);
+        }
+      } catch(e) {
+        console.warn('[VolumeRenderer] WebGL check error:', e);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lesionMeshes, isReady, mode]);
+
+  // ------------------------------------------------------------------
   // 5. Handle container resize
   // ------------------------------------------------------------------
   useEffect(() => {
@@ -913,14 +1085,20 @@ export function VolumeRenderer({
       const { width, height } = container.getBoundingClientRect();
       if (width > 0 && height > 0) {
         state.openglRW.setSize(width, height);
-        resetCameraToVolume(state.renderer, state.imageData, container, scanView);
+
+        if (mode === 'mesh' && meshActorRef.current.length > 0) {
+          resetCameraToMesh(state.renderer, meshActorRef.current, container);
+        } else if (state.imageData) {
+          resetCameraToVolume(state.renderer, state.imageData, container, scanView);
+        }
+
         state.renderWindow.render();
       }
     });
 
     observer.observe(container);
     return () => observer.disconnect();
-  }, [isReady, scanView]);
+  }, [isReady, scanView, mode]);
 
   // ------------------------------------------------------------------
   // 5. Preset button handler
@@ -1039,6 +1217,64 @@ export function VolumeRenderer({
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Frame the camera to encompass all mesh actors.
+ * Computes the combined axis-aligned bounding box across all actors
+ * and positions the camera so the full bounding box is visible.
+ */
+function resetCameraToMesh(
+  renderer: any,
+  actors: LesionActorResult[],
+  container: HTMLDivElement,
+): void {
+  // Compute combined bounding box
+  let bounds: [number, number, number, number, number, number] | null = null;
+  for (const { actor } of actors) {
+    const b = actor.getBounds();
+    if (!b) continue;
+    if (!bounds) {
+      bounds = [b[0], b[1], b[2], b[3], b[4], b[5]];
+    } else {
+      bounds[0] = Math.min(bounds[0], b[0]);
+      bounds[1] = Math.max(bounds[1], b[1]);
+      bounds[2] = Math.min(bounds[2], b[2]);
+      bounds[3] = Math.max(bounds[3], b[3]);
+      bounds[4] = Math.min(bounds[4], b[4]);
+      bounds[5] = Math.max(bounds[5], b[5]);
+    }
+  }
+  if (!bounds) return;
+
+  const center: [number, number, number] = [
+    (bounds[0] + bounds[1]) / 2,
+    (bounds[2] + bounds[3]) / 2,
+    (bounds[4] + bounds[5]) / 2,
+  ];
+
+  const diag = Math.sqrt(
+    (bounds[1] - bounds[0]) ** 2 +
+    (bounds[3] - bounds[2]) ** 2 +
+    (bounds[5] - bounds[4]) ** 2,
+  );
+
+  const { width, height } = container.getBoundingClientRect();
+  const aspect = Math.max(width, 1) / Math.max(height, 1);
+
+  const camera = renderer.getActiveCamera();
+  camera.setFocalPoint(center[0], center[1], center[2]);
+  camera.setViewAngle(30);
+
+  const viewAngleRad = (30 * Math.PI) / 180;
+  const fitHeight = diag / 2 / Math.tan(viewAngleRad / 2);
+  const fitWidth = (diag / 2 * aspect) / Math.tan(viewAngleRad / 2);
+  const distance = Math.max(fitHeight, fitWidth) * 1.15;
+
+  camera.setPosition(center[0], center[1] + distance, center[2]);
+  camera.setViewUp(0, 0, -1);
+
+  renderer.resetCameraClippingRange(bounds);
+}
 
 /** Apply a transfer-function preset to brand-new TF instances. */
 function applyPreset(

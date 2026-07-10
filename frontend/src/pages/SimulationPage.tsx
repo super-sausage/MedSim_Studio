@@ -8,6 +8,11 @@ import { dicomService } from '@/services/dicomService';
 import type {
   CtParamsPreviewParams,
   CtParamsPreviewResponse,
+  Lesion3DPreviewRequest,
+  Lesion3DPreviewResponse,
+  LesionInPhantomPreviewResponse,
+  DicomLesion3DPreviewResponse,
+  LesionMeshData,
   LesionConfig,
   LesionType,
   LesionShape,
@@ -392,6 +397,26 @@ export default function SimulationPage() {
   const [standardizedCaseCopyState, setStandardizedCaseCopyState] = useState<string | null>(null);
   const [standardizedCaseDownloadState, setStandardizedCaseDownloadState] = useState<string | null>(null);
 
+  // ---- 3D lesion mesh preview state ----
+  const [meshPreviewOpen, setMeshPreviewOpen] = useState(false);
+  const [meshPreviewData, setMeshPreviewData] = useState<LesionMeshData | null>(null);
+  const [meshPreviewLoading, setMeshPreviewLoading] = useState(false);
+  const [meshPreviewError, setMeshPreviewError] = useState<string | null>(null);
+  /** Phantom volume data for the in-body 3D preview */
+  const [previewPhantomData, setPreviewPhantomData] = useState<Float32Array | null>(null);
+  const [previewPhantomDims, setPreviewPhantomDims] = useState<[number, number, number] | null>(null);
+  const [previewPhantomSpacing, setPreviewPhantomSpacing] = useState<[number, number, number] | null>(null);
+
+  // ---- Phase 5: Lesion mesh overlay on CT volume state ----
+  const [lesionOverlayLoading, setLesionOverlayLoading] = useState(false);
+  const [lesionOverlayError, setLesionOverlayError] = useState<string | null>(null);
+  /** Base mesh data per lesion index (geometry in CT phantom physical coords) */
+  const [lesionOverlayBaseMeshes, setLesionOverlayBaseMeshes] = useState<LesionMeshData[]>([]);
+  /** Global opacity for all overlay meshes (0..1) */
+  const [lesionOverlayOpacity, setLesionOverlayOpacity] = useState(0.5);
+  /** Per-lesion visibility keyed by lesion index */
+  const [lesionOverlayVisibleMap, setLesionOverlayVisibleMap] = useState<Record<number, boolean>>({});
+
   // ---- Active rendering data ----
   const [decodedPhantomData, setDecodedPhantomData] = useState<Float32Array | null>(null);
   const [decodedLabelData, setDecodedLabelData] = useState<Uint8Array | null>(null);
@@ -544,6 +569,17 @@ export default function SimulationPage() {
 
     return { mask, labels };
   }, [lesions, phantom]);
+
+  // ---- Phase 5: Lesion mesh overlay (transformed to CT phantom coords) ----
+  const lesionOverlayMeshes = useMemo<LesionMeshData[]>(() => {
+    if (lesionOverlayBaseMeshes.length === 0) return [];
+
+    return lesionOverlayBaseMeshes.map((base, i) => ({
+      ...base,
+      opacity: lesionOverlayOpacity,
+      visible: lesionOverlayVisibleMap[i] !== false,
+    }));
+  }, [lesionOverlayBaseMeshes, lesionOverlayOpacity, lesionOverlayVisibleMap]);
 
   const simulatedVolumeData = useMemo(() => {
     if (!ctParamsResult?.simulatedVolumeBase64) return null;
@@ -1082,6 +1118,132 @@ export default function SimulationPage() {
     }
   }, [form]);
 
+  /**
+   * Preview current lesion inside a CT phantom body or DICOM volume in 3D.
+   *
+   * - If source is 'dicom': calls endpoint that loads the DICOM volume,
+   *   downsamples it, bakes the lesion in, and returns volume + mesh.
+   * - If source is 'synthetic': calls endpoint that generates a procedural
+   *   CT phantom with the lesion embedded.
+   *
+   * The VolumeRenderer renders the CT volume (mode='synthetic') with
+   * the lesion mesh overlaid.
+   */
+  const handlePreview3D = useCallback(async () => {
+    const radius = form.diameter / 2;
+
+    // Reset state
+    setMeshPreviewData(null);
+    setPreviewPhantomData(null);
+    setPreviewPhantomDims(null);
+    setPreviewPhantomSpacing(null);
+    setMeshPreviewError(null);
+    setMeshPreviewLoading(true);
+    setMeshPreviewOpen(true);
+
+    try {
+      // Shared lesion params
+      const lesionParams = {
+        lesionType: form.lesionType,
+        shape: form.shape,
+        normalizedCenterX: form.normalizedCenterX || 0,
+        normalizedCenterY: form.normalizedCenterY || 0,
+        normalizedCenterZ: form.normalizedCenterZ || 0,
+        radiusX: radius,
+        radiusY: radius,
+        radiusZ: radius,
+        huMean: form.huMean,
+        huStd: form.huStd,
+        marginSharpness: form.marginSharpness,
+        spiculationDegree: form.spiculationDegree,
+      };
+
+      let volumeBase64: string;
+      let volumeShape: [number, number, number];
+      let volumeSpacing: [number, number, number];
+      let lesionVertices: number[][];
+      let lesionFaces: number[][];
+      let lesionNormals: number[][];
+
+      if (sourceType === 'dicom' && selectedSeriesId) {
+        // ── Branch A: Lesion embedded in real DICOM volume ──
+        const result: DicomLesion3DPreviewResponse =
+          await simulationService.previewLesionOnDicom3D({
+            seriesId: selectedSeriesId,
+            ...lesionParams,
+            previewSize: 192,
+          });
+        volumeBase64 = result.volumeBase64;
+        volumeShape = result.volumeShape;
+        volumeSpacing = result.volumeSpacing;
+        lesionVertices = result.lesionVertices;
+        lesionFaces = result.lesionFaces;
+        lesionNormals = result.lesionNormals;
+
+        console.log('[SimulationPage] DICOM 3D preview received', {
+          shape: volumeShape,
+          spacing: volumeSpacing,
+          vertices: lesionVertices?.length,
+          faces: lesionFaces?.length,
+        });
+      } else {
+        // ── Branch B: Lesion embedded in procedural CT phantom ──
+        const result: LesionInPhantomPreviewResponse =
+          await simulationService.previewLesionInPhantom({
+            ...lesionParams,
+            phantomSize: 160,
+          });
+        volumeBase64 = result.phantomVolumeBase64;
+        volumeShape = result.phantomShape;
+        volumeSpacing = result.phantomSpacing;
+        lesionVertices = result.lesionVertices;
+        lesionFaces = result.lesionFaces;
+        lesionNormals = result.lesionNormals;
+
+        console.log('[SimulationPage] phantom 3D preview received', {
+          shape: volumeShape,
+          spacing: volumeSpacing,
+          vertices: lesionVertices?.length,
+          faces: lesionFaces?.length,
+        });
+      }
+
+      // ── Decode volume (base64 → Float32Array) ──
+      const binaryStr = atob(volumeBase64);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+      }
+      const floatArray = new Float32Array(bytes.buffer);
+
+      // Backend returns shape/spacing in [z, y, x]; VolumeRenderer expects [x, y, z]
+      const [sz, sy, sx] = volumeShape;
+      const [spz, spy, spx] = volumeSpacing;
+      const dims: [number, number, number] = [sx, sy, sz];
+      const spacing: [number, number, number] = [spx, spy, spz];
+
+      setPreviewPhantomData(floatArray);
+      setPreviewPhantomDims(dims);
+      setPreviewPhantomSpacing(spacing);
+
+      // ── Set lesion mesh (vertices are already in VTK centered space) ──
+      setMeshPreviewData({
+        id: 'preview',
+        vertices: lesionVertices,
+        faces: lesionFaces,
+        normals: lesionNormals,
+        opacity: 1.0,
+        color: [1, 0.35, 0.35],
+        visible: true,
+      });
+    } catch (err: any) {
+      console.error('[SimulationPage] 3D in-body preview failed:', err);
+      setMeshPreviewError(err?.message || '3D preview failed');
+    } finally {
+      setMeshPreviewLoading(false);
+    }
+  }, [form, sourceType, selectedSeriesId]);
+
   /** Remove a lesion by index */
   const handleRemoveLesion = useCallback(
     (index: number) => removeLesion(index),
@@ -1161,6 +1323,199 @@ export default function SimulationPage() {
     setDicomPreviewStats(null);
     setDicomPreviewError(null);
   }, []);
+
+  /** Close the 3D mesh preview modal */
+  const closeMeshPreview = useCallback(() => {
+    setMeshPreviewOpen(false);
+    setMeshPreviewData(null);
+    setMeshPreviewError(null);
+    setPreviewPhantomData(null);
+    setPreviewPhantomDims(null);
+    setPreviewPhantomSpacing(null);
+  }, []);
+
+  // -----------------------------------------------------------------------
+  // Phase 5: Lesion mesh overlay on CT volume
+  // -----------------------------------------------------------------------
+
+  /**
+   * Translate a backend 3D mesh (centered in its own preview volume)
+   * into the CT phantom's physical coordinate space.
+   *
+   * The backend generates lesions centered at the preview volume origin.
+   * We offset all vertices so the lesion center aligns with its intended
+   * position in the CT phantom's physical coordinate system.
+   */
+  const translateMeshToPhantom = useCallback(
+    (
+      mesh: Lesion3DPreviewResponse,
+      lesionIndex: number,
+    ): LesionMeshData | null => {
+      if (!phantom || !activeVolumeShape) return null;
+
+      const sp = phantom.metadata.spacing; // [sp_z, sp_y, sp_x]
+      const [depth, height, width] = activeVolumeShape;
+      const lesion = lesions[lesionIndex];
+      if (!lesion) return null;
+
+      // Lesion center in CT phantom voxel coords (x=column, y=row, z=slice)
+      const lx = lesion.center[0];
+      const ly = lesion.center[1];
+      const lz = lesion.center[2];
+
+      // Clamp to volume bounds (use center if 0 → auto-center later)
+      const clampedX = lx > 0 ? Math.min(lx, width - 1) : width / 2;
+      const clampedY = ly > 0 ? Math.min(ly, height - 1) : height / 2;
+      const clampedZ = lz > 0 ? Math.min(lz, depth - 1) : depth / 2;
+
+      // Target physical position in CT phantom (x, y, z) mm
+      const targetX = clampedX * sp[2];
+      const targetY = clampedY * sp[1];
+      const targetZ = clampedZ * sp[0];
+
+      // Mesh center in its own preview volume physical space
+      const meshCx = mesh.center[0];
+      const meshCy = mesh.center[1];
+      const meshCz = mesh.center[2];
+
+      // Translation: bring mesh center to CT phantom target position
+      const tx = targetX - meshCx;
+      const ty = targetY - meshCy;
+      const tz = targetZ - meshCz;
+
+      const translatedVertices = mesh.vertices.map(
+        (v) => [v[0] + tx, v[1] + ty, v[2] + tz] as [number, number, number],
+      );
+
+      return {
+        id: `lesion-${lesionIndex}`,
+        vertices: translatedVertices,
+        faces: mesh.faces,
+        normals: mesh.normals,
+        opacity: lesionOverlayOpacity,
+        color: LESION_OVERLAY_COLORS[lesionIndex % LESION_OVERLAY_COLORS.length].map(
+          (c) => c / 255,
+        ) as [number, number, number],
+        visible: lesionOverlayVisibleMap[lesionIndex] !== false,
+      };
+    },
+    [phantom, activeVolumeShape, lesions, lesionOverlayOpacity, lesionOverlayVisibleMap],
+  );
+
+  /**
+   * Fetch 3D triangle meshes for all configured lesions from the backend,
+   * translate into CT phantom coordinates, and add as overlay on the volume.
+   */
+  const handleLoadLesionOverlays = useCallback(async () => {
+    if (!phantom || !activeVolumeShape) {
+      setLesionOverlayError('Generate a CT phantom first');
+      return;
+    }
+    if (lesions.length === 0) {
+      setLesionOverlayError('Add at least one lesion first');
+      return;
+    }
+
+    const sp = phantom.metadata.spacing;
+
+    setLesionOverlayLoading(true);
+    setLesionOverlayError(null);
+    setLesionOverlayBaseMeshes([]);
+
+    try {
+      const results: LesionMeshData[] = [];
+
+      for (let i = 0; i < lesions.length; i++) {
+        const lesion = lesions[i];
+        const radius = Math.max(...lesion.radiusMm);
+
+        const request: Lesion3DPreviewRequest = {
+          lesionType: lesion.type,
+          shape: lesion.shape,
+          centerX: 0,
+          centerY: 0,
+          centerZ: 0,
+          radiusX: radius,
+          radiusY: radius,
+          radiusZ: radius,
+          huMean: lesion.huMean,
+          huStd: lesion.huStd,
+          marginSharpness: lesion.marginSharpness,
+          spiculationDegree: lesion.spiculationDegree,
+          previewSize: 64,
+          spacing: [sp[0], sp[1], sp[2]],
+        };
+
+        const mesh = await simulationService.previewLesion3D(request);
+
+        // Translate mesh from preview volume space → CT phantom space
+        const [depth, height, width] = activeVolumeShape;
+        const lx = lesion.center[0] > 0 ? Math.min(lesion.center[0], width - 1) : width / 2;
+        const ly = lesion.center[1] > 0 ? Math.min(lesion.center[1], height - 1) : height / 2;
+        const lz = lesion.center[2] > 0 ? Math.min(lesion.center[2], depth - 1) : depth / 2;
+
+        const targetX = lx * sp[2];
+        const targetY = ly * sp[1];
+        const targetZ = lz * sp[0];
+
+        const tx = targetX - mesh.center[0];
+        const ty = targetY - mesh.center[1];
+        const tz = targetZ - mesh.center[2];
+
+        const translatedVertices = mesh.vertices.map(
+          (v) => [v[0] + tx, v[1] + ty, v[2] + tz] as [number, number, number],
+        );
+
+        const color = LESION_OVERLAY_COLORS[i % LESION_OVERLAY_COLORS.length];
+
+        results.push({
+          id: `lesion-${i}`,
+          vertices: translatedVertices,
+          faces: mesh.faces,
+          normals: mesh.normals,
+          opacity: lesionOverlayOpacity,
+          color: [color[0] / 255, color[1] / 255, color[2] / 255],
+          visible: lesionOverlayVisibleMap[i] !== false,
+        });
+      }
+
+      // Reset all to visible
+      const visMap: Record<number, boolean> = {};
+      for (let i = 0; i < lesions.length; i++) visMap[i] = true;
+      setLesionOverlayVisibleMap(visMap);
+      setLesionOverlayBaseMeshes(results);
+    } catch (err: any) {
+      console.error('[SimulationPage] Failed to load lesion overlays:', err);
+      setLesionOverlayError(err?.message || 'Failed to load lesion overlays');
+    } finally {
+      setLesionOverlayLoading(false);
+    }
+  }, [phantom, activeVolumeShape, lesions, lesionOverlayOpacity, lesionOverlayVisibleMap]);
+
+  /** Toggle visibility of a single lesion overlay */
+  const handleToggleLesionVisibility = useCallback((index: number) => {
+    setLesionOverlayVisibleMap((prev) => ({
+      ...prev,
+      [index]: prev[index] === false,
+    }));
+  }, []);
+
+  /** Clear all lesion overlays and reset state */
+  const handleClearLesionOverlays = useCallback(() => {
+    setLesionOverlayBaseMeshes([]);
+    setLesionOverlayVisibleMap({});
+    setLesionOverlayError(null);
+  }, []);
+
+  // When lesions change, invalidate overlays (force re-fetch on next load)
+  useEffect(() => {
+    if (lesionOverlayBaseMeshes.length > 0) {
+      // Only clear if the lesion count changed
+      if (lesionOverlayBaseMeshes.length !== lesions.length) {
+        handleClearLesionOverlays();
+      }
+    }
+  }, [lesions.length, lesionOverlayBaseMeshes.length, handleClearLesionOverlays]);
 
   // -----------------------------------------------------------------------
   // Handlers: export
@@ -1515,9 +1870,22 @@ export default function SimulationPage() {
                           {lesion.spiculationDegree > 0 && ` · Spic: ${lesion.spiculationDegree.toFixed(1)}`}
                         </div>
                       </div>
+                      {lesionOverlayBaseMeshes.length > 0 && (
+                        <button
+                          onClick={() => handleToggleLesionVisibility(index)}
+                          className={`shrink-0 rounded p-1 text-sm transition-opacity ${
+                            lesionOverlayVisibleMap[index] !== false
+                              ? 'text-primary opacity-100'
+                              : 'text-muted-foreground/30 opacity-50'
+                          }`}
+                          title={lesionOverlayVisibleMap[index] !== false ? 'Hide lesion in 3D view' : 'Show lesion in 3D view'}
+                        >
+                          {lesionOverlayVisibleMap[index] !== false ? '◉' : '○'}
+                        </button>
+                      )}
                       <button
                         onClick={() => handleRemoveLesion(index)}
-                        className="ml-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+                        className="ml-1 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
                         title="Remove lesion"
                       >
                         <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1549,6 +1917,15 @@ export default function SimulationPage() {
               disabled={previewLoading}
             >
               {previewLoading ? 'Previewing...' : 'Preview'}
+            </Button>
+
+            {/* 3D Preview */}
+            <Button
+              variant="outline"
+              onClick={handlePreview3D}
+              disabled={meshPreviewLoading}
+            >
+              {meshPreviewLoading ? 'Generating 3D...' : '3D Preview'}
             </Button>
 
             {/* Preview on CT — only when DICOM source is selected */}
@@ -1771,6 +2148,7 @@ export default function SimulationPage() {
                           syntheticScanAxis="z"
                           segmentationMask={lesionOverlay?.mask ?? null}
                           segmentationLabels={lesionOverlay?.labels ?? null}
+                          lesionMeshes={lesionOverlayMeshes.length > 0 ? lesionOverlayMeshes : null}
                         />
                       ) : (
                         <div className="flex h-full items-center justify-center px-6 text-center">
@@ -2031,6 +2409,60 @@ export default function SimulationPage() {
                     />
                     Organ Labels
                   </label>
+                </>
+              )}
+
+              {/* Phase 5: Lesion mesh overlay controls */}
+              {phantom && lesions.length > 0 && (
+                <>
+                  <div className="h-5 w-px bg-border" />
+                  {lesionOverlayBaseMeshes.length > 0 ? (
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleClearLesionOverlays}
+                      >
+                        Clear Lesions
+                      </Button>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[10px] text-muted-foreground/70 whitespace-nowrap">Opacity</span>
+                        <input
+                          type="range"
+                          min={0.05}
+                          max={1}
+                          step={0.05}
+                          value={lesionOverlayOpacity}
+                          onChange={(e) => setLesionOverlayOpacity(Number(e.target.value))}
+                          className="h-1 w-20 cursor-pointer accent-primary"
+                        />
+                        <span className="w-8 text-right text-[10px] tabular-nums text-muted-foreground/60">
+                          {Math.round(lesionOverlayOpacity * 100)}%
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleLoadLesionOverlays}
+                        disabled={lesionOverlayLoading}
+                      >
+                        {lesionOverlayLoading ? (
+                          <span className="flex items-center gap-1">
+                            <div className="h-3 w-3 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                            Loading...
+                          </span>
+                        ) : (
+                          `Load ${lesions.length} Lesion${lesions.length > 1 ? 's' : ''}`
+                        )}
+                      </Button>
+                      {lesionOverlayError && (
+                        <span className="text-[10px] text-red-400">{lesionOverlayError}</span>
+                      )}
+                    </div>
+                  )}
                 </>
               )}
 
@@ -2561,6 +2993,33 @@ export default function SimulationPage() {
               </div>
             )}
 
+            {/* ---- Lesion overlay color legend ---- */}
+            {lesionOverlayMeshes.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 border-t border-border/50 pt-2">
+                <span className="text-[10px] text-muted-foreground/60">
+                  Lesions:
+                </span>
+                {lesionOverlayMeshes.map((mesh, i) => {
+                  const c = LESION_OVERLAY_COLORS[i % LESION_OVERLAY_COLORS.length];
+                  return (
+                    <span
+                      key={mesh.id}
+                      className="flex items-center gap-1 text-[10px] text-muted-foreground"
+                    >
+                      <span
+                        className="inline-block h-2.5 w-2.5 rounded-sm border border-white/20"
+                        style={{ backgroundColor: `rgb(${c[0]},${c[1]},${c[2]})` }}
+                      />
+                      {lesionTypeLabel[lesions[i]?.type] || `Lesion ${i + 1}`}
+                      {!mesh.visible && (
+                        <span className="text-muted-foreground/40">(hidden)</span>
+                      )}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+
             {/* ---- Organ slice ranges (atlas debug info) ---- */}
             {phantom?.metadata?.sliceLabelPresence && (
               <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 border-t border-border/30 pt-1.5">
@@ -2630,6 +3089,80 @@ export default function SimulationPage() {
             {dicomPreviewStats && (
               <p className="mt-2 text-xs text-green-600">{dicomPreviewStats}</p>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* ---- 3D Lesion Mesh Preview Modal ---- */}
+      {meshPreviewOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          onClick={closeMeshPreview}
+        >
+          <div
+            className="relative flex h-[85vh] w-[85vw] flex-col overflow-hidden rounded-lg bg-card shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-border px-5 py-3">
+              <div>
+                <h3 className="text-sm font-medium">3D Body Preview with Lesion</h3>
+                <p className="text-xs text-muted-foreground">
+                  {form.shape} · {lesionTypeLabel[form.lesionType]} · Ø {form.diameter} mm
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                {meshPreviewLoading && (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <div className="h-3 w-3 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                    Generating body with lesion...
+                  </div>
+                )}
+                {meshPreviewError && (
+                  <span className="text-xs text-destructive">{meshPreviewError}</span>
+                )}
+                {meshPreviewData && (
+                  <span className="rounded bg-primary/10 px-2 py-0.5 text-[11px] text-primary">
+                    {meshPreviewData.vertices.length} vertices · {meshPreviewData.faces.length} triangles
+                  </span>
+                )}
+                <button
+                  onClick={closeMeshPreview}
+                  className="flex h-7 w-7 items-center justify-center rounded-full bg-destructive text-sm text-destructive-foreground hover:bg-destructive/90"
+                  title="Close"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            {/* VolumeRenderer canvas — CT phantom body with lesion mesh overlay */}
+            <div className="relative flex-1 bg-black">
+              {previewPhantomData && previewPhantomDims ? (
+                <VolumeRenderer
+                  mode="synthetic"
+                  showControls
+                  syntheticData={previewPhantomData}
+                  syntheticDims={previewPhantomDims}
+                  syntheticSpacing={previewPhantomSpacing}
+                  lesionMeshes={meshPreviewData ? [meshPreviewData] : null}
+                />
+              ) : (
+                <div className="flex h-full items-center justify-center">
+                  {meshPreviewLoading ? (
+                    <div className="flex flex-col items-center gap-2">
+                      <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                      <span className="text-xs text-muted-foreground">Generating phantom with lesion...</span>
+                    </div>
+                  ) : meshPreviewError ? (
+                    <div className="text-center">
+                      <p className="mb-1 text-sm font-medium text-red-400">Failed to load preview</p>
+                      <p className="text-xs text-white/50">{meshPreviewError}</p>
+                    </div>
+                  ) : null}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}
