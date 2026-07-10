@@ -85,7 +85,7 @@ export type CtKernel = 'smooth' | 'soft' | 'standard' | 'lung' | 'bone' | 'sharp
 export type CtContrastPhase = 'noncontrast' | 'arterial' | 'venous' | 'delayed';
 export type CtScanDirection = 'head_to_feet' | 'feet_to_head';
 export type CtPhantomSource = 'procedural' | 'atlas' | 'dicom';
-export type CtSliceThickness = 0.625 | 1.0 | 2.5 | 5.0 | 10.0;
+export type CtSliceThickness = 0.625 | 1.0 | 2.5 | 5.0 | 10.0 | 15.0 | 20.0;
 export type CtKvp = 80 | 100 | 120 | 140;
 export type CtPitch = 0.5 | 0.8 | 1.0 | 1.2 | 1.5;
 export type CtFovMm = 150 | 250 | 350 | 500;
@@ -204,6 +204,7 @@ export interface StandardizedCtCase {
 }
 export interface CtParamsPreviewResponse {
   simulatedVolumeBase64: string;
+  simulatedLabelBase64?: string | null;
   metadata: CtParamsPreviewMetadata;
   paramsJson: CtParamsJson;
   standardizedCase: StandardizedCtCase;

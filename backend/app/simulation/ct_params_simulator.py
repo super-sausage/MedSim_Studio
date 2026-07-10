@@ -298,20 +298,98 @@ def _apply_slice_thickness(
             "effective_slice_thickness_mm": float(max(slice_thickness_mm, z_spacing)),
             "z_sigma_voxels": 0.0,
             "xy_sigma_voxels": 0.0,
+            "slab_span_slices": 1,
+            "slab_blend_alpha": 0.0,
+            "z_reconstruction_scale": 1.0,
+            "xy_reconstruction_scale": 1.0,
+            "detail_suppression_alpha": 0.0,
             "thickness_model": "identity",
         }
 
-    sigma_voxels = max((slice_thickness_mm / z_spacing - 1.0) * 0.5, 0.0)
+    thickness_ratio = max(slice_thickness_mm / z_spacing, 1.0)
+    sigma_voxels = max((thickness_ratio - 1.0) * 0.95, 0.0)
     blurred = gaussian_filter1d(volume, sigma=sigma_voxels, axis=0, mode="nearest")
-    xy_sigma = max((slice_thickness_mm / z_spacing - 1.0) * 0.08, 0.0)
+
+    slab_span = max(int(round(thickness_ratio)), 1)
+    slab_blend_alpha = 0.0
+    if slab_span > 1 and volume.shape[0] > 2:
+        slab_blend_alpha = min(0.32 + (thickness_ratio - 1.0) * 0.085, 0.84)
+        pad_before = slab_span // 2
+        pad_after = slab_span - 1 - pad_before
+        padded = np.pad(
+            blurred,
+            ((pad_before, pad_after), (0, 0), (0, 0)),
+            mode="edge",
+        )
+        cumulative = np.cumsum(padded, axis=0, dtype=np.float32)
+        cumulative = np.concatenate(
+            [np.zeros((1, cumulative.shape[1], cumulative.shape[2]), dtype=np.float32), cumulative],
+            axis=0,
+        )
+        slab_avg = (cumulative[slab_span:] - cumulative[:-slab_span]) / float(slab_span)
+        blurred = blurred * (1.0 - slab_blend_alpha) + slab_avg * slab_blend_alpha
+
+    z_reconstruction_scale = 1.0
+    if thickness_ratio > 2.0 and volume.shape[0] > 8:
+        z_reconstruction_scale = max(1.0 / min(np.sqrt(thickness_ratio) * 0.92, 3.2), 0.34)
+        blurred = zoom(
+            zoom(blurred, (z_reconstruction_scale, 1.0, 1.0), order=1, mode="nearest"),
+            (1.0 / z_reconstruction_scale, 1.0, 1.0),
+            order=1,
+            mode="nearest",
+        )
+        if blurred.shape[0] != volume.shape[0]:
+            blurred = zoom(
+                blurred,
+                (volume.shape[0] / blurred.shape[0], 1.0, 1.0),
+                order=1,
+                mode="nearest",
+            )
+
+    xy_sigma = max((thickness_ratio - 1.0) * 0.24, 0.0)
     if xy_sigma > 1e-6:
         blurred = gaussian_filter(blurred, sigma=(0.0, xy_sigma, xy_sigma), mode="nearest")
+
+    xy_reconstruction_scale = 1.0
+    if thickness_ratio > 3.0 and min(volume.shape[1], volume.shape[2]) > 24:
+        xy_reconstruction_scale = max(1.0 / min(1.0 + (thickness_ratio - 3.0) * 0.12, 1.8), 0.56)
+        blurred = zoom(
+            zoom(blurred, (1.0, xy_reconstruction_scale, xy_reconstruction_scale), order=1, mode="nearest"),
+            (1.0, 1.0 / xy_reconstruction_scale, 1.0 / xy_reconstruction_scale),
+            order=1,
+            mode="nearest",
+        )
+        if blurred.shape[1] != volume.shape[1] or blurred.shape[2] != volume.shape[2]:
+            blurred = zoom(
+                blurred,
+                (
+                    1.0,
+                    volume.shape[1] / blurred.shape[1],
+                    volume.shape[2] / blurred.shape[2],
+                ),
+                order=1,
+                mode="nearest",
+            )
+
+    detail_suppression_alpha = min((thickness_ratio - 1.0) * 0.055, 0.42)
+    if detail_suppression_alpha > 0.0:
+        edge_component = blurred - gaussian_filter(
+            blurred,
+            sigma=(0.0, 0.65 + xy_sigma * 0.25, 0.65 + xy_sigma * 0.25),
+            mode="nearest",
+        )
+        blurred = blurred - edge_component * detail_suppression_alpha
 
     return blurred.astype(np.float32, copy=False), {
         "effective_slice_thickness_mm": float(slice_thickness_mm),
         "z_sigma_voxels": float(sigma_voxels),
         "xy_sigma_voxels": float(xy_sigma),
-        "thickness_model": "z_blur_plus_partial_volume",
+        "slab_span_slices": int(slab_span),
+        "slab_blend_alpha": float(slab_blend_alpha),
+        "z_reconstruction_scale": float(z_reconstruction_scale),
+        "xy_reconstruction_scale": float(xy_reconstruction_scale),
+        "detail_suppression_alpha": float(detail_suppression_alpha),
+        "thickness_model": "z_blur_plus_slab_averaging_plus_coarse_reconstruction",
     }
 
 
@@ -332,6 +410,14 @@ def _apply_dose_noise(
 
     effective_mas = actual_mas * level_scale * pitch_scale * slice_thickness_scale
     photon_flux = max(22000.0 * (effective_mas / reference_mas) * (kvp / 120.0) ** 1.35, 2500.0)
+    low_dose_severity = float(
+        np.clip(
+            0.58 * (reference_mas / max(effective_mas, 1.0)) ** 0.72
+            + 0.62 * max((120.0 - kvp) / 40.0, 0.0),
+            0.0,
+            2.4,
+        )
+    )
 
     mu_map = _hu_to_relative_mu(volume, kvp)
     attenuation_proxy = _projection_thickness_surrogate(mu_map)
@@ -344,7 +430,7 @@ def _apply_dose_noise(
     log_noise = np.log(expected_counts + 1.0) - np.log(noisy_counts + 1.0)
 
     base_sigma = 13.5 * np.sqrt(reference_mas / max(effective_mas, 1.0))
-    sigma = base_sigma
+    sigma = base_sigma * (1.0 + 0.16 * low_dose_severity)
 
     materials = _material_masks(volume)
     body_mask = ~materials["air"]
@@ -359,7 +445,7 @@ def _apply_dose_noise(
     projection_noise = (
         log_noise
         * sigma_map
-        * (0.85 + 0.25 * attenuation_proxy)
+        * (0.85 + 0.25 * attenuation_proxy + 0.12 * low_dose_severity)
     ).astype(np.float32, copy=False)
 
     # Blend fine-grain and correlated detector/electronic noise so low-dose images look less synthetic.
@@ -369,8 +455,18 @@ def _apply_dose_noise(
         sigma=(0.25, 0.55, 0.55),
         mode="nearest",
     )
+    low_freq_noise = gaussian_filter(
+        rng.normal(0.0, 1.0, size=volume.shape).astype(np.float32),
+        sigma=(1.2, 3.4, 3.4),
+        mode="nearest",
+    )
     dense_structure_mask = (materials["cancellous_bone"] | materials["cortical_bone"]).astype(np.float32)
+    dense_edges = np.abs(
+        gaussian_filter(dense_structure_mask, sigma=(0.0, 0.8, 0.8), mode="nearest")
+        - gaussian_filter(dense_structure_mask, sigma=(0.0, 2.2, 2.2), mode="nearest")
+    ).astype(np.float32)
     nz = volume.shape[0]
+    ny = volume.shape[1]
     nx = volume.shape[2]
     streak_seed = gaussian_filter(
         rng.normal(0.0, 1.0, size=(nz, nx)).astype(np.float32),
@@ -378,8 +474,37 @@ def _apply_dose_noise(
         mode="nearest",
     )[:, None, :]
     streaks = streak_seed * gaussian_filter(dense_structure_mask, sigma=(0.0, 1.2, 0.0), mode="nearest")
-    detector_noise = sigma_map * (0.48 * white_noise + 0.16 * correlated_noise + 0.08 * streaks)
-    noisy = volume + projection_noise + detector_noise
+
+    view_band_seed = gaussian_filter(
+        rng.normal(0.0, 1.0, size=(nz, ny)).astype(np.float32),
+        sigma=(0.9, 2.8),
+        mode="nearest",
+    )[:, :, None]
+    view_banding = view_band_seed * np.clip(0.55 + 0.45 * radial, 0.0, 1.2)
+
+    starburst_phase = np.linspace(0.0, 2.0 * np.pi * (1.0 + low_dose_severity * 0.18), nx, dtype=np.float32)[None, None, :]
+    starburst = np.sin(starburst_phase + np.linspace(0.0, 2.0 * np.pi, nz, dtype=np.float32)[:, None, None] * 0.75)
+    bone_streaks = starburst * dense_edges * (0.7 + 0.3 * attenuation_proxy)
+
+    detector_noise = sigma_map * (
+        0.48 * white_noise
+        + (0.16 + 0.06 * low_dose_severity) * correlated_noise
+        + (0.06 + 0.12 * low_dose_severity) * low_freq_noise
+        + (0.08 + 0.16 * low_dose_severity) * streaks
+        + (0.0 + 0.14 * low_dose_severity) * bone_streaks
+        + (0.0 + 0.10 * low_dose_severity) * view_banding
+    )
+
+    photon_starvation = np.clip((attenuation_proxy - 0.58) / 0.42, 0.0, 1.0).astype(np.float32)
+    starvation_streak_amp = 4.0 + 7.5 * low_dose_severity
+    starvation_streaks = (
+        gaussian_filter(streak_seed[:, 0, :], sigma=(0.55, 1.1), mode="nearest")[:, None, :]
+        * photon_starvation
+        * dense_edges
+        * starvation_streak_amp
+    )
+
+    noisy = volume + projection_noise + detector_noise + starvation_streaks
 
     return noisy.astype(np.float32, copy=False), {
         "noise_sigma_hu": float(sigma),
@@ -395,7 +520,9 @@ def _apply_dose_noise(
             float(np.min(bowtie_fluence)),
             float(np.max(bowtie_fluence)),
         ],
-        "noise_model": "projection_domain_poisson_plus_detector_noise",
+        "low_dose_severity": float(low_dose_severity),
+        "photon_starvation_streak_hu": float(starvation_streak_amp),
+        "noise_model": "projection_domain_poisson_plus_detector_noise_plus_photon_starvation_artifact",
     }
 
 
@@ -1016,6 +1143,7 @@ def simulate_ct_scan_params(
 
     return {
         "simulated_volume": working,
+        "simulated_label_volume": working_labels,
         "simulated_spacing": output_spacing,
         "params_json": params_json,
         "metadata": metadata,

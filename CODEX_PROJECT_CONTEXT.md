@@ -1,8 +1,307 @@
 # MedSim Studio Codex Project Context
 
+## Update 2026-07-11
+
+This section captures the latest follow-up work from 2026-07-11, after the user reported two regressions:
+
+- the 3D slice-sync direction had become worse and appeared to scan from bottom to top
+- the organ / segmentation labels that previously appeared under the image and in 2D/3D overlays disappeared
+
+### What Was Fixed In This Pass
+
+#### 1. Slice-sync direction regression was reverted
+
+- a previous attempted fix changed the 3D progressive clip direction to `high_to_low`
+- the user confirmed this made the order visibly wrong: bottom-to-top
+- the frontend was changed back to:
+  - `syntheticClipDirection="low_to_high"`
+- this restores the scan direction behavior to the prior expected direction
+
+Relevant file:
+
+- `frontend/src/pages/SimulationPage.tsx`
+
+#### 2. Docker backend now mounts real LUNG1 sample data
+
+Root cause found:
+
+- `data/lung_lobe_samples` contains the real local `LUNG1-*` sample DICOM data:
+  - `LUNG1-001`
+  - `LUNG1-002`
+  - `LUNG1-003`
+- Docker backend previously mounted `models/phantom_atlas`, but not `data/lung_lobe_samples`
+- therefore the running backend container could not reliably see the real local `LUNG1` sample data
+- the frontend had a hardcoded `LUNG1-001` fallback option, so the UI could appear to offer LUNG1 even when the backend runtime did not have the actual sample directory mounted
+
+Fix:
+
+- added a read-only bind mount:
+  - `./data/lung_lobe_samples:/app/data/lung_lobe_samples:ro`
+- added backend validation:
+  - if `case_id` starts with `LUNG1-` but the sample case is not present under `data/lung_lobe_samples`, the backend now raises a clear `FileNotFoundError`
+
+Relevant files:
+
+- `docker-compose.yml`
+- `backend/app/simulation/phantom_generator.py`
+
+Validation:
+
+- `docker compose config` showed the new `/app/data/lung_lobe_samples` read-only mount
+- backend was rebuilt and restarted with `docker compose up -d --build backend`
+- direct API request confirmed real LUNG1 loading:
+  - endpoint: `GET /api/v1/simulation/phantom?source=atlas&size=192&case_id=LUNG1-001&scan_direction=head_to_feet`
+  - `case_id = LUNG1-001`
+  - original shape: `134x512x512`
+  - output shape: `50x192x192`
+  - `flipped_z = True`
+  - `scan_direction = head_to_feet`
+  - `spatial_reference = dicom_patient_space`
+  - loaded DICOM series: `0.000000-NA-82046`
+
+#### 3. LUNG1 DICOM SEG labels are now converted into workspace label overlays
+
+Root cause found:
+
+- the LUNG1 backend branch loaded only the CT image volume
+- it returned:
+  - `label_volume = None`
+  - `label_map = {}`
+  - `label_nonzero_counts = {}`
+  - `slice_label_presence = {}`
+- therefore the frontend had no `label_base64` for:
+  - 2D axial label overlay
+  - 3D segmentation color overlay
+  - bottom label legend
+
+Fix:
+
+- the LUNG1 loader now reads the bundled DICOM SEG object under the `Segmentation` series
+- it converts SEG frames into a z/y/x `uint8` label volume aligned to the CT volume via `ImagePositionPatient`
+- it applies the same z-flip and nearest-neighbor resampling as the CT output path
+- the converted label volume is returned as `label_base64`
+- label metadata is populated for frontend display
+
+Current LUNG1 SEG mapping:
+
+- DICOM SEG segment `Neoplasm, Primary GTV-1` -> label `100` (`neoplasm_primary_gtv`)
+- DICOM SEG segment `Lung Lung-Left` -> label `13` (`left_lung_upper_lobe` reused as left lung display id)
+- DICOM SEG segment `Lung Lung-Right` -> label `14` (`right_lung_upper_lobe` reused as right lung display id)
+- DICOM SEG segment `Spinal cord Spinal-Cord` -> label `21` (`spinal_cord`)
+
+Frontend changes:
+
+- added colors for label `21` and `100`
+- label display priority now includes `100`, `13`, `14`, and `21` first
+- bottom `Labels:` legend is no longer hardcoded to atlas abdominal organs only
+- it now derives visible label items from backend `label_map` and `label_nonzero_counts`
+
+Relevant files:
+
+- `backend/app/simulation/phantom_generator.py`
+- `frontend/src/pages/SimulationPage.tsx`
+
+Validation:
+
+- container could decode the LUNG1 DICOM SEG pixel data:
+  - shape: `(536, 512, 512)`
+  - dtype: `uint8`
+  - max value: `1`
+  - nonzero sum: `1903588`
+- backend API through frontend proxy confirmed restored label payload:
+  - `label_base64 = True`
+  - `label_base64` length: `2457600`
+  - label counts:
+    - `13`: `40776`
+    - `14`: `53255`
+    - `21`: `792`
+    - `100`: `2801`
+  - label z-ranges:
+    - `lung`: `[8, 40]`
+    - `lung_left`: `[8, 40]`
+    - `lung_right`: `[10, 40]`
+    - `spinal_cord`: `[9, 39]`
+    - `neoplasm`: `[18, 25]`
+- static checks passed:
+  - `python -m py_compile backend/app/simulation/phantom_generator.py`
+  - `npx tsc --noEmit`
+- backend and frontend were rebuilt/restarted:
+  - `docker compose up -d --build backend`
+  - `docker compose up -d --build frontend`
+- `docker compose ps` showed:
+  - backend healthy
+  - frontend healthy
+  - postgres healthy
+  - minio healthy
+
+### Important Current State For The Next Conversation
+
+- The immediate label regression should be fixed: LUNG1 now returns `label_base64`, and frontend 2D/3D overlays have label data again.
+- The frontend served at `http://localhost:5173` has been rebuilt after these changes.
+- The current direction regression from the attempted `high_to_low` clip change was reverted to `low_to_high`.
+- The broader user complaint about the perceived LUNG1 anatomical direction / visible range may still need visual browser validation and potentially a separate camera/orientation/display-range pass.
+- Do not reintroduce `syntheticClipDirection="high_to_low"` unless the visual behavior is verified in the browser.
+- If label overlays disappear again, first check:
+  - backend response contains `label_base64`
+  - backend `metadata.label_nonzero_counts` is non-empty
+  - frontend `showLabelOverlay` is true
+  - frontend `organSegmentationOverlay` has `labels.length > 0`
+
+### Current Dirty Worktree Note
+
+The working tree contains multiple uncommitted files. Some were already dirty from earlier CT parameter simulation and visualization work. Files touched or relevant in the latest 2026-07-11 follow-up include:
+
+- `docker-compose.yml`
+- `backend/app/simulation/phantom_generator.py`
+- `frontend/src/pages/SimulationPage.tsx`
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+Other dirty files from earlier work may include:
+
+- `backend/app/api/v1/simulation.py`
+- `backend/app/schemas/simulation.py`
+- `backend/app/simulation/ct_params_simulator.py`
+- `frontend/src/types/simulation.ts`
+- `CODEX_PROJECT_CONTEXT.md`
+
 ## Update 2026-07-10
 
 This section captures the latest `LUNG1` integration and CT workspace / visualization changes completed on 2026-07-10, including the follow-up scan-order fixes made later the same day.
+
+### Additional follow-up on 2026-07-10 (later same day)
+
+After the earlier `LUNG1` visualization and CT workspace changes, additional follow-up work was completed on the CT parameter preview path.
+
+What was added / changed in this later pass:
+
+#### 6. Simulated label volume now follows CT parameter preview output
+
+- `ct-params/preview` previously returned only the simulated CT volume
+- this caused the left axial overlay and right 3D overlay to fall out of sync after CT parameter simulation
+- the backend now returns `simulated_label_base64` when a label volume exists
+- the frontend now decodes and uses the simulated label volume for:
+  - left-side axial overlay after CT parameter simulation
+  - right-side 3D segmentation color overlay after CT parameter simulation
+- the right-side 3D progressive accumulation now clips both:
+  - the CT volume
+  - the segmentation overlay volume
+  so the overlay accumulates with the slices instead of appearing as an unsynchronised static layer
+
+Relevant files:
+
+- `backend/app/api/v1/simulation.py`
+- `backend/app/schemas/simulation.py`
+- `backend/app/simulation/ct_params_simulator.py`
+- `frontend/src/pages/SimulationPage.tsx`
+- `frontend/src/types/simulation.ts`
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+#### 7. 3D accumulated CT view was tuned to look more like slice-by-slice buildup
+
+- when `Slice Sync` is active, the right-side 3D view now forces a more scan-like soft-tissue rendering path instead of inheriting a more shell-like / bone-like volume look
+- the accumulated CT volume now uses a less specular, less shiny rendering configuration in scan mode
+- segmentation overlay default opacity was slightly increased from the earlier very light setting so the accumulated color layer reads more clearly without replacing the CT body
+- the practical goal of this pass was:
+  - original CT remains the base body
+  - segmentation remains only a light color layer
+  - the accumulation should visually read as layered CT slices rather than a static opaque organ shell
+
+Relevant files:
+
+- `frontend/src/pages/SimulationPage.tsx`
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+#### 8. Slice-thickness simulation was expanded and made much more visible
+
+- the available slice thickness presets were expanded beyond the earlier max of `10.0 mm`
+- the UI and schema now support:
+  - `0.625`
+  - `1.0`
+  - `2.5`
+  - `5.0`
+  - `10.0`
+  - `15.0`
+  - `20.0`
+- slice-thickness simulation is no longer only mild z-blur
+- it now combines:
+  - stronger z-direction blur
+  - slab-style slice averaging
+  - stronger xy partial-volume softening
+  - coarse reconstruction-like loss of detail for thick slices
+  - additional detail suppression so thick-slice previews look visibly less sharp in both 2D and 3D
+- the intended visual outcome is that:
+  - `10 mm` is clearly softer than `5 mm`
+  - `15 mm` is visibly more coarse
+  - `20 mm` looks like a much thicker, lower-detail reconstruction rather than only a slightly blurred one
+- the slice-thickness metadata now exposes additional algorithm diagnostics such as:
+  - `slab_span_slices`
+  - `slab_blend_alpha`
+  - `z_reconstruction_scale`
+  - `xy_reconstruction_scale`
+  - `detail_suppression_alpha`
+
+Relevant files:
+
+- `backend/app/schemas/simulation.py`
+- `backend/app/simulation/ct_params_simulator.py`
+- `frontend/src/pages/SimulationPage.tsx`
+- `frontend/src/types/simulation.ts`
+
+#### 9. Low-kVp / low-mAs noise and artifact simulation was strengthened
+
+- low `kVp` and low `mAs` were judged visually too clean in the earlier implementation
+- the noise path was strengthened so low-dose previews now show more obvious image degradation
+- the current low-dose model now layers:
+  - projection-inspired Poisson/log-count noise
+  - stronger material-dependent detector noise
+  - correlated noise
+  - low-frequency nonuniform noise
+  - bone-adjacent streak-like structure
+  - photon-starvation-style streak artifacts
+  - view-banding / low-dose nonuniformity effects
+- the effect strength now depends more explicitly on a low-dose severity term derived from:
+  - effective `mAs`
+  - selected `kVp`
+- the intended practical outcome is that combinations such as:
+  - `80 kVp + 30 mAs`
+  - `80 kVp + 50 mAs`
+  look substantially noisier and more artifact-prone than standard-dose configurations
+
+Relevant files:
+
+- `backend/app/simulation/ct_params_simulator.py`
+
+#### 10. CT parameter preview runtime failure was introduced and fixed in the same pass
+
+During the low-dose artifact enhancement pass, the preview page began failing with:
+
+- `CT parameter preview failed: sequence argument must have length equal to input rank`
+
+Root cause:
+
+- a low-dose artifact helper branch accidentally expanded a `radial` array by one extra dimension
+- that silently broadcast one intermediate result from 3-D to 4-D
+- a later `gaussian_filter(...)` call still used a 3-element sigma tuple and failed at runtime
+
+Fix:
+
+- the extra singleton expansion on `radial` was removed
+- `simulate_ct_scan_params(...)` was re-run locally after the fix and returned valid output again
+
+Why this matters for the next conversation:
+
+- if CT parameter preview starts failing again with a rank/sigma-length style error, inspect the low-dose artifact broadcasting path first
+
+Relevant files:
+
+- `backend/app/simulation/ct_params_simulator.py`
+
+Validation already run for this later pass:
+
+- `npx tsc --noEmit`
+- `python -m py_compile backend/app/simulation/ct_params_simulator.py`
+- `python -m py_compile backend/app/api/v1/simulation.py backend/app/schemas/simulation.py`
+- direct local invocation of `simulate_ct_scan_params(...)` after the rank/broadcast fix
 
 Latest local commit:
 

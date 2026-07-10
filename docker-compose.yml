@@ -67,6 +67,7 @@ services:
       - ./models/nnunet702_handoff:/app/models/nnunet702_handoff
       - ./models/nnunet_lung_lobe:/app/models/nnunet_lung_lobe
       - ./models/phantom_atlas:/app/models/phantom_atlas
+      - ./data/lung_lobe_samples:/app/data/lung_lobe_samples:ro
     shm_size: 8g
     deploy:
       resources:

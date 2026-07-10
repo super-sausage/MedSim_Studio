@@ -132,6 +132,19 @@ ORGAN_LABEL_MAP: Dict[int, str] = {
     20: "urinary_bladder",
 }
 
+LUNG_SAMPLE_LABEL_MAP: Dict[int, str] = {
+    **ORGAN_LABEL_MAP,
+    21: "spinal_cord",
+    100: "neoplasm_primary_gtv",
+}
+
+LUNG_SEGMENT_LABEL_TO_ID: Dict[str, int] = {
+    "neoplasm, primary gtv-1": 100,
+    "lung lung-left": 13,
+    "lung lung-right": 14,
+    "spinal cord spinal-cord": 21,
+}
+
 
 def generate_upper_body_ct_phantom(
     shape: Tuple[int, int, int] = (128, 128, 128),
@@ -488,6 +501,13 @@ def generate_atlas_ct_phantom(
         raise ValueError(
             f"Invalid scan_direction '{scan_direction}'. "
             f"Must be 'head_to_feet' or 'feet_to_head'."
+        )
+
+    if case_id.startswith("LUNG1-") and not _is_lung_sample_case(case_id):
+        raise FileNotFoundError(
+            f"LUNG1 sample case '{case_id}' was requested but not found under "
+            f"{get_lung_lobe_samples_root()}. Mount data/lung_lobe_samples into "
+            "the backend container or place the case there."
         )
 
     if _is_lung_sample_case(case_id):
@@ -921,6 +941,15 @@ def _generate_lung_sample_ct_phantom(
     else:
         ct_resampled = ct_volume.astype(np.float32, copy=False)
 
+    label_volume = _load_lung_sample_segmentation(
+        case_dir=case_dir,
+        ct_slices=slices,
+        slice_direction=slice_direction,
+        need_flip=need_flip,
+        zoom_factor=zoom_factor,
+        output_shape=ct_resampled.shape,
+    )
+
     new_spacing = tuple(float(axis_spacing / zoom_factor) for axis_spacing in orig_spacing)
     nz, ny, nx = ct_resampled.shape
     direction = (
@@ -942,6 +971,11 @@ def _generate_lung_sample_ct_phantom(
         else [0.0, 0.0, 1.0]
     )
 
+    label_nonzero_counts: Dict[int, int] = {}
+    slice_label_presence: Dict[str, list] = {}
+    if label_volume is not None:
+        label_nonzero_counts, slice_label_presence = _build_lung_sample_label_stats(label_volume)
+
     metadata: Dict[str, Any] = {
         "width": int(nx),
         "height": int(ny),
@@ -959,9 +993,9 @@ def _generate_lung_sample_ct_phantom(
         "origin": origin,
         "direction": [direction, row_direction_values, col_direction_values],
         "spatial_reference": "dicom_patient_space",
-        "label_map": {},
-        "label_nonzero_counts": {},
-        "slice_label_presence": {},
+        "label_map": {int(k): v for k, v in LUNG_SAMPLE_LABEL_MAP.items()},
+        "label_nonzero_counts": label_nonzero_counts,
+        "slice_label_presence": slice_label_presence,
         "window_presets": {
             name: {"windowLevel": float(p["window_level"]), "windowWidth": float(p["window_width"])}
             for name, p in WINDOW_PRESETS.items()
@@ -974,7 +1008,7 @@ def _generate_lung_sample_ct_phantom(
         ),
     }
 
-    return ct_resampled, None, metadata
+    return ct_resampled, label_volume, metadata
 
 
 def _select_lung_ct_series_dir(case_dir: Path) -> Path:
@@ -999,6 +1033,152 @@ def _select_lung_ct_series_dir(case_dir: Path) -> Path:
         raise FileNotFoundError(f"No DICOM series found for lung case {case_dir.name}")
 
     return best_candidate[2]
+
+
+def _load_lung_sample_segmentation(
+    *,
+    case_dir: Path,
+    ct_slices: list[dict[str, Any]],
+    slice_direction: Optional[np.ndarray],
+    need_flip: bool,
+    zoom_factor: float,
+    output_shape: Tuple[int, int, int],
+) -> Optional[np.ndarray]:
+    """Convert the bundled LUNG1 DICOM SEG object into a zyx label map."""
+    import logging
+    import pydicom
+
+    if slice_direction is None:
+        return None
+
+    seg_paths = sorted(case_dir.rglob("*Segmentation*/*.dcm"))
+    if not seg_paths:
+        return None
+
+    try:
+        seg_ds = pydicom.dcmread(str(seg_paths[0]), force=True)
+        seg_pixels = seg_ds.pixel_array
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Failed to read LUNG1 segmentation for %s: %s",
+            case_dir.name,
+            exc,
+        )
+        return None
+
+    if seg_pixels.ndim == 2:
+        seg_pixels = seg_pixels[np.newaxis, :, :]
+
+    ct_positions: list[float] = []
+    for item in ct_slices:
+        image_position = item.get("image_position")
+        if image_position is None:
+            return None
+        ct_positions.append(float(np.dot(image_position, slice_direction)))
+
+    label_volume = np.zeros(
+        (len(ct_slices), int(seg_ds.Rows), int(seg_ds.Columns)),
+        dtype=np.uint8,
+    )
+
+    segment_number_to_id: Dict[int, int] = {}
+    for segment in getattr(seg_ds, "SegmentSequence", []):
+        segment_number = int(getattr(segment, "SegmentNumber", 0) or 0)
+        label_text = " ".join(
+            str(value or "")
+            for value in (
+                getattr(segment, "SegmentLabel", ""),
+                getattr(segment, "SegmentDescription", ""),
+            )
+        ).strip().lower()
+        mapped_id = LUNG_SEGMENT_LABEL_TO_ID.get(label_text)
+        if mapped_id is not None:
+            segment_number_to_id[segment_number] = mapped_id
+
+    frame_groups = getattr(seg_ds, "PerFrameFunctionalGroupsSequence", [])
+    for frame_index, frame in enumerate(frame_groups):
+        if frame_index >= seg_pixels.shape[0]:
+            break
+
+        try:
+            segment_number = int(
+                frame.SegmentIdentificationSequence[0].ReferencedSegmentNumber
+            )
+            image_position = np.asarray(
+                [float(v) for v in frame.PlanePositionSequence[0].ImagePositionPatient],
+                dtype=np.float64,
+            )
+        except Exception:
+            continue
+
+        label_id = segment_number_to_id.get(segment_number)
+        if label_id is None:
+            continue
+
+        frame_position = float(np.dot(image_position, slice_direction))
+        z_index = int(np.argmin(np.abs(np.asarray(ct_positions) - frame_position)))
+        frame_mask = seg_pixels[frame_index] > 0
+        if not np.any(frame_mask):
+            continue
+
+        if label_id == 100:
+            label_volume[z_index][frame_mask] = label_id
+        else:
+            target = label_volume[z_index]
+            target[frame_mask & (target == 0)] = label_id
+
+    if need_flip:
+        label_volume = label_volume[::-1, :, :].copy()
+
+    if zoom_factor != 1.0:
+        label_volume = zoom(
+            label_volume,
+            (zoom_factor, zoom_factor, zoom_factor),
+            order=0,
+            mode="constant",
+            cval=0,
+        ).astype(np.uint8)
+
+    if label_volume.shape != output_shape:
+        logging.getLogger(__name__).warning(
+            "LUNG1 segmentation shape %s does not match CT shape %s after resampling.",
+            label_volume.shape,
+            output_shape,
+        )
+        return None
+
+    return label_volume
+
+
+def _build_lung_sample_label_stats(
+    label_volume: np.ndarray,
+) -> tuple[Dict[int, int], Dict[str, list]]:
+    label_nonzero_counts: Dict[int, int] = {}
+    for label_id in LUNG_SAMPLE_LABEL_MAP:
+        if label_id == 0:
+            continue
+        count = int(np.sum(label_volume == label_id))
+        if count > 0:
+            label_nonzero_counts[int(label_id)] = count
+
+    groups = {
+        "lung": [13, 14],
+        "lung_left": [13],
+        "lung_right": [14],
+        "spinal_cord": [21],
+        "neoplasm": [100],
+    }
+    slice_label_presence: Dict[str, list] = {}
+    for group_name, label_ids in groups.items():
+        z_presence = np.any(np.isin(label_volume, label_ids), axis=(1, 2))
+        z_indices = np.where(z_presence)[0]
+        if len(z_indices) > 0:
+            slice_label_presence[group_name] = [
+                int(z_indices[0]),
+                int(z_indices[-1]),
+            ]
+
+    return label_nonzero_counts, slice_label_presence
 
 
 def _safe_float(value: Any) -> Optional[float]:

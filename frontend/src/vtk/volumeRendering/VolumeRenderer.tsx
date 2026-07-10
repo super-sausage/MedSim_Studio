@@ -67,7 +67,7 @@ interface LesionMeshProp {
 
 /** Default peak opacity for segmentation overlay (0..1).
  *  This should tint the CT volume, not replace it visually. */
-const DEFAULT_SEG_OPACITY = 0.045;
+const DEFAULT_SEG_OPACITY = 0.065;
 
 /** Half-band width around integer label values in the opacity transfer
  *  function.  Keeps the function sharp at each label while preventing
@@ -425,6 +425,88 @@ export function VolumeRenderer({
   const [clip, setClip] = useState<ClipState>({ x: 0, y: 0, z: 0 });
   const [segmentationOpacity, setSegmentationOpacity] = useState(DEFAULT_SEG_OPACITY);
 
+  const applyActiveClippingPlanes = useCallback((imageData: any, targetMappers: any[]) => {
+    if (!imageData || targetMappers.length === 0) return;
+
+    const activePlanes: any[] = [];
+    const bounds = imageData.getBounds();
+
+    if (clip.x > 0) {
+      const xPos = bounds[0] + clip.x * (bounds[1] - bounds[0]);
+      activePlanes.push(
+        vtkPlane.newInstance({ normal: [1, 0, 0], origin: [xPos, 0, 0] }),
+      );
+    }
+
+    if (clip.y > 0) {
+      const yPos = bounds[2] + clip.y * (bounds[3] - bounds[2]);
+      activePlanes.push(
+        vtkPlane.newInstance({ normal: [0, 1, 0], origin: [0, yPos, 0] }),
+      );
+    }
+
+    if (clip.z > 0) {
+      const zPos = bounds[4] + clip.z * (bounds[5] - bounds[4]);
+      activePlanes.push(
+        vtkPlane.newInstance({ normal: [0, 0, 1], origin: [0, 0, zPos] }),
+      );
+    }
+
+    if (
+      syntheticClipIndex !== undefined &&
+      syntheticClipIndex >= 0 &&
+      syntheticScanAxis
+    ) {
+      const dims = imageData.getDimensions();
+      const spacing = imageData.getSpacing();
+      const origin = imageData.getOrigin();
+      const axisIdx = syntheticScanAxis === 'x' ? 0
+        : syntheticScanAxis === 'y' ? 1 : 2;
+      const axisDim = dims[axisIdx];
+
+      const progressivePlane = createProgressiveClipPlane(
+        axisIdx,
+        axisDim,
+        syntheticClipIndex,
+        syntheticClipDirection,
+        origin,
+        spacing,
+      );
+      if (progressivePlane) {
+        activePlanes.push(progressivePlane);
+      }
+    }
+
+    for (const mapper of targetMappers) {
+      if (!mapper) continue;
+      mapper.removeAllClippingPlanes();
+      for (const plane of activePlanes) {
+        mapper.addClippingPlane(plane);
+      }
+    }
+  }, [clip, syntheticClipDirection, syntheticClipIndex, syntheticScanAxis]);
+
+  const applyCtVolumeLook = useCallback((volume: any, mapper: any) => {
+    if (!volume || !mapper) return;
+
+    const property = volume.getProperty();
+    property.setInterpolationTypeToLinear();
+    property.setIndependentComponents(true);
+    property.setUseGradientOpacity(0, false);
+    property.setShade(true);
+    property.setAmbient(0.1);
+    property.setDiffuse(0.7);
+    property.setSpecular(0.2);
+    property.setSpecularPower(10.0);
+    if (typeof property.setScalarOpacityUnitDistance === 'function') {
+      property.setScalarOpacityUnitDistance(0, 1.0);
+    }
+    if (typeof mapper.setSampleDistance === 'function' && syntheticSpacing) {
+      const minSpacing = Math.min(syntheticSpacing[0], syntheticSpacing[1], syntheticSpacing[2]);
+      mapper.setSampleDistance(Math.max(minSpacing * 0.8, 0.25));
+    }
+  }, [syntheticSpacing]);
+
   // ------------------------------------------------------------------
   // 1. Initialise vtk.js pipeline
   //    — synthetic: runs once on mount
@@ -575,15 +657,7 @@ export function VolumeRenderer({
         const property = volume.getProperty();
         property.setRGBTransferFunction(0, colorTransfer);
         property.setScalarOpacity(0, piecewiseFunc);
-        property.setInterpolationTypeToLinear();
-        property.setShade(true);
-        property.setAmbient(0.1);
-        property.setDiffuse(0.7);
-        property.setSpecular(0.2);
-        property.setSpecularPower(10.0);
-
-        property.setIndependentComponents(true);
-        property.setUseGradientOpacity(0, false);
+        applyCtVolumeLook(volume, mapper);
 
         renderer.addVolume(volume);
         resetCameraToVolume(renderer, imageData, container, scanView);
@@ -696,7 +770,7 @@ export function VolumeRenderer({
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, seriesId, syntheticData, syntheticDims, syntheticSpacing]);
+  }, [applyCtVolumeLook, mode, scanView, seriesId, syntheticData, syntheticDims, syntheticSpacing]);
 
   // ------------------------------------------------------------------
   // 2. Handle preset changes (update transfer functions in-place)
@@ -714,13 +788,22 @@ export function VolumeRenderer({
 
     state.volume.getProperty().setRGBTransferFunction(0, newColor);
     state.volume.getProperty().setScalarOpacity(0, newOpacity);
+    applyCtVolumeLook(state.volume, state.mapper);
 
     // Replace stored refs so we don't leak old TF objects
     state.colorTransfer = newColor;
     state.piecewiseFunc = newOpacity;
 
     state.renderWindow.render();
-  }, [activePreset, isReady]);
+  }, [activePreset, applyCtVolumeLook, isReady]);
+
+  useEffect(() => {
+    const state = vtkRef.current;
+    if (!state || !isReady || !state.volume || !state.mapper) return;
+
+    applyCtVolumeLook(state.volume, state.mapper);
+    state.renderWindow.render();
+  }, [applyCtVolumeLook, isReady]);
 
   // ------------------------------------------------------------------
   // 3. Clipping plane management — user clips + progressive scan clip
@@ -729,74 +812,12 @@ export function VolumeRenderer({
     const state = vtkRef.current;
     if (!state || !isReady) return;
 
-    const { mapper, imageData, renderWindow } = state;
-    if (!mapper || !imageData || !renderWindow) return;
+    const { imageData, renderWindow } = state;
+    if (!imageData || !renderWindow) return;
 
-    const bounds = imageData.getBounds();
-    // bounds: [xMin, xMax, yMin, yMax, zMin, zMax]
-    const activePlanes: any[] = [];
-
-    // ---- User clipping planes (slider-controlled) ----
-    // X axis (normal points +X, clip negative side)
-    if (clip.x > 0) {
-      const xPos = bounds[0] + clip.x * (bounds[1] - bounds[0]);
-      activePlanes.push(
-        vtkPlane.newInstance({ normal: [1, 0, 0], origin: [xPos, 0, 0] }),
-      );
-    }
-
-    // Y axis (normal points +Y, clip negative side)
-    if (clip.y > 0) {
-      const yPos = bounds[2] + clip.y * (bounds[3] - bounds[2]);
-      activePlanes.push(
-        vtkPlane.newInstance({ normal: [0, 1, 0], origin: [0, yPos, 0] }),
-      );
-    }
-
-    // Z axis (normal points +Z, clip negative side)
-    if (clip.z > 0) {
-      const zPos = bounds[4] + clip.z * (bounds[5] - bounds[4]);
-      activePlanes.push(
-        vtkPlane.newInstance({ normal: [0, 0, 1], origin: [0, 0, zPos] }),
-      );
-    }
-
-    // ---- Progressive scan clipping ----
-    // Hides voxels with data-index > clipIndex along the scan axis.
-    // A plane whose normal points NEGATIVE clips the POSITIVE side,
-    // so voxels after the clip position are hidden.
-    if (
-      syntheticClipIndex !== undefined &&
-      syntheticClipIndex >= 0 &&
-      syntheticScanAxis
-    ) {
-      const dims = imageData.getDimensions();   // [x, y, z]
-      const spacing = imageData.getSpacing();   // [x, y, z]
-      const origin = imageData.getOrigin();      // [x, y, z]
-
-      const axisIdx = syntheticScanAxis === 'x' ? 0
-        : syntheticScanAxis === 'y' ? 1 : 2;
-      const axisDim = dims[axisIdx];
-
-      const progressivePlane = createProgressiveClipPlane(
-        axisIdx,
-        axisDim,
-        syntheticClipIndex,
-        syntheticClipDirection,
-        origin,
-        spacing,
-      );
-      if (progressivePlane) {
-        activePlanes.push(progressivePlane);
-      }
-    }
-
-    mapper.removeAllClippingPlanes();
-    for (const plane of activePlanes) {
-      mapper.addClippingPlane(plane);
-    }
+    applyActiveClippingPlanes(imageData, [state.mapper, segRef.current?.mapper].filter(Boolean));
     renderWindow.render();
-  }, [clip, syntheticClipDirection, syntheticClipIndex, syntheticScanAxis, isReady]);
+  }, [applyActiveClippingPlanes, isReady]);
 
   // ------------------------------------------------------------------
   // 4. Segmentation overlay — add/remove a second volume for mask
@@ -931,6 +952,7 @@ export function VolumeRenderer({
       segProp.setIndependentComponents(true);
 
       renderer.addVolume(segVolume);
+      applyActiveClippingPlanes(ctImageData, [segMapper]);
       renderWindow.render();
 
       segRef.current = {
@@ -946,7 +968,7 @@ export function VolumeRenderer({
       console.error('[VolumeRenderer] Segmentation overlay failed:', err);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segmentationMask, segmentationLabels, isReady]);
+  }, [applyActiveClippingPlanes, segmentationMask, segmentationLabels, isReady]);
 
   // ------------------------------------------------------------------
   // 4b. Segmentation opacity live update — when the slider is dragged,

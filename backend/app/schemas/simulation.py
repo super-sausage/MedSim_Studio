@@ -266,7 +266,7 @@ class CTParamsPreviewParams(BaseModel):
     gantry_pitch_deg: float = Field(0.0, ge=-30.0, le=30.0)
     gantry_yaw_deg: float = Field(0.0, ge=-30.0, le=30.0)
     gantry_roll_deg: float = Field(0.0, ge=-30.0, le=30.0)
-    slice_thickness_mm: Literal[0.625, 1.0, 2.5, 5.0, 10.0] = 1.0
+    slice_thickness_mm: Literal[0.625, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0] = 1.0
     dose_level: Literal["low", "standard", "high"] = "standard"
     mAs: int = Field(150, ge=30, le=300)
     kVp: Literal[80, 100, 120, 140] = 120
@@ -293,6 +293,7 @@ class CTParamsPreviewResponse(BaseModel):
     """Preview response for CT scan parameter simulation."""
 
     simulated_volume_base64: str
+    simulated_label_base64: Optional[str] = None
     metadata: Dict[str, Any]
     params_json: Dict[str, Any]
     standardized_case: Dict[str, Any]

@@ -61,13 +61,15 @@ const ORGAN_COLORS: Record<number, [number, number, number]> = {
   18: [220, 191, 166], // stomach
   19: [199, 241, 255], // trachea
   20: [147, 177, 241], // urinary_bladder
+  21: [246, 244, 236], // spinal_cord
+  100: [255, 84, 84],  // neoplasm_primary_gtv
 };
 
 /** Semi-transparency alpha for organ label overlay (0-1) */
 const LABEL_OVERLAY_ALPHA = 0.35;
 const LESION_LABEL_BASE = 100;
 
-const ORGAN_LABEL_PRIORITY = [9, 7, 8, 10, 11, 12, 13, 14, 17, 15, 19, 20, 18, 6, 5, 3, 4, 16, 1, 2];
+const ORGAN_LABEL_PRIORITY = [100, 13, 14, 21, 9, 7, 8, 10, 11, 12, 17, 15, 19, 20, 18, 6, 5, 3, 4, 16, 1, 2];
 
 function formatOrganLabelName(name: string): string {
   return name
@@ -198,7 +200,9 @@ function findInformativeSliceRange(
 ): { startIndex: number; endIndex: number } {
   const [depth, height, width] = shape;
   const sliceSize = width * height;
-  const minBodyPixels = Math.max(32, Math.floor(sliceSize * 0.005));
+  const minBodyPixels = Math.max(16, Math.floor(sliceSize * 0.001));
+  const minConsecutiveSlices = Math.min(3, depth);
+  const bodyPixelCounts = new Uint32Array(depth);
   let startIndex = 0;
   let endIndex = Math.max(depth - 1, 0);
 
@@ -215,19 +219,34 @@ function findInformativeSliceRange(
         }
       }
     }
+    bodyPixelCounts[z] = bodyPixels;
   }
 
-  for (let z = depth - 1; z >= startIndex; z--) {
-    const offset = z * sliceSize;
-    let bodyPixels = 0;
-    for (let i = 0; i < sliceSize; i++) {
-      if (volumeData[offset + i] >= bodyThresholdHU) {
-        bodyPixels += 1;
-        if (bodyPixels >= minBodyPixels) {
-          endIndex = z;
-          return { startIndex, endIndex };
-        }
+  for (let z = 0; z <= depth - minConsecutiveSlices; z++) {
+    let sustained = true;
+    for (let k = 0; k < minConsecutiveSlices; k++) {
+      if (bodyPixelCounts[z + k] < minBodyPixels) {
+        sustained = false;
+        break;
       }
+    }
+    if (sustained) {
+      startIndex = z;
+      break;
+    }
+  }
+
+  for (let z = depth - 1; z >= startIndex + minConsecutiveSlices - 1; z--) {
+    let sustained = true;
+    for (let k = 0; k < minConsecutiveSlices; k++) {
+      if (bodyPixelCounts[z - k] < minBodyPixels) {
+        sustained = false;
+        break;
+      }
+    }
+    if (sustained) {
+      endIndex = z;
+      return { startIndex, endIndex };
     }
   }
 
@@ -687,6 +706,15 @@ export default function SimulationPage() {
       return null;
     }
   }, [ctParamsResult?.simulatedVolumeBase64]);
+  const simulatedLabelData = useMemo(() => {
+    if (!ctParamsResult?.simulatedLabelBase64) return null;
+    try {
+      return decodeBase64ToUint8(ctParamsResult.simulatedLabelBase64);
+    } catch (err) {
+      console.error('[SimulationPage] Failed to decode simulated label volume:', err);
+      return null;
+    }
+  }, [ctParamsResult?.simulatedLabelBase64]);
 
   const activeVolumeShape = useMemo<[number, number, number] | null>(() => {
     if (ctParamsResult?.metadata.shape && ctParamsResult.metadata.shape.length >= 3) {
@@ -710,7 +738,7 @@ export default function SimulationPage() {
   }, [ctParamsResult?.metadata.spacing, phantom]);
 
   const activeSliceData = ctParamsResult ? simulatedVolumeData : decodedPhantomData;
-  const activeLabelData = ctParamsResult ? null : decodedLabelData;
+  const activeLabelData = ctParamsResult ? simulatedLabelData : decodedLabelData;
   const activeBodySliceRange = useMemo(() => {
     if (!activeSliceData || !activeVolumeShape) return null;
     const threshold = phantom?.metadata.bodyThresholdHU ?? -500;
@@ -733,13 +761,13 @@ export default function SimulationPage() {
     return { x: clampedX, y: clampedY, z: clampedZ };
   }, [activeVolumeShape, activeVolumeSpacing, pickedPosition, pickedWorldPositionMm]);
   const activeSegmentationLabelData = useMemo(() => {
-    if (!decodedLabelData || !activeVolumeShape) return null;
+    if (!activeLabelData || !activeVolumeShape) return null;
 
     const expectedVoxelCount = activeVolumeShape[0] * activeVolumeShape[1] * activeVolumeShape[2];
-    if (decodedLabelData.length !== expectedVoxelCount) return null;
+    if (activeLabelData.length !== expectedVoxelCount) return null;
 
-    return decodedLabelData;
-  }, [decodedLabelData, activeVolumeShape]);
+    return activeLabelData;
+  }, [activeLabelData, activeVolumeShape]);
   const totalSlices = activeVolumeShape?.[0] ?? 0;
   const scanStartIndex = activeBodySliceRange?.startIndex ?? 0;
   const scanEndIndex = activeBodySliceRange?.endIndex ?? Math.max(totalSlices - 1, 0);
@@ -818,6 +846,35 @@ export default function SimulationPage() {
       labels: [...organLabels, ...lesionLabels],
     };
   }, [lesionOverlay, organSegmentationOverlay]);
+  const visibleLabelLegendItems = useMemo(() => {
+    const labelMap = phantom?.metadata?.labelMap;
+    if (!labelMap) return [];
+
+    const nonzeroCounts = phantom.metadata.labelNonzeroCounts ?? {};
+    const available = Object.entries(labelMap)
+      .map(([key, value]) => [Number(key), value] as const)
+      .filter(([index]) => index > 0 && !!ORGAN_COLORS[index])
+      .filter(([index]) => {
+        const count = nonzeroCounts[index];
+        return count === undefined || Number(count) > 0;
+      });
+
+    const orderedIndexes = [
+      ...ORGAN_LABEL_PRIORITY.filter((index) => available.some(([availableIndex]) => availableIndex === index)),
+      ...available
+        .map(([index]) => index)
+        .filter((index) => !ORGAN_LABEL_PRIORITY.includes(index)),
+    ];
+
+    return orderedIndexes.map((index) => {
+      const rawName = available.find(([availableIndex]) => availableIndex === index)?.[1] ?? `Label ${index}`;
+      return {
+        index,
+        name: formatOrganLabelName(rawName),
+        color: ORGAN_COLORS[index],
+      };
+    });
+  }, [phantom?.metadata?.labelMap, phantom?.metadata?.labelNonzeroCounts]);
 
   useEffect(() => {
     if (!activeVolumeShape) return;
@@ -875,7 +932,7 @@ export default function SimulationPage() {
       windowLevel,
       windowWidth,
       labelData: activeLabelData,
-      showLabelOverlay: showLabelOverlay && !ctParamsResult,
+      showLabelOverlay,
       pickedPosition: activePickedPosition,
     });
   }, [
@@ -884,7 +941,6 @@ export default function SimulationPage() {
     activeLabelData,
     activePickedPosition,
     activeVolumeShape,
-    ctParamsResult,
     showLabelOverlay,
     sliceIndex,
   ]);
@@ -3025,7 +3081,7 @@ export default function SimulationPage() {
                       }
                       className="rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
                     >
-                      {[0.625, 1.0, 2.5, 5.0, 10.0].map((value) => (
+                      {[0.625, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0].map((value) => (
                         <option key={value} value={value}>
                           {value}
                         </option>
@@ -3330,20 +3386,10 @@ export default function SimulationPage() {
                 <span className="text-[10px] text-muted-foreground/60">
                   Labels:
                 </span>
-                {[
-                  [9, 'Liver'],
-                  [7, 'L Kidney'],
-                  [8, 'R Kidney'],
-                  [10, 'Lungs'],
-                  [17, 'Spleen'],
-                  [15, 'Pancreas'],
-                  [19, 'Trachea'],
-                  [20, 'Bladder'],
-                ].map(([id, name]) => {
-                  const color = ORGAN_COLORS[id as number];
+                {visibleLabelLegendItems.map(({ index, name, color }) => {
                   return (
                     <span
-                      key={id}
+                      key={index}
                       className="flex items-center gap-1 text-[10px] text-muted-foreground"
                     >
                       <span

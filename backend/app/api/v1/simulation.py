@@ -2137,9 +2137,16 @@ async def preview_ct_scan_params(
         volume_b64 = base64.b64encode(
             np.asarray(simulated_volume, dtype="<f4").tobytes()
         ).decode("ascii")
+        simulated_label_volume = simulation_result.get("simulated_label_volume")
+        simulated_label_b64 = None
+        if simulated_label_volume is not None:
+            simulated_label_b64 = base64.b64encode(
+                np.asarray(simulated_label_volume, dtype=np.uint8).tobytes()
+            ).decode("ascii")
 
         return CTParamsPreviewResponse(
             simulated_volume_base64=volume_b64,
+            simulated_label_base64=simulated_label_b64,
             metadata=metadata,
             params_json=params_json,
             standardized_case=standardized_case,
