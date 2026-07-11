@@ -10,7 +10,16 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import affine_transform, gaussian_filter, gaussian_filter1d, laplace, zoom
+from scipy.ndimage import (
+    affine_transform,
+    binary_dilation,
+    binary_fill_holes,
+    gaussian_filter,
+    gaussian_filter1d,
+    label,
+    laplace,
+    zoom,
+)
 
 
 Spacing3D = Tuple[float, float, float]
@@ -77,6 +86,37 @@ def _projection_thickness_surrogate(mu_map: np.ndarray) -> np.ndarray:
     backproj_y = np.repeat(proj_y_norm[:, None, :], mu_map.shape[1], axis=1)
     backproj_x = np.repeat(proj_x_norm[:, :, None], mu_map.shape[2], axis=2)
     return (0.55 * backproj_y + 0.45 * backproj_x).astype(np.float32, copy=False)
+
+
+def _extract_body_support_mask(
+    volume: np.ndarray,
+    label_volume: Optional[np.ndarray] = None,
+    threshold_hu: float = -900.0,
+) -> np.ndarray:
+    """
+    Approximate the physically meaningful body support region.
+
+    The right-side 3D preview is expected to behave like stacked 2D CT slices,
+    not a glowing rectangular voxel box. After angle/FOV/noise processing,
+    exterior padded air can drift above pure AIR_HU and become volume-visible.
+    We therefore keep only the largest connected non-air component, fill its
+    internal cavities, and preserve explicit label voxels.
+    """
+    support_seed = volume > threshold_hu
+    if label_volume is not None:
+      support_seed |= label_volume > 0
+
+    labeled, num_features = label(support_seed)
+    if num_features <= 0:
+        return support_seed
+
+    component_sizes = np.bincount(labeled.ravel())
+    component_sizes[0] = 0
+    largest_component = labeled == int(np.argmax(component_sizes))
+    filled_component = binary_fill_holes(largest_component)
+    if label_volume is not None:
+        filled_component |= label_volume > 0
+    return binary_dilation(filled_component, iterations=1)
 
 
 def _normalized_radial_map(shape: tuple[int, int, int]) -> np.ndarray:
@@ -202,13 +242,14 @@ def _apply_gantry_pose(
     gantry_roll_deg: float,
     *,
     label_volume: Optional[np.ndarray] = None,
-) -> tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+    support_mask: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Dict[str, Any]]:
     if (
         abs(gantry_pitch_deg) < 1e-6
         and abs(gantry_yaw_deg) < 1e-6
         and abs(gantry_roll_deg) < 1e-6
     ):
-        return volume, label_volume, {
+        return volume, label_volume, support_mask, {
             "gantry_pitch_deg": 0.0,
             "gantry_yaw_deg": 0.0,
             "gantry_roll_deg": 0.0,
@@ -268,7 +309,20 @@ def _apply_gantry_pose(
             prefilter=False,
         ).astype(np.uint8, copy=False)
 
-    return rotated_volume, rotated_labels, {
+    rotated_support_mask: Optional[np.ndarray] = None
+    if support_mask is not None:
+        rotated_support_mask = affine_transform(
+            support_mask.astype(np.float32, copy=False),
+            matrix=transform_matrix,
+            offset=offset,
+            output_shape=output_shape,
+            order=0,
+            mode="constant",
+            cval=0.0,
+            prefilter=False,
+        ) > 0.5
+
+    return rotated_volume, rotated_labels, rotated_support_mask, {
         "gantry_pitch_deg": float(gantry_pitch_deg),
         "gantry_yaw_deg": float(gantry_yaw_deg),
         "gantry_roll_deg": float(gantry_roll_deg),
@@ -692,14 +746,15 @@ def _apply_fov_effect(
     fov_mm: float,
     warnings: list[str],
     label_volume: Optional[np.ndarray] = None,
-) -> tuple[np.ndarray, Spacing3D, Dict[str, Any]]:
+    support_mask: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Spacing3D, Dict[str, Any]]:
     ny, nx = volume.shape[1], volume.shape[2]
     current_fov_y = float(spacing[1] * ny)
     current_fov_x = float(spacing[2] * nx)
     reference_fov = max(current_fov_y, current_fov_x)
 
     if abs(fov_mm - reference_fov) < 1.0:
-        return volume, label_volume, spacing, {
+        return volume, label_volume, support_mask, spacing, {
             "mode": "identity",
             "reference_fov_mm": float(reference_fov),
         }
@@ -739,12 +794,17 @@ def _apply_fov_effect(
         scaled_labels = _resize_xy(label_volume.astype(np.float32, copy=False), zoom_factor, order=0)
         label_result = _crop_or_pad_to_shape(scaled_labels, (ny, nx)).astype(np.uint8, copy=False)
 
+    support_result = support_mask
+    if support_mask is not None:
+        scaled_support = _resize_xy(support_mask.astype(np.float32, copy=False), zoom_factor, order=0)
+        support_result = _crop_or_pad_to_shape(scaled_support, (ny, nx)) > 0.5
+
     new_spacing = (
         float(spacing[0]),
         float(fov_mm / ny),
         float(fov_mm / nx),
     )
-    return result.astype(np.float32, copy=False), label_result, new_spacing, {
+    return result.astype(np.float32, copy=False), label_result, support_result, new_spacing, {
         "mode": mode,
         "reference_fov_mm": float(reference_fov),
         "applied_zoom_factor": float(zoom_factor),
@@ -1033,6 +1093,10 @@ def simulate_ct_scan_params(
 
     working = volume.astype(np.float32, copy=True)
     working_labels = label_volume.astype(np.uint8, copy=True) if label_volume is not None else None
+    working_support_mask = working > -980.0
+    if working_labels is not None:
+        working_support_mask |= working_labels > 0
+    working_support_mask = binary_dilation(working_support_mask, iterations=1)
     input_spacing = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
     warnings: list[str] = []
     resolved_params = _resolve_params(params)
@@ -1049,13 +1113,14 @@ def simulate_ct_scan_params(
     hu_before = [float(np.min(working)), float(np.max(working))]
     preview_before = _center_slice_stats(working)
 
-    working, working_labels, step_meta = _apply_gantry_pose(
+    working, working_labels, working_support_mask, step_meta = _apply_gantry_pose(
         working,
         input_spacing,
         resolved_params["gantry_pitch_deg"],
         resolved_params["gantry_yaw_deg"],
         resolved_params["gantry_roll_deg"],
         label_volume=working_labels,
+        support_mask=working_support_mask,
     )
     algorithm_steps.append({"name": "gantry_pose_resampling", **step_meta})
 
@@ -1071,12 +1136,13 @@ def simulate_ct_scan_params(
     working, step_meta = _apply_pitch_effect(working, resolved_params["pitch"])
     algorithm_steps.append({"name": "pitch_degradation", **step_meta})
 
-    working, working_labels, output_spacing, step_meta = _apply_fov_effect(
+    working, working_labels, working_support_mask, output_spacing, step_meta = _apply_fov_effect(
         working,
         input_spacing,
         resolved_params["fov_mm"],
         warnings,
         label_volume=working_labels,
+        support_mask=working_support_mask,
     )
     algorithm_steps.append({"name": "fov_adjustment", **step_meta})
 
@@ -1088,6 +1154,11 @@ def simulate_ct_scan_params(
 
     working, step_meta = _apply_contrast_phase(working, resolved_params["contrast_phase"], working_labels)
     algorithm_steps.append({"name": "contrast_phase", **step_meta})
+
+    if working_support_mask is not None:
+        # Keep voxels outside the rotated/padded patient support region as true air.
+        # Without this, later noise/filter stages can make the expanded rotation box visible.
+        working = np.where(working_support_mask, working, AIR_HU)
 
     working = _clipped_float32(working)
 
