@@ -91,8 +91,8 @@ interface SegmentationVolumeRef {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SEG_OPACITY = 0.14;
-const SELECTED_OPACITY_BOOST = 0.16;
+const DEFAULT_SEG_OPACITY = 0.11;
+const SELECTED_OPACITY_BOOST = 0.10;
 const MIN_ORGAN_SURFACE_VOXELS = 8;
 const SURFACE_SMOOTHING_ITERATIONS = 8;
 const SURFACE_SMOOTHING_PASS_BAND = 0.2;
@@ -1012,10 +1012,10 @@ export function VolumeRenderer({
       const segProp = segActor.getProperty();
       segProp.setColor(label.color[0] / 255, label.color[1] / 255, label.color[2] / 255);
       segProp.setOpacity(label.opacity ?? segmentationOpacity);
-      segProp.setAmbient(0.28);
-      segProp.setDiffuse(0.62);
-      segProp.setSpecular(0.18);
-      segProp.setSpecularPower(22.0);
+      segProp.setAmbient(0.38);
+      segProp.setDiffuse(0.48);
+      segProp.setSpecular(0.08);
+      segProp.setSpecularPower(12.0);
       if (typeof segProp.setInterpolationToPhong === 'function') {
         segProp.setInterpolationToPhong();
       }

@@ -1,5 +1,224 @@
 # MedSim Studio Codex Project Context
 
+## Update 2026-07-11 - organ colors darkened and separation increased for CT overlays
+
+This pass happened after the user reviewed the latest lighter organ overlay
+palette and asked for the colors to become deeper again, with stronger visual
+separation between organs.
+
+The user requirement in this pass was specifically:
+
+- keep organ colors visible
+- make the colors darker than the previous softened pastel version
+- increase inter-organ distinction so adjacent structures are easier to tell
+  apart
+- avoid returning to an overly opaque overlay that hides CT detail
+
+### Frontend changes made
+
+#### `frontend/src/pages/SimulationPage.tsx`
+
+- the organ color table was retuned from a light pastel palette to a deeper,
+  more distinct palette
+- left/right kidneys and lung lobes now use more separated hues instead of
+  nearly identical colors
+- `LABEL_OVERLAY_ALPHA` was set to `0.28`
+  - this makes 2D organ overlays more visible than the lighter pass
+  - but still avoids the earlier heavier look that obscured CT texture
+- fallback colors for non-predefined labels were changed to:
+  - higher saturation
+  - lower lightness
+  - stronger label-to-label separation
+- the shared color softening step was retained, but reduced significantly:
+  - previous mix was stronger
+  - current `softenOrganColor(...)` mix is `0.06`
+
+#### `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+- segmentation overlay opacity was raised to better match the darker palette:
+  - `DEFAULT_SEG_OPACITY = 0.11`
+  - `SELECTED_OPACITY_BOOST = 0.10`
+- organ surface material was kept relatively soft so deeper colors do not look
+  too glossy or muddy in 3D
+
+### Result
+
+- organ colors are now darker than the previous pass
+- the visual distinction between neighboring organs is stronger
+- 2D and 3D segmentation overlays are easier to read without becoming fully
+  heavy or opaque
+
+### Validation
+
+- `npx tsc --noEmit` passed in `frontend`
+
+## Update 2026-07-11 - DICOM multi-organ colors restored under Slice Sync via label-volume alignment and slice-synced segmentation volume rendering
+
+This pass happened after the user continued reporting that organ colors still
+did not load in the CT simulation page, even though the backend appeared to
+have nnUNet weights capable of segmenting 20 organs.
+
+The user also gave one hard requirement that constrained the fix:
+
+- `Slice Sync` must remain enabled and usable
+- the 3D view must behave like progressive CT loading from the top and build
+  up the 3D body as slices advance
+
+### What was actually confirmed
+
+The issue was not "backend has no segmentation" and not simply "colors are
+missing from the legend".
+
+Confirmed during this pass:
+
+- the backend was returning DICOM workspace segmentation successfully
+- direct API validation against the running backend returned:
+  - `label_source = nnunet`
+  - `label_model_name = nnunet702_20organs`
+  - `label_base64` present
+  - `label_map` populated for labels `1..20`
+  - non-zero labels present in the returned mask
+- the frontend diagnostics later shown by the user also confirmed:
+  - `Labels: on`
+  - `Source: nnunet`
+  - `Model: nnunet702_20organs`
+  - `Nonzero labels: 5`
+
+Important implication:
+
+- segmentation data was already arriving at the frontend
+- the failure was in frontend rendering behavior, not label generation itself
+
+### Real root causes found in the frontend
+
+Two separate frontend issues were identified.
+
+#### 1. Segmentation mask voxel order did not match the CT vtk volume order
+
+The CT volume data was transposed before being passed into vtk, but the
+segmentation and lesion masks were still being passed through in raw zyx order.
+
+That meant:
+
+- the CT and label volume were not using the same memory layout inside vtk
+- organ overlays could appear misplaced, clipped incorrectly, or effectively
+  invisible
+
+#### 2. Surface-mesh organ rendering was a poor fit for progressive Slice Sync
+
+The current 3D segmentation renderer was based on per-organ extracted surfaces.
+That works better when the full volume is already available, but under
+`Slice Sync` the progressive clipping logic meant organs could remain hard to
+see or seem absent during early accumulation.
+
+The user explicitly wanted the progressive scan effect preserved, so disabling
+`Slice Sync` was not an acceptable solution.
+
+### Frontend changes made
+
+#### `frontend/src/pages/SimulationPage.tsx`
+
+- added `transposeZyxMaskToVtkOrder(...)`
+- organ segmentation masks are now transposed into the same vtk voxel order as
+  the CT volume before rendering
+- lesion masks are also transposed the same way for consistency
+- DICOM diagnostics were added to the page so the loaded workspace now shows:
+  - `Labels`
+  - `Source`
+  - `Model`
+  - `Nonzero labels`
+- when studies load and no study is selected, the first study is auto-selected
+- when CT workspace series load and none is selected, the first CT series is
+  auto-selected
+- DICOM loading behavior was tightened:
+  - if a study is selected, the load source is treated as `dicom`
+  - if a study is selected but no CT series is selected, loading is blocked
+    with an explicit error instead of silently falling back to atlas
+- `Slice Sync` default remains enabled:
+  - `const [sync3DToSlice, setSync3DToSlice] = useState(true);`
+
+#### `frontend/src/services/simulationService.ts`
+
+- `PhantomMetadata` was extended so the frontend can carry DICOM label
+  diagnostics:
+  - `labelSource`
+  - `labelModelName`
+  - `labelError`
+  - `labelsEnabled`
+  - `segmentationSeriesId`
+
+#### `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+The renderer now supports two segmentation rendering paths:
+
+1. normal full-volume mode:
+   - keep the existing per-organ smoothed surface actors
+2. `Slice Sync` progressive mode:
+   - render segmentation as a clipped label volume overlay instead of only
+     extracted surfaces
+
+Implementation details:
+
+- added `SegmentationVolumeRef`
+- added cleanup for segmentation volume resources
+- clipping planes are now applied to:
+  - CT mapper
+  - segmentation volume mapper when present
+  - organ surface mappers
+- in `Slice Sync` mode (`syntheticClipIndex >= 0`), the renderer now:
+  - builds a segmentation `vtkImageData`
+  - creates a `vtkVolumeMapper`
+  - assigns per-label color transfer function entries
+  - assigns per-label opacity bands around each integer label value
+  - uses nearest-neighbor interpolation so labels stay discrete
+  - overlays the segmentation volume progressively as slices accumulate
+- outside `Slice Sync` mode, the original per-organ surface rendering path is
+  retained
+- live opacity / visibility updates now work for both:
+  - segmentation volume overlay mode
+  - per-organ surface mode
+
+### Why this fixed the visible behavior
+
+The final fix was not just "add more colors".
+
+It changed the rendering model so that:
+
+- label voxels align spatially with the CT volume
+- progressive scan accumulation can reveal segmentation as the scan advances
+- colored organ regions can appear during slice-synced buildup instead of
+  waiting for stable full organ surfaces
+
+### Validation performed
+
+- `npx tsc --noEmit` passed in `frontend`
+- backend API validation confirmed nnUNet multi-organ labels were being
+  returned for the current DICOM workspace test study
+- the user later reported that segmented organs were appearing in greater
+  quantity than before, which was the expected direction after this fix
+
+### Current repository state after this pass
+
+This pass was committed.
+
+- commit: `5ba693a`
+- message: `fix: improve slice-synced dicom segmentation rendering`
+
+### Important notes for the next conversation
+
+- do not remove or disable `Slice Sync` to "fix" segmentation visibility; the
+  user explicitly needs the progressive CT-style generation behavior
+- if the user reports that "too many" organs appear, that is now more likely a
+  segmentation quality / model-selection question rather than the old
+  color-loading failure
+- the first things to inspect next are:
+  1. label alignment and voxel order assumptions
+  2. whether the renderer is in slice-synced volume-overlay mode or full
+     surface mode
+  3. backend `label_source`, `label_model_name`, and `label_nonzero_counts`
+  4. whether the current DICOM CT field of view actually contains the organs
+     the user expects
+
 ## Update 2026-07-11 - move 3D organ visibility checklist below the volume
 
 This pass addressed a layout issue reported by the user on the CT simulation

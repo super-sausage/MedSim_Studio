@@ -42,32 +42,32 @@ const WINDOW_PRESETS: WindowPreset[] = [
 // ---------------------------------------------------------------------------
 
 const ORGAN_COLORS: Record<number, [number, number, number]> = {
-  1: [250, 233, 143],  // left_adrenal_gland
-  2: [250, 233, 143],  // right_adrenal_gland
-  3: [205, 156, 130],  // colon
-  4: [246, 196, 206],  // duodenum
-  5: [177, 219, 242],  // esophagus
-  6: [168, 224, 162],  // gallbladder
-  7: [255, 204, 143],  // left_kidney
-  8: [255, 204, 143],  // right_kidney
-  9: [223, 143, 128],  // liver
-  10: [136, 221, 235], // left_lung_lower_lobe
-  11: [136, 221, 235], // right_lung_lower_lobe
-  12: [136, 221, 235], // right_lung_middle_lobe
-  13: [181, 237, 245], // left_lung_upper_lobe
-  14: [181, 237, 245], // right_lung_upper_lobe
-  15: [248, 226, 141], // pancreas
-  16: [239, 198, 213], // small_bowel
-  17: [198, 160, 218], // spleen
-  18: [220, 191, 166], // stomach
-  19: [199, 241, 255], // trachea
-  20: [147, 177, 241], // urinary_bladder
-  21: [246, 244, 236], // spinal_cord
-  100: [255, 84, 84],  // neoplasm_primary_gtv
+  1: [226, 196, 88],   // left_adrenal_gland
+  2: [226, 196, 88],   // right_adrenal_gland
+  3: [179, 114, 88],   // colon
+  4: [221, 146, 180],  // duodenum
+  5: [96, 174, 206],   // esophagus
+  6: [106, 176, 108],  // gallbladder
+  7: [214, 138, 74],   // left_kidney
+  8: [194, 112, 68],   // right_kidney
+  9: [186, 92, 72],    // liver
+  10: [76, 174, 194],  // left_lung_lower_lobe
+  11: [58, 150, 184],  // right_lung_lower_lobe
+  12: [80, 196, 172],  // right_lung_middle_lobe
+  13: [96, 210, 220],  // left_lung_upper_lobe
+  14: [80, 192, 224],  // right_lung_upper_lobe
+  15: [218, 182, 74],  // pancreas
+  16: [206, 132, 160], // small_bowel
+  17: [142, 108, 198], // spleen
+  18: [182, 132, 100], // stomach
+  19: [86, 194, 224],  // trachea
+  20: [82, 110, 204],  // urinary_bladder
+  21: [214, 214, 204], // spinal_cord
+  100: [224, 72, 72],  // neoplasm_primary_gtv
 };
 
 /** Semi-transparency alpha for organ label overlay (0-1) */
-const LABEL_OVERLAY_ALPHA = 0.35;
+const LABEL_OVERLAY_ALPHA = 0.28;
 const LESION_LABEL_BASE = 100;
 
 const ORGAN_LABEL_PRIORITY = [100, 13, 14, 21, 9, 7, 8, 10, 11, 12, 17, 15, 19, 20, 18, 6, 5, 3, 4, 16, 1, 2];
@@ -94,8 +94,8 @@ function normalizeOrganLabelKey(name: string): string {
 
 function getFallbackOrganColor(labelIndex: number): [number, number, number] {
   const hue = (labelIndex * 47) % 360;
-  const saturation = 60;
-  const lightness = 70;
+  const saturation = 58;
+  const lightness = 60;
   const c = (1 - Math.abs((2 * lightness) / 100 - 1)) * (saturation / 100);
   const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
   const m = lightness / 100 - c / 2;
@@ -124,17 +124,26 @@ function getFallbackOrganColor(labelIndex: number): [number, number, number] {
   ];
 }
 
+function softenOrganColor([r, g, b]: [number, number, number]): [number, number, number] {
+  const mix = 0.06;
+  return [
+    Math.round(r + (255 - r) * mix),
+    Math.round(g + (255 - g) * mix),
+    Math.round(b + (255 - b) * mix),
+  ];
+}
+
 function getOrganColor(index: number, rawName?: string): [number, number, number] {
   const normalizedName = rawName ? normalizeOrganLabelKey(rawName) : '';
   if (normalizedName && ORGAN_NAME_COLORS[normalizedName]) {
-    return ORGAN_NAME_COLORS[normalizedName];
+    return softenOrganColor(ORGAN_NAME_COLORS[normalizedName]);
   }
 
   if (ORGAN_COLORS[index]) {
-    return ORGAN_COLORS[index];
+    return softenOrganColor(ORGAN_COLORS[index]);
   }
 
-  return getFallbackOrganColor(index);
+  return softenOrganColor(getFallbackOrganColor(index));
 }
 
 // ---------------------------------------------------------------------------
