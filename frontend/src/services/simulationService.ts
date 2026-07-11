@@ -272,6 +272,7 @@ export const simulationService = {
     scanDirection: 'head_to_feet' | 'feet_to_head' = 'head_to_feet',
     studyId?: string | null,
     seriesId?: string | null,
+    includeLabels = true,
   ): Promise<PhantomResponse> =>
     api.get<PhantomResponse>('/simulation/phantom', {
       timeout: 180000,
@@ -280,6 +281,7 @@ export const simulationService = {
         size,
         case_id: caseId,
         scan_direction: scanDirection,
+        include_labels: includeLabels,
         ...(studyId ? { study_id: studyId } : {}),
         ...(seriesId ? { series_id: seriesId } : {}),
       },

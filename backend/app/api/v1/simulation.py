@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from PIL import Image
 
 import numpy as np
+import pydicom
 from scipy.ndimage import zoom
 
 from app.database.session import get_db, SessionLocal
@@ -53,6 +54,8 @@ from app.simulation.volume_builder import build_volume_from_dicom, build_synthet
 from app.simulation.exporter import export_nrrd, export_nifti, export_dicom_zip
 from app.simulation.ct_params_simulator import simulate_ct_scan_params
 from app.simulation.phantom_generator import (
+    LUNG_SAMPLE_LABEL_MAP,
+    LUNG_SEGMENT_LABEL_TO_ID,
     generate_atlas_ct_phantom,
     generate_procedural_ct_phantom,
     list_available_atlas_cases,
@@ -418,6 +421,7 @@ def _get_cached_phantom_payload(
     size: int,
     case_id: str,
     scan_direction: str,
+    include_labels: bool,
 ) -> Dict[str, Any]:
     """Cache expensive phantom generation + base64 encoding by request key."""
     if source == "atlas":
@@ -430,13 +434,18 @@ def _get_cached_phantom_payload(
         response_content = _build_workspace_volume_payload(
             ct_volume,
             metadata,
-            label_volume=label_volume,
+            label_volume=label_volume if include_labels else None,
+            include_labels=include_labels,
         )
 
         return response_content
 
     volume, _, metadata = generate_procedural_ct_phantom(size=size)
-    return _build_workspace_volume_payload(volume, metadata)
+    return _build_workspace_volume_payload(
+        volume,
+        metadata,
+        include_labels=include_labels,
+    )
 
 
 def _downsample_volume_to_max_dim(
@@ -457,20 +466,391 @@ def _downsample_volume_to_max_dim(
     return resized.astype(np.float32, copy=False), new_spacing, scale
 
 
+def _read_dicom_dataset_from_storage(storage: Any, object_key: Optional[str]) -> Optional[Any]:
+    if not object_key:
+        return None
+    dicom_bytes = storage.get_object_bytes(object_key)
+    if dicom_bytes is None:
+        return None
+    try:
+        return pydicom.dcmread(io.BytesIO(dicom_bytes), force=True)
+    except Exception:
+        logger.warning("Failed to parse DICOM object from storage: %s", object_key, exc_info=True)
+        return None
+
+
+def _extract_vector(values: Any, expected_len: int) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    try:
+        vector = np.asarray([float(v) for v in values], dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if vector.shape[0] != expected_len:
+        return None
+    return vector
+
+
+def _collect_dicom_ct_slice_geometry(
+    storage: Any,
+    instances: List[DicomInstance],
+) -> tuple[list[Dict[str, Any]], Optional[np.ndarray]]:
+    slices: list[Dict[str, Any]] = []
+    row_direction: Optional[np.ndarray] = None
+    col_direction: Optional[np.ndarray] = None
+
+    for fallback_index, inst in enumerate(instances):
+        ds = _read_dicom_dataset_from_storage(storage, inst.pixel_data_path)
+        if ds is None:
+            continue
+
+        raw_image_position = getattr(ds, "ImagePositionPatient", None)
+        if raw_image_position is None:
+            raw_image_position = inst.image_position
+        raw_image_orientation = getattr(ds, "ImageOrientationPatient", None)
+        if raw_image_orientation is None:
+            raw_image_orientation = inst.image_orientation
+
+        image_position = _extract_vector(raw_image_position, 3)
+        image_orientation = _extract_vector(raw_image_orientation, 6)
+        if image_orientation is not None and row_direction is None and col_direction is None:
+            row_direction = image_orientation[:3]
+            col_direction = image_orientation[3:]
+
+        sort_fallback = inst.slice_location
+        if sort_fallback is None:
+            sort_fallback = inst.instance_number if inst.instance_number is not None else fallback_index
+
+        slices.append(
+            {
+                "image_position": image_position,
+                "sort_fallback": float(sort_fallback),
+            }
+        )
+
+    slice_direction: Optional[np.ndarray] = None
+    if row_direction is not None and col_direction is not None:
+        candidate = np.cross(row_direction, col_direction)
+        norm = float(np.linalg.norm(candidate))
+        if norm > 1e-6:
+            slice_direction = candidate / norm
+
+    if slice_direction is not None and all(item["image_position"] is not None for item in slices):
+        for item in slices:
+            item["sort_position"] = float(np.dot(item["image_position"], slice_direction))
+        slices.sort(key=lambda item: item["sort_position"])
+    else:
+        slices.sort(key=lambda item: item["sort_fallback"])
+
+    return slices, slice_direction
+
+
+def _find_dicom_seg_series(db: Session, study_id: str, ct_series_id: str) -> list[DicomSeries]:
+    series_items = (
+        db.query(DicomSeries)
+        .filter(DicomSeries.study_id == study_id)
+        .filter(DicomSeries.id != ct_series_id)
+        .all()
+    )
+
+    candidates: list[DicomSeries] = []
+    for series in series_items:
+        modality = str(series.modality or "").upper()
+        description = str(series.series_description or "").lower()
+        protocol = str(series.protocol_name or "").lower()
+        if modality == "SEG" or "segmentation" in description or "segmentation" in protocol:
+            candidates.append(series)
+    return candidates
+
+
+def _load_dicom_seg_label_volume(
+    *,
+    db: Session,
+    storage: Any,
+    study_id: str,
+    ct_series_id: str,
+    ct_instances: List[DicomInstance],
+    need_flip: bool,
+    zoom_factor: float,
+    output_shape: tuple[int, int, int],
+) -> tuple[Optional[np.ndarray], Dict[str, int], Dict[str, list], Optional[str]]:
+    """Try converting a same-study DICOM SEG object into a workspace label map."""
+    ct_slices, slice_direction = _collect_dicom_ct_slice_geometry(storage, ct_instances)
+    if not ct_slices or slice_direction is None:
+        return None, {}, {}, None
+
+    ct_positions = [
+        float(np.dot(item["image_position"], slice_direction))
+        for item in ct_slices
+        if item["image_position"] is not None
+    ]
+    if len(ct_positions) != len(ct_slices):
+        return None, {}, {}, None
+
+    for seg_series in _find_dicom_seg_series(db, study_id, ct_series_id):
+        seg_instances = (
+            db.query(DicomInstance)
+            .filter(DicomInstance.series_id == seg_series.id)
+            .order_by(DicomInstance.instance_number.asc().nulls_last())
+            .all()
+        )
+        for seg_instance in seg_instances:
+            seg_ds = _read_dicom_dataset_from_storage(storage, seg_instance.pixel_data_path)
+            if seg_ds is None:
+                continue
+            try:
+                seg_pixels = seg_ds.pixel_array
+            except Exception:
+                logger.warning("Failed to decode DICOM SEG pixels for series %s", seg_series.id, exc_info=True)
+                continue
+            if seg_pixels.ndim == 2:
+                seg_pixels = seg_pixels[np.newaxis, :, :]
+
+            segment_number_to_id: Dict[int, int] = {}
+            for segment in getattr(seg_ds, "SegmentSequence", []):
+                segment_number = int(getattr(segment, "SegmentNumber", 0) or 0)
+                label_text = " ".join(
+                    str(value or "")
+                    for value in (
+                        getattr(segment, "SegmentLabel", ""),
+                        getattr(segment, "SegmentDescription", ""),
+                    )
+                ).strip().lower()
+                mapped_id = LUNG_SEGMENT_LABEL_TO_ID.get(label_text)
+                if mapped_id is not None:
+                    segment_number_to_id[segment_number] = mapped_id
+
+            if not segment_number_to_id:
+                continue
+
+            label_volume = np.zeros(
+                (len(ct_slices), int(seg_ds.Rows), int(seg_ds.Columns)),
+                dtype=np.uint8,
+            )
+            frame_groups = getattr(seg_ds, "PerFrameFunctionalGroupsSequence", [])
+            for frame_index, frame in enumerate(frame_groups):
+                if frame_index >= seg_pixels.shape[0]:
+                    break
+                try:
+                    segment_number = int(
+                        frame.SegmentIdentificationSequence[0].ReferencedSegmentNumber
+                    )
+                    image_position = np.asarray(
+                        [float(v) for v in frame.PlanePositionSequence[0].ImagePositionPatient],
+                        dtype=np.float64,
+                    )
+                except Exception:
+                    continue
+
+                label_id = segment_number_to_id.get(segment_number)
+                if label_id is None:
+                    continue
+
+                z_index = int(np.argmin(np.abs(np.asarray(ct_positions) - float(np.dot(image_position, slice_direction)))))
+                frame_mask = seg_pixels[frame_index] > 0
+                if not np.any(frame_mask):
+                    continue
+
+                if label_id == 100:
+                    label_volume[z_index][frame_mask] = label_id
+                else:
+                    target = label_volume[z_index]
+                    target[frame_mask & (target == 0)] = label_id
+
+            if need_flip:
+                label_volume = label_volume[::-1, :, :].copy()
+
+            if zoom_factor != 1.0:
+                label_volume = zoom(
+                    label_volume,
+                    (zoom_factor, zoom_factor, zoom_factor),
+                    order=0,
+                    mode="constant",
+                    cval=0,
+                ).astype(np.uint8)
+
+            if label_volume.shape != output_shape:
+                logger.warning(
+                    "DICOM SEG label shape %s does not match CT output shape %s",
+                    label_volume.shape,
+                    output_shape,
+                )
+                continue
+
+            label_counts = {
+                int(label_id): int(np.sum(label_volume == label_id))
+                for label_id in LUNG_SAMPLE_LABEL_MAP
+                if label_id != 0 and int(np.sum(label_volume == label_id)) > 0
+            }
+            if not label_counts:
+                continue
+
+            slice_presence: Dict[str, list] = {}
+            groups = {
+                "lung": [13, 14],
+                "lung_left": [13],
+                "lung_right": [14],
+                "spinal_cord": [21],
+                "neoplasm": [100],
+            }
+            for group_name, label_ids in groups.items():
+                z_presence = np.any(np.isin(label_volume, label_ids), axis=(1, 2))
+                z_indices = np.where(z_presence)[0]
+                if len(z_indices) > 0:
+                    slice_presence[group_name] = [int(z_indices[0]), int(z_indices[-1])]
+
+            return label_volume, label_counts, slice_presence, seg_series.id
+
+    return None, {}, {}, None
+
+
+def _label_defs_to_label_map(label_defs: list[dict]) -> Dict[int, str]:
+    label_map: Dict[int, str] = {}
+    for label_def in label_defs:
+        try:
+            label_index = int(label_def.get("index", 0))
+        except (TypeError, ValueError):
+            continue
+        if label_index <= 0:
+            continue
+        raw_name = label_def.get("name") or f"label_{label_index}"
+        label_map[label_index] = str(raw_name).strip().lower().replace(" ", "_")
+    return label_map
+
+
+def _summarize_label_volume(
+    label_volume: np.ndarray,
+    label_map: Dict[int, str],
+) -> tuple[Dict[int, int], Dict[str, list]]:
+    label_counts: Dict[int, int] = {}
+    slice_presence: Dict[str, list] = {}
+
+    for label_id, label_name in label_map.items():
+        mask = label_volume == int(label_id)
+        count = int(np.sum(mask))
+        if count <= 0:
+            continue
+        label_counts[int(label_id)] = count
+
+        z_presence = np.any(mask, axis=(1, 2))
+        z_indices = np.where(z_presence)[0]
+        if len(z_indices) > 0:
+            slice_presence[str(label_name)] = [int(z_indices[0]), int(z_indices[-1])]
+
+    return label_counts, slice_presence
+
+
+def _load_nnunet_workspace_label_volume(
+    volume: np.ndarray,
+    spacing: tuple[float, float, float],
+) -> tuple[Optional[np.ndarray], Dict[int, str], Dict[int, int], Dict[str, list], Optional[str], Optional[str]]:
+    """Run the locally mounted nnUNet model as a DICOM workspace label fallback."""
+    model_attempts = [
+        "nnunet702_20organs",
+        "nnunet_lung_lobe",
+        "nnunet_handoff",
+    ]
+    last_error: Optional[str] = None
+
+    for model_name in model_attempts:
+        try:
+            if model_name == "nnunet702_20organs":
+                from app.ai.nnunet_custom_20 import (
+                    is_available as is_nnunet20_available,
+                    run_nnunet_custom_20,
+                )
+                from app.ai.nnunet_custom_20.labels import get_label_defs
+
+                if not is_nnunet20_available():
+                    continue
+                label_volume = run_nnunet_custom_20(
+                    volume=volume,
+                    spacing=spacing,
+                    merge_to_6=False,
+                )
+                label_map = _label_defs_to_label_map(get_label_defs())
+
+            elif model_name == "nnunet_lung_lobe":
+                from app.ai.nnunet_lung_lobe import (
+                    is_available as is_lung_lobe_available,
+                    remap_lung_lobe_labels_to_upper_body,
+                    run_nnunet_lung_lobe,
+                )
+                from app.ai.nnunet_lung_lobe.labels import get_label_defs
+
+                if not is_lung_lobe_available():
+                    continue
+                raw_label_volume = run_nnunet_lung_lobe(
+                    volume=volume,
+                    spacing=spacing,
+                )
+                label_volume = remap_lung_lobe_labels_to_upper_body(raw_label_volume)
+                label_map = _label_defs_to_label_map(get_label_defs())
+
+            else:
+                from app.ai.nnunet_custom import (
+                    is_available as is_nnunet_available,
+                    run_nnunet_custom,
+                )
+                from app.ai.nnunet_custom.labels import get_label_defs
+
+                if not is_nnunet_available():
+                    continue
+                label_volume = run_nnunet_custom(
+                    volume=volume,
+                    spacing=spacing,
+                )
+                label_map = _label_defs_to_label_map(get_label_defs())
+
+            label_volume = np.asarray(label_volume, dtype=np.uint8)
+            if label_volume.shape != volume.shape:
+                logger.warning(
+                    "nnUNet label shape %s does not match CT shape %s for model %s",
+                    label_volume.shape,
+                    volume.shape,
+                    model_name,
+                )
+                continue
+
+            label_counts, slice_presence = _summarize_label_volume(label_volume, label_map)
+            if not label_counts:
+                logger.warning("nnUNet model %s returned no foreground labels", model_name)
+                continue
+
+            return label_volume, label_map, label_counts, slice_presence, model_name, None
+
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+            logger.warning("DICOM workspace nnUNet fallback failed for %s: %s", model_name, last_error, exc_info=True)
+
+    return None, {}, {}, {}, None, last_error
+
+
 def _build_workspace_volume_payload(
     volume: np.ndarray,
     metadata: Dict[str, Any],
     *,
     label_volume: Optional[np.ndarray] = None,
+    include_labels: bool = True,
 ) -> Dict[str, Any]:
+    response_metadata = dict(metadata)
+    response_metadata["labels_enabled"] = bool(include_labels)
+    if not include_labels:
+        response_metadata["label_map"] = {}
+        response_metadata["label_nonzero_counts"] = {}
+        response_metadata["slice_label_presence"] = {}
+        response_metadata["label_source"] = None
+        response_metadata["label_model_name"] = None
+        response_metadata["segmentation_series_id"] = None
+
     response_content: Dict[str, Any] = {
         "volume_base64": base64.b64encode(
             np.asarray(volume, dtype="<f4").tobytes()
         ).decode("ascii"),
         "label_base64": None,
-        "metadata": metadata,
+        "metadata": response_metadata,
     }
-    if label_volume is not None:
+    if include_labels and label_volume is not None:
         response_content["label_base64"] = base64.b64encode(
             np.asarray(label_volume, dtype=np.uint8).tobytes()
         ).decode("ascii")
@@ -2174,6 +2554,7 @@ async def generate_ct_phantom(
     case_id: str = Query("LUNG1-001", description="Atlas case ID (only used when source='atlas')"),
     study_id: Optional[str] = Query(None, description="Study ID (used when source='dicom')"),
     series_id: Optional[str] = Query(None, description="Series ID (used when source='dicom')"),
+    include_labels: bool = Query(True, description="Whether to include organ label volumes and metadata"),
     scan_direction: str = Query(
         "head_to_feet",
         description="Z-axis scan direction: 'head_to_feet' (z=0=head/chest) or 'feet_to_head'",
@@ -2272,6 +2653,38 @@ async def generate_ct_phantom(
                 size,
                 order=1,
             )
+            label_volume = None
+            label_counts: Dict[int, int] = {}
+            slice_label_presence: Dict[str, list] = {}
+            seg_series_id = None
+            label_source = None
+            label_model_name = None
+            label_error = None
+            label_map: Dict[int, str] = {}
+            if include_labels:
+                (
+                    label_volume,
+                    label_map,
+                    label_counts,
+                    slice_label_presence,
+                    label_model_name,
+                    label_error,
+                ) = _load_nnunet_workspace_label_volume(volume, resized_spacing)
+                if label_volume is not None:
+                    label_source = "nnunet"
+                else:
+                    label_volume, label_counts, slice_label_presence, seg_series_id = _load_dicom_seg_label_volume(
+                        db=db,
+                        storage=storage,
+                        study_id=series.study_id,
+                        ct_series_id=series.id,
+                        ct_instances=instances,
+                        need_flip=bool(dicom_metadata.get("flipped_z", False)),
+                        zoom_factor=float(scale),
+                        output_shape=(int(volume.shape[0]), int(volume.shape[1]), int(volume.shape[2])),
+                    )
+                    label_source = "dicom_seg" if label_volume is not None else None
+                    label_map = {int(k): v for k, v in LUNG_SAMPLE_LABEL_MAP.items()} if label_volume is not None else {}
 
             metadata = {
                 "width": int(volume.shape[2]),
@@ -2294,6 +2707,13 @@ async def generate_ct_phantom(
                 "resample_scale": float(scale),
                 "scan_direction": scan_direction,
                 "flipped_z": bool(dicom_metadata.get("flipped_z", False)),
+                "segmentation_series_id": seg_series_id,
+                "label_source": label_source,
+                "label_model_name": label_model_name,
+                "label_error": label_error,
+                "label_map": {int(k): v for k, v in label_map.items()},
+                "label_nonzero_counts": label_counts,
+                "slice_label_presence": slice_label_presence,
                 "window_presets": {
                     name: {"windowLevel": float(p["window_level"]), "windowWidth": float(p["window_width"])}
                     for name, p in WINDOW_PRESETS.items()
@@ -2305,13 +2725,21 @@ async def generate_ct_phantom(
                     f"for interactive browsing."
                 ),
             }
-            return JSONResponse(content=_build_workspace_volume_payload(volume, metadata))
+            return JSONResponse(
+                content=_build_workspace_volume_payload(
+                    volume,
+                    metadata,
+                    label_volume=label_volume,
+                    include_labels=include_labels,
+                )
+            )
 
         response_content = _get_cached_phantom_payload(
             source=source,
             size=size,
             case_id=case_id,
             scan_direction=scan_direction,
+            include_labels=include_labels,
         )
         return JSONResponse(content=response_content)
 

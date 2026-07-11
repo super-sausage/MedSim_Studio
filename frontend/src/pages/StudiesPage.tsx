@@ -8,9 +8,9 @@ import type { DicomStudy } from '@/types/index';
  * StudiesPage
  *
  * DICOM study management page. Provides:
- * - Study list with search
+ * - Study list with explicit actions
  * - DICOM file upload
- * - Navigation to the viewer
+ * - Direct handoff into viewer or simulation
  */
 export default function StudiesPage() {
   const navigate = useNavigate();
@@ -22,7 +22,6 @@ export default function StudiesPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dirInputRef = useRef<HTMLInputElement>(null);
 
-  // Load studies on mount
   const loadStudies = useCallback(async () => {
     setIsLoading(true);
     try {
@@ -39,7 +38,6 @@ export default function StudiesPage() {
     loadStudies();
   }, [loadStudies]);
 
-  // Handle file upload
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     setIsUploading(true);
@@ -47,26 +45,23 @@ export default function StudiesPage() {
     try {
       const fileArray = Array.from(files);
       const result = await dicomService.uploadDicom(fileArray);
-
-      // Refresh studies list
       await loadStudies();
-
-      // Navigate to viewer for the uploaded study
-      navigate(`/viewer/${result.studyId}`);
+      navigate(dicomService.buildSimulationPath(result.studyId, null, true));
     } catch (error: any) {
       const message = error?.message || 'Upload failed';
       setUploadError(message);
       console.error('Upload failed:', error);
     } finally {
       setIsUploading(false);
-      // Reset file input
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
+      if (dirInputRef.current) {
+        dirInputRef.current.value = '';
+      }
     }
-  }, [navigate, loadStudies]);
+  }, [loadStudies, navigate]);
 
-  // Handle study deletion
   const handleDeleteStudy = useCallback(async (studyId: string) => {
     if (!window.confirm('Delete this study and all its files?')) return;
     setDeletingId(studyId);
@@ -82,7 +77,6 @@ export default function StudiesPage() {
 
   return (
     <div className="flex h-full flex-col p-6">
-      {/* Header */}
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Studies</h1>
@@ -101,7 +95,7 @@ export default function StudiesPage() {
             ref={dirInputRef}
             type="file"
             className="hidden"
-            // @ts-expect-error -- webkitdirectory is not in the DOM lib but is supported by target browsers.
+            // @ts-expect-error webkitdirectory is supported by target browsers.
             webkitdirectory=""
             onChange={(e) => handleFileUpload(e.target.files)}
           />
@@ -122,14 +116,12 @@ export default function StudiesPage() {
         </div>
       </div>
 
-      {/* Upload error */}
       {uploadError && (
         <div className="mb-4 rounded border border-red-400/30 bg-red-500/10 px-4 py-2 text-sm text-red-400">
           {uploadError}
         </div>
       )}
 
-      {/* Study list */}
       <div className="flex-1">
         {isLoading ? (
           <div className="flex h-full items-center justify-center">
@@ -141,7 +133,7 @@ export default function StudiesPage() {
         ) : studies.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center text-center">
             <svg className="mb-4 h-16 w-16 text-muted-foreground" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1}>
-              <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
             </svg>
             <h3 className="mb-2 text-lg font-medium">No studies loaded</h3>
             <p className="mb-4 max-w-md text-sm text-muted-foreground">
@@ -153,13 +145,13 @@ export default function StudiesPage() {
             {studies.map((study) => (
               <div
                 key={study.id}
-                className="group relative rounded-lg border border-border bg-card transition-colors hover:border-primary/50 hover:bg-accent"
+                className="rounded-lg border border-border bg-card transition-colors hover:border-primary/50 hover:bg-accent"
               >
                 <button
                   onClick={() => navigate(`/viewer/${study.id}`)}
-                  className="w-full p-4 text-left"
+                  className="w-full p-4 pb-3 text-left"
                 >
-                  <div className="mb-2 flex items-start justify-between">
+                  <div className="mb-2 flex items-start justify-between gap-3">
                     <span className="font-medium text-foreground">
                       {study.patientName}
                     </span>
@@ -172,25 +164,39 @@ export default function StudiesPage() {
                     {study.studyDescription && (
                       <p className="truncate">{study.studyDescription}</p>
                     )}
-                    <p>
-                      {study.seriesCount} series &middot; {study.instanceCount} instances
-                    </p>
+                    <p>{study.seriesCount} series, {study.instanceCount} instances</p>
                     {study.studyDate && (
                       <p>{study.studyDate}</p>
                     )}
                   </div>
                 </button>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleDeleteStudy(study.id);
-                  }}
-                  disabled={deletingId === study.id}
-                  className="absolute right-2 top-2 rounded px-1.5 py-0.5 text-xs text-red-400 opacity-0 transition-opacity hover:bg-red-500/10 group-hover:opacity-100 disabled:opacity-50"
-                  title="Delete study"
-                >
-                  {deletingId === study.id ? '...' : '×'}
-                </button>
+
+                <div className="flex items-center gap-2 border-t border-border/70 px-4 py-3">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1"
+                    onClick={() => navigate(`/viewer/${study.id}`)}
+                  >
+                    Open Viewer
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1"
+                    onClick={() => navigate(dicomService.buildSimulationPath(study.id))}
+                  >
+                    Open Simulation
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={() => handleDeleteStudy(study.id)}
+                    disabled={deletingId === study.id}
+                  >
+                    {deletingId === study.id ? 'Removing...' : 'Remove'}
+                  </Button>
+                </div>
               </div>
             ))}
           </div>

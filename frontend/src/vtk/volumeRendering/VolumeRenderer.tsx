@@ -377,7 +377,7 @@ function resetCameraToVolume(
   const fitHeight = radius / Math.tan(viewAngleRad / 2);
   const fitWidth = (radius * aspect) / Math.tan(viewAngleRad / 2);
   const distance = Math.max(fitHeight, fitWidth) * 1.15;
-  camera.setPosition(center[0], center[1] - distance, center[2]);
+  camera.setPosition(center[0], center[1] + distance, center[2]);
   camera.setViewUp(0, 0, scanView ? -1 : 1);
   renderer.resetCameraClippingRange(bounds);
 }

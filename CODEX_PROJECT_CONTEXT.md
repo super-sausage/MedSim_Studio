@@ -1,6 +1,396 @@
 # MedSim Studio Codex Project Context
 
+## Update 2026-07-11 - DICOM multi-organ label debugging follow-up and 3D front-view default
+
+This follow-up pass happened after the user reported that the simulation page
+still only showed lungs, and separately asked that the default 3D body view
+should face the user instead of showing the patient from the back.
+
+### 1. Real root cause for "only lungs visible" on DICOM
+
+The key issue is not simply the frontend legend or 3D renderer.
+
+What was confirmed:
+
+- the current DICOM workspace data can legitimately be chest-focused CT
+- same-study DICOM SEG content in these cases may only contain:
+  - left lung
+  - right lung
+  - spinal cord
+  - neoplasm
+- therefore, if the backend prefers same-study SEG before running a broader
+  multi-organ model, the page will continue to show mostly lungs even if local
+  nnUNet weights exist
+
+Important implication:
+
+- if the CT scan itself does not include abdominal organs in the actual field
+  of view, no model can invent full liver / spleen / kidneys / pancreas labels
+  outside the scanned anatomy
+
+### 2. Backend DICOM label loading was changed to prefer nnUNet before SEG
+
+To better match the user's expectation that uploaded model weights should be
+used for DICOM workspace labeling, the DICOM workspace label path in
+`backend/app/api/v1/simulation.py` was updated so that:
+
+1. load the DICOM CT volume
+2. if labels are enabled, try local nnUNet first
+3. if nnUNet returns no valid label volume, fall back to same-study DICOM SEG
+4. if neither path succeeds, still return the CT volume and keep label metadata
+   empty / diagnostic
+
+Current nnUNet priority order for DICOM workspace labels:
+
+1. `nnunet702_20organs`
+2. `nnunet_lung_lobe`
+3. `nnunet_handoff`
+
+This is different from the earlier pass that preferred DICOM SEG before nnUNet.
+
+### 3. Workspace load now supports explicit "include labels" control
+
+The user also wanted the simulation page to choose whether organ labels should
+be loaded at all.
+
+Changes made:
+
+- `backend/app/api/v1/simulation.py`
+  - `/api/v1/simulation/phantom` now accepts `include_labels`
+  - when `include_labels=false`, the response suppresses:
+    - `label_base64`
+    - `label_map`
+    - `label_nonzero_counts`
+    - `slice_label_presence`
+    - `label_source`
+    - `label_model_name`
+    - `segmentation_series_id`
+  - response metadata now includes:
+    - `labels_enabled`
+- `frontend/src/services/simulationService.ts`
+  - `getPhantom(...)` now forwards `include_labels`
+- `frontend/src/pages/SimulationPage.tsx`
+  - the CT workspace toolbar now includes:
+    - `Include organ labels`
+
+### 4. Frontend no longer drops non-lung labels due to hardcoded color filtering
+
+Another real issue found in the frontend was that organ labels were still being
+filtered through a hardcoded color map, so any backend label without an
+explicit predefined color could be silently dropped from:
+
+- 2D axial overlay
+- 3D segmentation overlay
+- bottom legend
+
+Fix:
+
+- `frontend/src/pages/SimulationPage.tsx`
+  - label filtering no longer requires `ORGAN_COLORS[index]`
+  - visible label ordering still keeps priority labels first, but now appends
+    all other recognized labels
+  - dynamic fallback colors are generated for unknown label IDs
+  - 2D slice rendering now uses backend-derived / computed label colors instead
+    of assuming only the older hardcoded label set
+
+### 5. Important runtime finding about model availability checks
+
+An explicit local Python check from the host environment raised:
+
+- `FileNotFoundError: /app/models/nnunet702_handoff`
+
+This does **not** prove the Docker backend is broken.
+
+What it means:
+
+- the model wrappers resolve paths like `/app/models/...`
+- those paths only exist inside the backend container
+- host-side direct Python imports are therefore not a reliable proof that the
+  containerized runtime cannot see the weights
+
+What was also confirmed locally:
+
+- the project directory does contain these model folders:
+  - `models/nnunet702_handoff`
+  - `models/nnunet_lung_lobe`
+  - `models/nnunet701_full_handoff`
+- `docker-compose.yml` mounts them into the backend container at:
+  - `/app/models/nnunet702_handoff`
+  - `/app/models/nnunet_lung_lobe`
+  - `/app/models/nnunet_handoff`
+
+So the remaining practical question is container runtime validation, not merely
+filesystem presence in the repository.
+
+### 6. Default 3D body view now starts from the front
+
+The user reported that the initial 3D body orientation showed the patient from
+the back and asked to change it so the patient faces the viewer by default.
+
+Change made:
+
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+  - `resetCameraToVolume(...)` now places the default camera on the opposite
+    Y side of the volume
+  - this changes the initial body view from posterior-facing to anterior-facing
+    without altering the slice-sync clipping direction logic
+
+### 7. Validation performed in this pass
+
+Static checks run:
+
+- `python -m py_compile backend/app/api/v1/simulation.py`
+- `npx tsc --noEmit` in `frontend`
+
+Additional manual inspection / confirmation:
+
+- local model folders exist under `models/`
+- compose mounts for nnUNet model directories are present in `docker-compose.yml`
+
+### 8. Current state for the next conversation
+
+- The frontend now has an explicit `Include organ labels` toggle for CT
+  workspace loading.
+- The frontend should no longer hide non-lung labels merely because they were
+  absent from the old hardcoded color table.
+- The DICOM backend label path now prefers multi-organ nnUNet before same-study
+  DICOM SEG.
+- If the user still only sees lungs after rebuilding / restarting the backend,
+  the next check should be:
+  1. whether the backend container is actually running the new code
+  2. whether `metadata.label_source` is `nnunet` or `dicom_seg`
+  3. whether the CT series itself is chest-limited and does not include other
+     organs in the scanned range
+- The default 3D body orientation should now start with the patient facing the
+  viewer.
+
+## Update 2026-07-11 - DICOM workspace labels, nnUNet fallback, and source UI simplification
+
+This pass addressed the user's follow-up that the simulation workspace should
+not require manually switching the lower-left source selector to `atlas` just to
+see organ labels. The intended behavior is:
+
+- keep atlas loading available
+- remove the visible workspace `Source` selector from the compact toolbar
+- let DICOM folder loading produce organ labels when possible
+- show every organ recognized by the local segmentation model, not only lungs
+
+### Frontend Workspace Source UI
+
+- `frontend/src/pages/SimulationPage.tsx`
+  - removed the visible compact-toolbar `Source: atlas / procedural / dicom`
+    selector
+  - kept atlas behavior internally as a fallback when no DICOM CT series is
+    selected
+  - always shows DICOM `Study` and `Series` controls in the compact toolbar
+  - selecting a DICOM study or series marks the workspace source as `dicom`
+  - `Load CT` now chooses DICOM when a CT series is selected, otherwise falls
+    back to atlas
+  - atlas functionality remains available through the internal
+    `selectedAtlasCaseId` fallback path
+
+### DICOM SEG Support
+
+- `backend/app/api/v1/simulation.py`
+  - DICOM workspace loading now searches same-study series for DICOM SEG data
+  - SEG frames are converted into the workspace `uint8` label volume when their
+    segment labels match the current LUNG1-compatible mapping
+  - SEG labels are aligned to CT slices through `ImagePositionPatient`
+  - label z-order is flipped and nearest-neighbor-resampled with the CT volume
+  - response metadata now includes:
+    - `segmentation_series_id`
+    - `label_source`
+    - `label_model_name`
+    - `label_error`
+    - `label_map`
+    - `label_nonzero_counts`
+    - `slice_label_presence`
+
+### nnUNet Fallback For Uploaded DICOM Folders
+
+The user noted that local nnUNet weights had already been uploaded and should be
+used to segment imported DICOM folders. The DICOM workspace load path now works
+in this order:
+
+1. load the DICOM CT volume
+2. use same-study DICOM SEG if present
+3. if no SEG label volume is available, run local nnUNet automatically
+4. if nnUNet fails, still return the CT volume and record the error in metadata
+
+The fallback model priority is currently:
+
+1. `nnunet702_20organs`
+2. `nnunet_lung_lobe`
+3. `nnunet_handoff`
+
+Runtime validation inside Docker showed all three model wrappers available:
+
+- `nnunet20 = True`
+- `lung_lobe = True`
+- `nnunet6 = True`
+- CUDA is visible, but current `AI_DEVICE` resolved to `cpu` in the container
+
+Validation with the current local DICOM test study, which contains CT only and
+no SEG series, returned:
+
+- `label_source = nnunet`
+- `label_model_name = nnunet702_20organs`
+- `label_base64 = true`
+- non-zero labels included `3`, `10`, `12`, `13`, `16`, `17`, and `18`
+
+### Show All Recognized Organs
+
+The backend was returning multiple organ labels, but the frontend 3D overlay
+only passed labels listed in `ORGAN_LABEL_PRIORITY`; labels outside that
+priority list could be dropped from the renderer even though the legend handled
+them.
+
+- `frontend/src/pages/SimulationPage.tsx`
+  - 3D organ overlay label selection now mirrors the legend logic
+  - it reads every label in backend `labelMap`
+  - it filters out only labels with known zero voxel counts
+  - it orders priority labels first, then appends all other recognized labels
+  - `VolumeRenderer` already creates isolated surface actors per label, so no
+    renderer change was required for the "all organs" behavior
+
+### Validation Run
+
+Commands / checks run during this pass:
+
+- `python -m py_compile backend/app/api/v1/simulation.py`
+- `npx tsc --noEmit` in `frontend`
+- `docker compose up -d --build backend`
+- `docker compose up -d --build frontend`
+- direct API validation:
+  - `GET /api/v1/simulation/phantom?source=dicom&size=64&study_id=...&series_id=...&scan_direction=head_to_feet`
+  - returned `label_source = nnunet`
+  - returned `label_model_name = nnunet702_20organs`
+  - returned `label_base64 = true`
+
+### Current Operational Notes
+
+- Frontend is available at `http://localhost:5173`
+- Backend is available at `http://localhost:8000`
+- The first DICOM load can take noticeably longer because nnUNet inference is
+  now part of the load path when no DICOM SEG is present
+- If the user wants faster interactive loading, the next improvement should be
+  caching nnUNet workspace labels by study/series/size/scan direction or moving
+  fallback segmentation into a background job with progressive UI state
+
+## Update 2026-07-11 — fully isolated 3D organ segmentation layers
+
+The 3D segmentation renderer was revised so segmentation can no longer alter
+the appearance of the original CT volume or any voxel outside an organ mask.
+
+### Implementation
+
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+  - keeps the CT `vtkVolume`, mapper, transfer functions, opacity function, and
+    material as the unchanged base rendering layer
+  - restores the pre-segmentation CT soft-tissue and lung transfer-function
+    presets, volume material values, sample distance, opacity unit distance,
+    default renderer lighting, full-volume camera framing, and anterior camera
+    position
+  - creates one binary `vtkImageData` mask per non-zero segmentation label;
+    label `0` and every voxel belonging to another label stay absent from that
+    organ's pipeline
+  - runs `vtkImageMarchingCubes` at iso-value `0.5` for every organ separately
+  - applies a conservative `vtkWindowedSincPolyDataFilter` pass (8 iterations,
+    pass band `0.2`, feature-edge smoothing off, boundary smoothing off), then
+    recomputes point normals with `vtkPolyDataNormals`
+  - assigns each organ its backend label color and a soft semi-transparent Phong
+    material; no bounding-box actor, slice-plane actor, or regional color volume
+    is created
+  - stores each organ pipeline/actor in a map keyed by label ID, so visibility,
+    selection highlight, color, and opacity updates change only that actor
+  - adds per-organ visibility checkboxes and click-to-highlight controls; these
+    operations do not rebuild or mutate the CT actor or other organ actors
+  - applies clipping only as mapper geometry clipping to the CT and organ actors;
+    it does not color the clipping plane or the clipped region
+- `frontend/src/pages/SimulationPage.tsx`
+  - restores the original default `Soft` window selection
+  - continues passing the integer segmentation label map unchanged; the renderer
+    is responsible for isolating each label into its own surface layer
+- `frontend/src/types/vtk-filters.d.ts`
+  - declares the vtk.js Marching Cubes, windowed-sinc smoothing, and normals
+    filter modules used by the surface pipeline
+
+### Verification
+
+- `npx tsc --noEmit` passes in `frontend`
+- `npm run build` passes; Vite resolves and bundles all three vtk.js surface
+  filters successfully
+- `npm test -- --runInBand` starts Vitest successfully, but this repository
+  currently contains no matching test files (`No test files found`)
+- reviewed the segmentation update path to confirm it never calls the CT
+  actor's `setRGBTransferFunction`, `setScalarOpacity`, or material setters
+- reviewed mask construction to confirm only exact label matches become `1`;
+  background, bounding boxes, slice planes, and unrelated anatomy remain `0`
+
 ## Update 2026-07-11
+
+This section also captures the later 2026-07-11 follow-up pass focused on improving the right-side 3D lung segmentation presentation.
+
+### Additional 3D lung rendering follow-up on 2026-07-11
+
+#### 1. Right-side lung segmentation was changed from voxel volume overlay to extracted surface mesh
+
+- the previous overlay rendered the segmentation label volume directly as translucent voxels
+- this caused obvious staircase edges, blocky surfaces, and noisy front/back overlap
+- the frontend renderer now:
+  - isolates lung-related segmentation labels only
+  - unions them into a binary lung mask
+  - runs `vtkImageMarchingCubes` at iso-value `0.5`
+  - applies light `vtkWindowedSincPolyDataFilter` smoothing
+  - recomputes normals with `vtkPolyDataNormals`
+- the practical result is a cleaner lung surface that keeps anatomical shape without the previous voxel-mask jaggedness
+
+Relevant file:
+
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+#### 2. Lung material, lighting, and depth cues were redesigned
+
+- the new lung surface uses a pale light-blue semi-transparent material
+- default lung opacity is now about `0.54`
+- the renderer now adds a small three-light setup:
+  - key light
+  - cool fill light
+  - subtle rim light
+- the lung mesh now uses diffuse shading plus a restrained specular highlight to improve curvature and depth separation without looking plastic
+
+Relevant file:
+
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+#### 3. CT body rendering was pushed into the background
+
+- `ct-soft-tissue` and `ct-lung` 3D transfer functions were reduced in brightness and opacity
+- volume material parameters were softened so outer body surfaces, spine, and skin do not dominate the frame
+- sample distance and opacity unit distance were also tuned so the CT reads more as contextual anatomy and less as an opaque blocker in front of the lungs
+
+Relevant file:
+
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+#### 4. Camera framing now focuses on the lungs
+
+- when lung segmentation exists, the 3D camera now frames lung bounds instead of the full CT bounds
+- the camera uses a mild oblique anterior view and extra margin so both lungs remain centered and fully visible
+- this reduces unrelated surrounding anatomy and improves front/back depth readability
+
+Relevant file:
+
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+#### 5. Default viewing preset now starts in lung windowing
+
+- the simulation page default window preset was changed from `Soft` to `Lung`
+- this better matches the lung-focused 3D rendering on initial load
+
+Relevant file:
+
+- `frontend/src/pages/SimulationPage.tsx`
 
 This section captures the latest follow-up work from 2026-07-11, after the user reported two regressions:
 

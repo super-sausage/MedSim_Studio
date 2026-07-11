@@ -38,4 +38,14 @@ export const dicomService = {
   /** Delete a study */
   deleteStudy: (studyId: string) =>
     api.delete<{ message: string }>(`/dicom/studies/${studyId}`),
+
+  /** Build a simulation route for a DICOM study/series */
+  buildSimulationPath: (studyId?: string | null, seriesId?: string | null, autoload = false) => {
+    const params = new URLSearchParams();
+    params.set('source', 'dicom');
+    if (studyId) params.set('studyId', studyId);
+    if (seriesId) params.set('seriesId', seriesId);
+    if (autoload) params.set('autoload', '1');
+    return `/simulation?${params.toString()}`;
+  },
 };

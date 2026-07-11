@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { Button } from '@components/ui/button';
 import { useSimulationStore } from '@store/useSimulationStore';
 import { simulationService } from '@/services/simulationService';
@@ -71,11 +72,69 @@ const LESION_LABEL_BASE = 100;
 
 const ORGAN_LABEL_PRIORITY = [100, 13, 14, 21, 9, 7, 8, 10, 11, 12, 17, 15, 19, 20, 18, 6, 5, 3, 4, 16, 1, 2];
 
+const ORGAN_NAME_COLORS: Record<string, [number, number, number]> = {
+  liver: ORGAN_COLORS[9],
+  kidney: ORGAN_COLORS[7],
+  lung: ORGAN_COLORS[13],
+  spleen: ORGAN_COLORS[17],
+  pancreas: ORGAN_COLORS[15],
+  bladder: ORGAN_COLORS[20],
+};
+
 function formatOrganLabelName(name: string): string {
   return name
     .split('_')
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ');
+}
+
+function normalizeOrganLabelKey(name: string): string {
+  return name.trim().toLowerCase().replace(/\s+/g, '_');
+}
+
+function getFallbackOrganColor(labelIndex: number): [number, number, number] {
+  const hue = (labelIndex * 47) % 360;
+  const saturation = 60;
+  const lightness = 70;
+  const c = (1 - Math.abs((2 * lightness) / 100 - 1)) * (saturation / 100);
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = lightness / 100 - c / 2;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+
+  if (hue < 60) {
+    r = c; g = x; b = 0;
+  } else if (hue < 120) {
+    r = x; g = c; b = 0;
+  } else if (hue < 180) {
+    r = 0; g = c; b = x;
+  } else if (hue < 240) {
+    r = 0; g = x; b = c;
+  } else if (hue < 300) {
+    r = x; g = 0; b = c;
+  } else {
+    r = c; g = 0; b = x;
+  }
+
+  return [
+    Math.round((r + m) * 255),
+    Math.round((g + m) * 255),
+    Math.round((b + m) * 255),
+  ];
+}
+
+function getOrganColor(index: number, rawName?: string): [number, number, number] {
+  const normalizedName = rawName ? normalizeOrganLabelKey(rawName) : '';
+  if (normalizedName && ORGAN_NAME_COLORS[normalizedName]) {
+    return ORGAN_NAME_COLORS[normalizedName];
+  }
+
+  if (ORGAN_COLORS[index]) {
+    return ORGAN_COLORS[index];
+  }
+
+  return getFallbackOrganColor(index);
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +370,7 @@ function renderVolumeSliceToCanvas({
   windowLevel,
   windowWidth,
   labelData,
+  labelColors,
   showLabelOverlay = false,
   pickedPosition,
 }: {
@@ -323,6 +383,7 @@ function renderVolumeSliceToCanvas({
   windowLevel: number;
   windowWidth: number;
   labelData?: Uint8Array | null;
+  labelColors?: Record<number, [number, number, number]>;
   showLabelOverlay?: boolean;
   pickedPosition?: { x: number; y: number; z: number } | null;
 }): void {
@@ -348,19 +409,12 @@ function renderVolumeSliceToCanvas({
     const pixelIdx = i * 4;
 
     if (labelSlice && labelSlice[i] > 0) {
-      const organColor = ORGAN_COLORS[labelSlice[i]];
-      if (organColor) {
-        const alpha = LABEL_OVERLAY_ALPHA;
-        imageData.data[pixelIdx] = gray * (1 - alpha) + organColor[0] * alpha;
-        imageData.data[pixelIdx + 1] = gray * (1 - alpha) + organColor[1] * alpha;
-        imageData.data[pixelIdx + 2] = gray * (1 - alpha) + organColor[2] * alpha;
-        imageData.data[pixelIdx + 3] = 255;
-      } else {
-        imageData.data[pixelIdx] = gray;
-        imageData.data[pixelIdx + 1] = gray;
-        imageData.data[pixelIdx + 2] = gray;
-        imageData.data[pixelIdx + 3] = 255;
-      }
+      const organColor = labelColors?.[labelSlice[i]] ?? getOrganColor(labelSlice[i]);
+      const alpha = LABEL_OVERLAY_ALPHA;
+      imageData.data[pixelIdx] = gray * (1 - alpha) + organColor[0] * alpha;
+      imageData.data[pixelIdx + 1] = gray * (1 - alpha) + organColor[1] * alpha;
+      imageData.data[pixelIdx + 2] = gray * (1 - alpha) + organColor[2] * alpha;
+      imageData.data[pixelIdx + 3] = 255;
     } else {
       imageData.data[pixelIdx] = gray;
       imageData.data[pixelIdx + 1] = gray;
@@ -498,6 +552,16 @@ const LESION_OVERLAY_COLORS: Array<[number, number, number]> = [
 export default function SimulationPage() {
   const { lesions, organs, addLesion, removeLesion, activeJobs, completedJobs, addJob } =
     useSimulationStore();
+  const [searchParams] = useSearchParams();
+  const initialDicomStudyId = searchParams.get('studyId');
+  const initialDicomSeriesId = searchParams.get('seriesId');
+  const initialDicomAutoload = searchParams.get('autoload') === '1';
+  const initialSource = searchParams.get('source');
+  const hasInitialDicomSelection =
+    initialSource === 'dicom' && Boolean(initialDicomStudyId || initialDicomSeriesId);
+  const initialSelectionAppliedRef = useRef(false);
+  const initialSeriesSelectionAppliedRef = useRef(false);
+  const initialAutoloadTriggeredRef = useRef(false);
 
   // ---- Tab state ----
   const [activeTab, setActiveTab] = useState<
@@ -548,6 +612,7 @@ export default function SimulationPage() {
   const [phantomError, setPhantomError] = useState<string | null>(null);
   const [ctWorkspaceSource, setCtWorkspaceSource] = useState<'atlas' | 'procedural' | 'dicom'>('atlas');
   const [phantomSize, setPhantomSize] = useState(192);
+  const [includeOrganLabels, setIncludeOrganLabels] = useState(true);
   const [loadedPhantomSize, setLoadedPhantomSize] = useState<number | null>(null);
   const [sliceIndex, setSliceIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -840,6 +905,16 @@ export default function SimulationPage() {
   const loadedWorkspaceStudyId = phantom?.metadata.studyId ?? null;
   const loadedWorkspaceSeriesId = phantom?.metadata.seriesId ?? null;
   const activeVolumeDatasetKey = ctParamsResult?.simulatedVolumeBase64 ?? phantom?.volumeBase64 ?? null;
+  const activeOrganColorMap = useMemo(() => {
+    const labelMap = phantom?.metadata?.labelMap;
+    if (!labelMap) return {};
+
+    return Object.fromEntries(
+      Object.entries(labelMap)
+        .map(([key, rawName]) => [Number(key), getOrganColor(Number(key), rawName)] as const)
+        .filter(([index]) => Number.isFinite(index) && index > 0),
+    ) as Record<number, [number, number, number]>;
+  }, [phantom?.metadata?.labelMap]);
 
   const organSegmentationOverlay = useMemo(() => {
     if (!showLabelOverlay || !phantom?.metadata?.labelMap || !activeSegmentationLabelData || !activeVolumeShape) {
@@ -848,20 +923,29 @@ export default function SimulationPage() {
 
     const availableLabels = Object.entries(phantom.metadata.labelMap)
       .map(([key, value]) => [Number(key), value] as const)
-      .filter(([index]) => index > 0 && !!ORGAN_COLORS[index]);
+      .filter(([index]) => index > 0)
+      .filter(([index]) => {
+        const count = phantom.metadata.labelNonzeroCounts?.[index];
+        return count === undefined || Number(count) > 0;
+      });
 
     if (availableLabels.length === 0) return null;
 
-    const orderedLabels = ORGAN_LABEL_PRIORITY
-      .filter((index) => availableLabels.some(([availableIndex]) => availableIndex === index))
-      .map((index) => {
-        const rawName = availableLabels.find(([availableIndex]) => availableIndex === index)?.[1] ?? `Label ${index}`;
-        return {
-          index,
-          name: formatOrganLabelName(rawName),
-          color: ORGAN_COLORS[index],
-        };
-      });
+    const orderedIndexes = [
+      ...ORGAN_LABEL_PRIORITY.filter((index) => availableLabels.some(([availableIndex]) => availableIndex === index)),
+      ...availableLabels
+        .map(([index]) => index)
+        .filter((index) => !ORGAN_LABEL_PRIORITY.includes(index)),
+    ];
+
+    const orderedLabels = orderedIndexes.map((index) => {
+      const rawName = availableLabels.find(([availableIndex]) => availableIndex === index)?.[1] ?? `label_${index}`;
+      return {
+        index,
+        name: formatOrganLabelName(rawName),
+        color: getOrganColor(index, rawName),
+      };
+    });
 
     return {
       // The renderer converts each integer label into its own surface actor;
@@ -869,7 +953,13 @@ export default function SimulationPage() {
       mask: Float32Array.from(activeSegmentationLabelData),
       labels: orderedLabels,
     };
-  }, [activeSegmentationLabelData, activeVolumeShape, phantom?.metadata?.labelMap, showLabelOverlay]);
+  }, [
+    activeSegmentationLabelData,
+    activeVolumeShape,
+    phantom?.metadata?.labelMap,
+    phantom?.metadata?.labelNonzeroCounts,
+    showLabelOverlay,
+  ]);
 
   const compositeSegmentationOverlay = useMemo(() => {
     const organMask = organSegmentationOverlay?.mask ?? null;
@@ -901,7 +991,7 @@ export default function SimulationPage() {
     const nonzeroCounts = phantom.metadata.labelNonzeroCounts ?? {};
     const available = Object.entries(labelMap)
       .map(([key, value]) => [Number(key), value] as const)
-      .filter(([index]) => index > 0 && !!ORGAN_COLORS[index])
+      .filter(([index]) => index > 0)
       .filter(([index]) => {
         const count = nonzeroCounts[index];
         return count === undefined || Number(count) > 0;
@@ -915,11 +1005,11 @@ export default function SimulationPage() {
     ];
 
     return orderedIndexes.map((index) => {
-      const rawName = available.find(([availableIndex]) => availableIndex === index)?.[1] ?? `Label ${index}`;
+      const rawName = available.find(([availableIndex]) => availableIndex === index)?.[1] ?? `label_${index}`;
       return {
         index,
         name: formatOrganLabelName(rawName),
-        color: ORGAN_COLORS[index],
+        color: getOrganColor(index, rawName),
       };
     });
   }, [phantom?.metadata?.labelMap, phantom?.metadata?.labelNonzeroCounts]);
@@ -981,11 +1071,13 @@ export default function SimulationPage() {
       windowLevel,
       windowWidth,
       labelData: activeLabelData,
+      labelColors: activeOrganColorMap,
       showLabelOverlay,
       pickedPosition: activePickedPosition,
     });
   }, [
     activePreset,
+    activeOrganColorMap,
     activeSliceData,
     activeLabelData,
     activePickedPosition,
@@ -1054,6 +1146,18 @@ export default function SimulationPage() {
     }
   }, []);
 
+  useEffect(() => {
+    if (!hasInitialDicomSelection || initialSelectionAppliedRef.current) {
+      return;
+    }
+    initialSelectionAppliedRef.current = true;
+    setActiveTab('phantom');
+    setSourceType('dicom');
+    setCtWorkspaceSource('dicom');
+    setSelectedStudyId(initialDicomStudyId);
+    setSelectedSeriesId(initialDicomSeriesId);
+  }, [hasInitialDicomSelection, initialDicomSeriesId, initialDicomStudyId]);
+
   // ---- Load available DICOM studies on mount ----
   useEffect(() => {
     let mounted = true;
@@ -1081,6 +1185,7 @@ export default function SimulationPage() {
     if (!selectedStudyId) {
       setSeriesList([]);
       setSelectedSeriesId(null);
+      initialSeriesSelectionAppliedRef.current = false;
       return;
     }
     let mounted = true;
@@ -1102,15 +1207,45 @@ export default function SimulationPage() {
     return () => { mounted = false; };
   }, [selectedStudyId]);
 
+  useEffect(() => {
+    if (!hasInitialDicomSelection || !selectedStudyId || initialSeriesSelectionAppliedRef.current) {
+      return;
+    }
+    if (selectedStudyId !== initialDicomStudyId) {
+      initialSeriesSelectionAppliedRef.current = true;
+      return;
+    }
+    if (seriesList.length === 0) {
+      return;
+    }
+
+    const preferredSeries =
+      seriesList.find((series) => !series.modality || series.modality.toUpperCase() === 'CT')
+      ?? seriesList[0]
+      ?? null;
+    const nextSeriesId = initialDicomSeriesId && seriesList.some((series) => series.id === initialDicomSeriesId)
+      ? initialDicomSeriesId
+      : preferredSeries?.id ?? null;
+
+    if (nextSeriesId) {
+      setSelectedSeriesId(nextSeriesId);
+    }
+    initialSeriesSelectionAppliedRef.current = true;
+  }, [
+    hasInitialDicomSelection,
+    initialDicomSeriesId,
+    initialDicomStudyId,
+    selectedStudyId,
+    seriesList,
+  ]);
+
   // -----------------------------------------------------------------------
   // Handlers: phantom
   // -----------------------------------------------------------------------
 
   const handleGeneratePhantom = async () => {
-    if (ctWorkspaceSource === 'dicom' && !selectedSeriesId) {
-      setPhantomError('Select a DICOM CT series before loading the CT workspace.');
-      return;
-    }
+    const effectiveSeriesId = selectedSeriesId ?? ctWorkspaceSeriesList[0]?.id ?? null;
+    const effectiveSource: 'atlas' | 'dicom' = effectiveSeriesId ? 'dicom' : 'atlas';
 
     setPickedPosition(null);
     setPickedWorldPositionMm(null);
@@ -1124,13 +1259,15 @@ export default function SimulationPage() {
     setPlaying(false);
     try {
       const size = phantomSize;
+      setCtWorkspaceSource(effectiveSource);
       const response = await simulationService.getPhantom(
-        ctWorkspaceSource,
+        effectiveSource,
         size,
         selectedAtlasCaseId,
         'head_to_feet',
-        ctWorkspaceSource === 'dicom' ? selectedStudyId : null,
-        ctWorkspaceSource === 'dicom' ? selectedSeriesId : null,
+        effectiveSource === 'dicom' ? selectedStudyId : null,
+        effectiveSource === 'dicom' ? effectiveSeriesId : null,
+        includeOrganLabels,
       );
       setPhantom(response);
       setLoadedPhantomSize(size);
@@ -1143,6 +1280,24 @@ export default function SimulationPage() {
       setPhantomLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!initialDicomAutoload || initialAutoloadTriggeredRef.current) {
+      return;
+    }
+    if (ctWorkspaceSource !== 'dicom' || !selectedStudyId || !selectedSeriesId || phantomLoading) {
+      return;
+    }
+
+    initialAutoloadTriggeredRef.current = true;
+    void handleGeneratePhantom();
+  }, [
+    ctWorkspaceSource,
+    initialDicomAutoload,
+    phantomLoading,
+    selectedSeriesId,
+    selectedStudyId,
+  ]);
 
   const handlePlayPause = () => {
     if (totalSlices <= 0) return;
@@ -2631,127 +2786,66 @@ export default function SimulationPage() {
             <div className="rounded-2xl border border-border/70 bg-card px-4 py-3 shadow-sm">
               <div className="flex flex-wrap items-center gap-4">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground">Source:</span>
-                  {(['atlas', 'procedural', 'dicom'] as const).map((source) => (
-                    <button
-                      key={source}
-                      type="button"
-                      onClick={() => {
-                        setCtWorkspaceSource(source);
-                        setCtParamsResult(null);
-                        setCtParamsError(null);
-                        setPhantomError(null);
-                      }}
-                      className={`rounded px-2 py-1 text-xs transition-colors ${
-                        ctWorkspaceSource === source
-                          ? 'bg-primary text-primary-foreground'
-                          : 'bg-muted text-muted-foreground hover:bg-muted-foreground/20'
-                      }`}
-                      disabled={phantomLoading}
-                    >
-                      {source}
-                    </button>
-                  ))}
+                  <span className="text-xs text-muted-foreground">Study:</span>
+                  <select
+                    value={selectedStudyId ?? ''}
+                    onChange={(e) => {
+                      setSelectedStudyId(e.target.value || null);
+                      setSelectedSeriesId(null);
+                      setCtWorkspaceSource('dicom');
+                      setCtParamsResult(null);
+                      setCtParamsError(null);
+                      setPhantomError(null);
+                    }}
+                    disabled={loadingStudies || phantomLoading}
+                    className="max-w-[220px] rounded border border-border bg-background px-2 py-1 text-xs"
+                  >
+                    <option value="">{loadingStudies ? 'Loading studies...' : 'Select DICOM study'}</option>
+                    {studies.map((study) => (
+                      <option key={study.id} value={study.id}>
+                        {study.patientName || study.patientId || study.studyInstanceUid || study.id}
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
-                {ctWorkspaceSource === 'atlas' && (
-                  <>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-muted-foreground">Atlas:</span>
-                      <select
-                        value={selectedAtlasCaseId}
-                        onChange={(e) => {
-                          setSelectedAtlasCaseId(e.target.value);
-                          setCtParamsResult(null);
-                          setPhantomError(null);
-                        }}
-                        disabled={loadingAtlasCases || phantomLoading || atlasCases.length === 0}
-                        className="max-w-[220px] rounded border border-border bg-background px-2 py-1 text-xs"
-                      >
-                        {atlasCases.length === 0 ? (
-                          <option value="LUNG1-001">
-                            {loadingAtlasCases ? 'Loading atlas cases...' : 'No atlas cases found'}
-                          </option>
-                        ) : (
-                          atlasCases.map((atlasCase) => (
-                            <option key={atlasCase.caseId} value={atlasCase.caseId}>
-                              {atlasCase.label}
-                            </option>
-                          ))
-                        )}
-                      </select>
-                    </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">Series:</span>
+                  <select
+                    value={selectedSeriesId ?? ''}
+                    onChange={(e) => {
+                      setSelectedSeriesId(e.target.value || null);
+                      setCtWorkspaceSource('dicom');
+                      setCtParamsResult(null);
+                      setCtParamsError(null);
+                      setPhantomError(null);
+                    }}
+                    disabled={!selectedStudyId || loadingSeries || phantomLoading}
+                    className="max-w-[260px] rounded border border-border bg-background px-2 py-1 text-xs"
+                  >
+                    <option value="">
+                      {!selectedStudyId
+                        ? 'Select study first'
+                        : loadingSeries
+                          ? 'Loading series...'
+                          : 'Select CT series'}
+                    </option>
+                    {ctWorkspaceSeriesList.map((series) => (
+                      <option key={series.id} value={series.id}>
+                        {series.seriesNumber ? `#${series.seriesNumber} ` : ''}{series.seriesDescription || series.modality || series.id}
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void refreshAtlasCases()}
-                      disabled={loadingAtlasCases || phantomLoading}
-                    >
-                      {loadingAtlasCases ? 'Refreshing...' : 'Refresh Atlas'}
-                    </Button>
-                  </>
-                )}
-
-                {ctWorkspaceSource === 'dicom' && (
-                  <>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-muted-foreground">Study:</span>
-                      <select
-                        value={selectedStudyId ?? ''}
-                        onChange={(e) => {
-                          setSelectedStudyId(e.target.value || null);
-                          setSelectedSeriesId(null);
-                          setCtParamsResult(null);
-                        }}
-                        disabled={loadingStudies || phantomLoading}
-                        className="max-w-[220px] rounded border border-border bg-background px-2 py-1 text-xs"
-                      >
-                        <option value="">{loadingStudies ? 'Loading studies...' : 'Select study'}</option>
-                        {studies.map((study) => (
-                          <option key={study.id} value={study.id}>
-                            {study.patientName || study.patientId || study.studyInstanceUid || study.id}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-muted-foreground">Series:</span>
-                      <select
-                        value={selectedSeriesId ?? ''}
-                        onChange={(e) => {
-                          setSelectedSeriesId(e.target.value || null);
-                          setCtParamsResult(null);
-                        }}
-                        disabled={!selectedStudyId || loadingSeries || phantomLoading}
-                        className="max-w-[260px] rounded border border-border bg-background px-2 py-1 text-xs"
-                      >
-                        <option value="">
-                          {!selectedStudyId
-                            ? 'Select study first'
-                            : loadingSeries
-                              ? 'Loading series...'
-                              : 'Select CT series'}
-                        </option>
-                        {ctWorkspaceSeriesList.map((series) => (
-                          <option key={series.id} value={series.id}>
-                            {series.seriesNumber ? `#${series.seriesNumber} ` : ''}{series.seriesDescription || series.modality || series.id}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void refreshDicomStudies()}
-                      disabled={loadingStudies || phantomLoading}
-                    >
-                      {loadingStudies ? 'Refreshing...' : 'Refresh DICOM'}
-                    </Button>
-                  </>
-                )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void refreshDicomStudies()}
+                  disabled={loadingStudies || phantomLoading}
+                >
+                  {loadingStudies ? 'Refreshing...' : 'Refresh DICOM'}
+                </Button>
 
                 {/* Size selector */}
                 <div className="flex items-center gap-2">
@@ -2776,6 +2870,17 @@ export default function SimulationPage() {
                   </span>
                 </div>
 
+                <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={includeOrganLabels}
+                    onChange={(e) => setIncludeOrganLabels(e.target.checked)}
+                    disabled={phantomLoading}
+                    className="accent-primary"
+                  />
+                  Include organ labels
+                </label>
+
               {/* Generate button */}
               <Button
                 variant="default"
@@ -2783,13 +2888,7 @@ export default function SimulationPage() {
                 onClick={handleGeneratePhantom}
                 disabled={phantomLoading}
               >
-                {phantomLoading
-                  ? 'Loading...'
-                  : ctWorkspaceSource === 'atlas'
-                    ? 'Load Atlas CT'
-                    : ctWorkspaceSource === 'procedural'
-                      ? 'Load Procedural CT'
-                      : 'Load DICOM CT'}
+                {phantomLoading ? 'Loading...' : 'Load CT'}
               </Button>
 
               {/* Play / Pause */}
