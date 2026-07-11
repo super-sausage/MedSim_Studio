@@ -466,6 +466,27 @@ def _downsample_volume_to_max_dim(
     return resized.astype(np.float32, copy=False), new_spacing, scale
 
 
+def _resample_label_volume_to_shape(
+    label_volume: np.ndarray,
+    output_shape: tuple[int, int, int],
+) -> np.ndarray:
+    """Nearest-neighbor resample a zyx label volume to an exact target shape."""
+    if tuple(int(dim) for dim in label_volume.shape) == tuple(int(dim) for dim in output_shape):
+        return np.asarray(label_volume, dtype=np.uint8, copy=False)
+
+    zoom_factors = tuple(
+        float(target_dim) / float(source_dim)
+        for source_dim, target_dim in zip(label_volume.shape, output_shape)
+    )
+    resized = zoom(
+        np.asarray(label_volume, dtype=np.float32),
+        zoom_factors,
+        order=0,
+        mode="nearest",
+    )
+    return np.asarray(np.rint(resized), dtype=np.uint8)
+
+
 def _read_dicom_dataset_from_storage(storage: Any, object_key: Optional[str]) -> Optional[Any]:
     if not object_key:
         return None
@@ -2647,8 +2668,10 @@ async def generate_ct_phantom(
             source_spacing = tuple(dicom_metadata.get("spacing", (1.0, 1.0, 1.0)))
             original_shape = [int(dim) for dim in volume.shape]
             original_spacing = [float(v) for v in source_spacing]
+            full_resolution_volume = volume
+            full_resolution_spacing = source_spacing
             volume, resized_spacing, scale = _downsample_volume_to_max_dim(
-                volume,
+                full_resolution_volume,
                 source_spacing,
                 size,
                 order=1,
@@ -2662,6 +2685,22 @@ async def generate_ct_phantom(
             label_error = None
             label_map: Dict[int, str] = {}
             if include_labels:
+                segmentation_input_max_dim = max(size, 320)
+                segmentation_input_volume = full_resolution_volume
+                segmentation_input_spacing = full_resolution_spacing
+                segmentation_input_scale = 1.0
+                if max(full_resolution_volume.shape) > segmentation_input_max_dim:
+                    (
+                        segmentation_input_volume,
+                        segmentation_input_spacing,
+                        segmentation_input_scale,
+                    ) = _downsample_volume_to_max_dim(
+                        full_resolution_volume,
+                        full_resolution_spacing,
+                        segmentation_input_max_dim,
+                        order=1,
+                    )
+
                 (
                     label_volume,
                     label_map,
@@ -2669,8 +2708,16 @@ async def generate_ct_phantom(
                     slice_label_presence,
                     label_model_name,
                     label_error,
-                ) = _load_nnunet_workspace_label_volume(volume, resized_spacing)
+                ) = _load_nnunet_workspace_label_volume(
+                    segmentation_input_volume,
+                    segmentation_input_spacing,
+                )
                 if label_volume is not None:
+                    label_volume = _resample_label_volume_to_shape(
+                        label_volume,
+                        (int(volume.shape[0]), int(volume.shape[1]), int(volume.shape[2])),
+                    )
+                    label_counts, slice_label_presence = _summarize_label_volume(label_volume, label_map)
                     label_source = "nnunet"
                 else:
                     label_volume, label_counts, slice_label_presence, seg_series_id = _load_dicom_seg_label_volume(
@@ -2705,6 +2752,13 @@ async def generate_ct_phantom(
                 "original_spacing": original_spacing,
                 "output_spacing": [float(v) for v in resized_spacing],
                 "resample_scale": float(scale),
+                "segmentation_input_shape": [
+                    int(segmentation_input_volume.shape[0]),
+                    int(segmentation_input_volume.shape[1]),
+                    int(segmentation_input_volume.shape[2]),
+                ] if include_labels else None,
+                "segmentation_input_spacing": [float(v) for v in segmentation_input_spacing] if include_labels else None,
+                "segmentation_input_scale": float(segmentation_input_scale) if include_labels else None,
                 "scan_direction": scan_direction,
                 "flipped_z": bool(dicom_metadata.get("flipped_z", False)),
                 "segmentation_series_id": seg_series_id,

@@ -91,7 +91,7 @@ interface SegmentationVolumeRef {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SEG_OPACITY = 0.11;
+const DEFAULT_SEG_OPACITY = 0.68;
 const SELECTED_OPACITY_BOOST = 0.10;
 const MIN_ORGAN_SURFACE_VOXELS = 8;
 const SURFACE_SMOOTHING_ITERATIONS = 8;
