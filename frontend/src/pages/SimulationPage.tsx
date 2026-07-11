@@ -1408,6 +1408,8 @@ export default function SimulationPage() {
       gantryYawDeg: 0,
       gantryRollDeg: 0,
     }));
+    setCtParamsError(null);
+    setCtParamsResult(null);
   }, []);
 
   const handleRunCtParamsSimulation = async (
