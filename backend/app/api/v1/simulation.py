@@ -2550,7 +2550,7 @@ async def preview_ct_scan_params(
 @router.get("/phantom")
 async def generate_ct_phantom(
     source: str = Query("procedural", description="Phantom source: 'procedural', 'atlas', or 'dicom'"),
-    size: int = Query(192, ge=64, le=320, description="Volume max edge size in voxels"),
+    size: int = Query(256, ge=64, le=320, description="Volume max edge size in voxels"),
     case_id: str = Query("LUNG1-001", description="Atlas case ID (only used when source='atlas')"),
     study_id: Optional[str] = Query(None, description="Study ID (used when source='dicom')"),
     series_id: Optional[str] = Query(None, description="Series ID (used when source='dicom')"),

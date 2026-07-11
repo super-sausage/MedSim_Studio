@@ -498,7 +498,7 @@ const DEFAULT_CT_PARAMS: CtParamsPreviewParams = {
   kVp: 120,
   pitch: 1.2,
   fovMm: 250,
-  matrixSize: 256,
+  matrixSize: 512,
   kernel: 'bone',
   contrastPhase: 'venous',
 };
@@ -611,7 +611,7 @@ export default function SimulationPage() {
   const [phantomLoading, setPhantomLoading] = useState(false);
   const [phantomError, setPhantomError] = useState<string | null>(null);
   const [ctWorkspaceSource, setCtWorkspaceSource] = useState<'atlas' | 'procedural' | 'dicom'>('atlas');
-  const [phantomSize, setPhantomSize] = useState(192);
+  const [phantomSize, setPhantomSize] = useState(256);
   const [includeOrganLabels, setIncludeOrganLabels] = useState(true);
   const [loadedPhantomSize, setLoadedPhantomSize] = useState<number | null>(null);
   const [sliceIndex, setSliceIndex] = useState(0);
@@ -2666,7 +2666,6 @@ export default function SimulationPage() {
                           className={`h-auto max-h-full w-full max-w-full rounded-lg border border-white/10 ${
                             pickingMode ? 'cursor-crosshair' : 'cursor-default'
                           }`}
-                          style={{ imageRendering: 'pixelated' }}
                         />
                       </div>
                     ) : null}
@@ -2860,10 +2859,10 @@ export default function SimulationPage() {
                     disabled={phantomLoading}
                     className="rounded border border-border bg-background px-2 py-1 text-xs"
                   >
-                    <option value={96}>96 Fast</option>
-                    <option value={160}>160 Balanced</option>
-                    <option value={192}>192 Detail</option>
-                    <option value={256}>256 Max</option>
+                    <option value={128}>128 Fast</option>
+                    <option value={192}>192 Balanced</option>
+                    <option value={256}>256 Detail</option>
+                    <option value={320}>320 Max</option>
                   </select>
                   <span className="text-[10px] text-muted-foreground/60">
                     larger = clearer, slower
