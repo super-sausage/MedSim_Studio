@@ -1,5 +1,93 @@
 # MedSim Studio Codex Project Context
 
+## Update 2026-07-11 - move 3D organ visibility checklist below the volume
+
+This pass addressed a layout issue reported by the user on the CT simulation
+page: the organ visibility checklist inside the `3D Volume` panel visually
+competed with and partially covered the 3D rendering area.
+
+### What changed
+
+- the organ visibility checklist was moved out of the internal
+  `VolumeRenderer` overlay area
+- the checklist is now rendered in the page layout immediately before
+  `CT Scan Params Simulation`
+- the compact label color legend was also kept in that lower page region
+  instead of remaining farther down the page
+
+### Implementation details
+
+- `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+  - added optional controlled props for:
+    - hidden segmentation labels
+    - selected segmentation label
+    - external toggle / selection handlers
+    - whether the built-in segmentation checklist should be shown
+  - the renderer can now either manage its own segmentation-control state or
+    defer to page-level state
+- `frontend/src/pages/SimulationPage.tsx`
+  - added page-level state for hidden / selected organ labels
+  - passed that state into `VolumeRenderer` so the external checklist controls
+    the same 3D organ actors
+  - added a new `3D Organ Visibility` section immediately above
+    `CT Scan Params Simulation`
+  - reset external organ selection / visibility state when the loaded label
+    dataset changes
+
+### Result
+
+- the 3D rendering card no longer contains the organ checkbox list
+- organ visibility controls remain functional and synchronized with the 3D
+  organ surfaces
+- the user can manage organ visibility below the main image workspace without
+  obscuring the 3D view
+
+### Validation
+
+- `npx tsc --noEmit` passed in `frontend`
+
+## Update 2026-07-11 - repository reset to origin/main after unsuccessful CT 2D recovery attempt
+
+This update records the final state after a later attempt to repair the left
+CT 2D workspace image loading did not produce an acceptable result for the
+user.
+
+### What happened in this pass
+
+- the left-side CT 2D loading issue was investigated again
+- several local frontend/backend adjustments were tried during the session
+- despite those attempts, the user reported that the left 2D CT image still
+  did not load correctly in the desired way
+- the user then chose to abandon that experimental local state and requested a
+  return to the remote `main`
+
+### Important final repository state
+
+- the local repository was reset back to `origin/main`
+- current branch: `main`
+- current commit after reset:
+  - `b325cea` `fix: improve CT workspace 2D image clarity`
+- working tree is clean after the reset
+
+### Important implication for the next conversation
+
+- any uncommitted local edits from the failed recovery attempt were discarded
+- those discarded edits are **not** part of the current codebase and should not
+  be assumed to exist
+- the effective current baseline for further work is exactly the remote
+  `origin/main` state at commit `b325cea`
+
+### Most recent retained commits after the reset
+
+1. `b325cea` `fix: improve CT workspace 2D image clarity`
+2. `e0d3411` `chore: checkpoint current project state`
+3. `1ee8c6b` `Restore organ label surface colors`
+4. `4b6e102` `Show synchronized torso slice guide`
+5. `1e9753c` `Add torso slice position guide`
+6. `72a557f` `Restore LUNG1 labels and refine CT preview`
+7. `17bb385` `Fix CT scan accumulation direction`
+8. `3d3a1ce` `Unify LUNG1 workspace flow and refine CT visualization`
+
 ## Update 2026-07-11 - DICOM multi-organ label debugging follow-up and 3D front-view default
 
 This follow-up pass happened after the user reported that the simulation page

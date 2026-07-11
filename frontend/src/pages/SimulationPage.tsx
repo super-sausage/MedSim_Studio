@@ -620,6 +620,8 @@ export default function SimulationPage() {
   const [sync3DToSlice, setSync3DToSlice] = useState(true);
   const [activePreset, setActivePreset] = useState<WindowPreset>(WINDOW_PRESETS[0]);
   const [showLabelOverlay, setShowLabelOverlay] = useState(true);
+  const [hiddenOrganLabelIndexes, setHiddenOrganLabelIndexes] = useState<Set<number>>(new Set());
+  const [selectedOrganLabelIndex, setSelectedOrganLabelIndex] = useState<number | null>(null);
   const [pickingMode, setPickingMode] = useState(false);
   const [pickedPosition, setPickedPosition] = useState<{ x: number; y: number; z: number } | null>(null);
   const [pickedWorldPositionMm, setPickedWorldPositionMm] = useState<[number, number, number] | null>(null);
@@ -1014,6 +1016,17 @@ export default function SimulationPage() {
     });
   }, [phantom?.metadata?.labelMap, phantom?.metadata?.labelNonzeroCounts]);
   const hasActiveOrganLabels = Boolean(activeSegmentationLabelData && visibleLabelLegendItems.length > 0);
+  const toggleOrganLabelVisibility = useCallback((labelIndex: number) => {
+    setHiddenOrganLabelIndexes((current) => {
+      const next = new Set(current);
+      if (next.has(labelIndex)) {
+        next.delete(labelIndex);
+      } else {
+        next.add(labelIndex);
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     if (!activeVolumeShape) return;
@@ -1028,6 +1041,11 @@ export default function SimulationPage() {
     setSliceIndex(scanStartIndex);
     setPlaying(false);
   }, [activeVolumeDatasetKey, scanStartIndex]);
+
+  useEffect(() => {
+    setHiddenOrganLabelIndexes(new Set());
+    setSelectedOrganLabelIndex(null);
+  }, [phantom?.metadata?.labelMap, ctParamsResult?.simulatedLabelBase64, showLabelOverlay]);
 
   useEffect(() => {
     if (!activeVolumeShape || !activeVolumeSpacing || !activeSliceData) {
@@ -2724,6 +2742,11 @@ export default function SimulationPage() {
                             syntheticScanAxis="z"
                             segmentationMask={compositeSegmentationOverlay?.mask ?? null}
                             segmentationLabels={compositeSegmentationOverlay?.labels ?? null}
+                            hiddenSegmentationLabels={hiddenOrganLabelIndexes}
+                            selectedSegmentationLabel={selectedOrganLabelIndex}
+                            onToggleSegmentationLabel={toggleOrganLabelVisibility}
+                            onSelectedSegmentationLabelChange={setSelectedOrganLabelIndex}
+                            showSegmentationLabelControls={false}
                             lesionMeshes={lesionOverlayMeshes.length > 0 ? lesionOverlayMeshes : null}
                           />
                           <SlicePositionIndicator
@@ -3059,6 +3082,82 @@ export default function SimulationPage() {
               )}
               </div>
             </div>
+
+            {hasActiveOrganLabels && showLabelOverlay && (
+              <div className="rounded-lg border border-border/60 bg-card px-4 py-3">
+                <div className="mb-2">
+                  <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-foreground/70">
+                    3D Organ Visibility
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    Control which organ surfaces are shown in the 3D volume.
+                  </div>
+                </div>
+                <div className="grid gap-1 sm:grid-cols-2 xl:grid-cols-3">
+                  {compositeSegmentationOverlay?.labels
+                    ?.filter((label) => label.index > 0)
+                    .map((label) => {
+                      const visible = !hiddenOrganLabelIndexes.has(label.index);
+                      const selected = selectedOrganLabelIndex === label.index;
+                      return (
+                        <div
+                          key={label.index}
+                          className={`flex items-center gap-2 rounded border px-2 py-1.5 text-xs ${
+                            selected ? 'border-primary/50 bg-primary/10' : 'border-border/60 bg-background/40'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={visible}
+                            onChange={() => toggleOrganLabelVisibility(label.index)}
+                            aria-label={`Toggle ${label.name}`}
+                            className="accent-primary"
+                          />
+                          <button
+                            type="button"
+                            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                            onClick={() => setSelectedOrganLabelIndex((current) => current === label.index ? null : label.index)}
+                          >
+                            <span
+                              className="h-2.5 w-2.5 shrink-0 rounded-full"
+                              style={{ backgroundColor: `rgb(${label.color.join(',')})` }}
+                            />
+                            <span className="truncate">{label.name}</span>
+                          </button>
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            )}
+
+            {hasActiveOrganLabels && showLabelOverlay && (
+              <div className="rounded-lg border border-border/60 bg-card px-4 py-3">
+                <div className="flex flex-wrap gap-x-3 gap-y-1">
+                  <span className="text-[10px] text-muted-foreground/60">
+                    Labels:
+                  </span>
+                  {visibleLabelLegendItems.map(({ index, name, color }) => {
+                    return (
+                      <span
+                        key={index}
+                        className="flex items-center gap-1 text-[10px] text-muted-foreground"
+                      >
+                        <span
+                          className="inline-block h-2.5 w-2.5 rounded-sm border border-white/20"
+                          style={{
+                            backgroundColor: color
+                              ? `rgb(${color[0]},${color[1]},${color[2]})`
+                              : '#888',
+                          }}
+                        />
+                        {name}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             <div className="rounded-lg border border-border bg-card">
               <div className="flex items-center justify-between gap-3 px-4 py-3">
@@ -3533,33 +3632,6 @@ export default function SimulationPage() {
                 </div>
               )}
             </div>
-
-            {/* ---- Label legend (compact, shown when labels available) ---- */}
-            {hasActiveOrganLabels && showLabelOverlay && (
-              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 border-t border-border/50 pt-2">
-                <span className="text-[10px] text-muted-foreground/60">
-                  Labels:
-                </span>
-                {visibleLabelLegendItems.map(({ index, name, color }) => {
-                  return (
-                    <span
-                      key={index}
-                      className="flex items-center gap-1 text-[10px] text-muted-foreground"
-                    >
-                      <span
-                        className="inline-block h-2.5 w-2.5 rounded-sm border border-white/20"
-                        style={{
-                          backgroundColor: color
-                            ? `rgb(${color[0]},${color[1]},${color[2]})`
-                            : '#888',
-                        }}
-                      />
-                      {name}
-                    </span>
-                  );
-                })}
-              </div>
-            )}
 
             {/* ---- Lesion overlay color legend ---- */}
             {lesionOverlayMeshes.length > 0 && (

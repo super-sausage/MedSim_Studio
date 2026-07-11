@@ -102,6 +102,16 @@ interface VolumeRendererProps {
   segmentationMask?: Float32Array | null;
   /** Label definitions for coloring the segmentation mask */
   segmentationLabels?: SegmentationLabelDef[] | null;
+  /** Optional externally controlled hidden label set for segmentation surfaces */
+  hiddenSegmentationLabels?: Set<number>;
+  /** Optional externally controlled selected segmentation label */
+  selectedSegmentationLabel?: number | null;
+  /** Called when a segmentation label visibility toggle changes */
+  onToggleSegmentationLabel?: (labelIndex: number) => void;
+  /** Called when a segmentation label selection changes */
+  onSelectedSegmentationLabelChange?: (labelIndex: number | null) => void;
+  /** Whether to show the built-in segmentation label checklist inside the renderer */
+  showSegmentationLabelControls?: boolean;
   /**
    * External volume data for synthetic mode.
    * When provided with mode='synthetic', this replaces the built-in
@@ -393,6 +403,11 @@ export function VolumeRenderer({
   showControls = false,
   segmentationMask,
   segmentationLabels,
+  hiddenSegmentationLabels: controlledHiddenSegmentationLabels,
+  selectedSegmentationLabel: controlledSelectedSegmentationLabel,
+  onToggleSegmentationLabel,
+  onSelectedSegmentationLabelChange,
+  showSegmentationLabelControls = true,
   syntheticData,
   syntheticDims,
   syntheticSpacing,
@@ -431,8 +446,10 @@ export function VolumeRenderer({
   const [activePreset, setActivePreset] = useState<PresetName>(initialPreset);
   const [clip, setClip] = useState<ClipState>({ x: 0, y: 0, z: 0 });
   const [segmentationOpacity, setSegmentationOpacity] = useState(DEFAULT_SEG_OPACITY);
-  const [hiddenSegmentationLabels, setHiddenSegmentationLabels] = useState<Set<number>>(new Set());
-  const [selectedSegmentationLabel, setSelectedSegmentationLabel] = useState<number | null>(null);
+  const [internalHiddenSegmentationLabels, setInternalHiddenSegmentationLabels] = useState<Set<number>>(new Set());
+  const [internalSelectedSegmentationLabel, setInternalSelectedSegmentationLabel] = useState<number | null>(null);
+  const hiddenSegmentationLabels = controlledHiddenSegmentationLabels ?? internalHiddenSegmentationLabels;
+  const selectedSegmentationLabel = controlledSelectedSegmentationLabel ?? internalSelectedSegmentationLabel;
 
   const applyActiveClippingPlanes = useCallback((imageData: any, targetMappers: any[]) => {
     if (!imageData || targetMappers.length === 0) return;
@@ -1178,13 +1195,27 @@ export function VolumeRenderer({
   }, []);
 
   const toggleSegmentationLabel = useCallback((labelIndex: number) => {
-    setHiddenSegmentationLabels((current) => {
+    if (onToggleSegmentationLabel) {
+      onToggleSegmentationLabel(labelIndex);
+      return;
+    }
+
+    setInternalHiddenSegmentationLabels((current) => {
       const next = new Set(current);
       if (next.has(labelIndex)) next.delete(labelIndex);
       else next.add(labelIndex);
       return next;
     });
-  }, []);
+  }, [onToggleSegmentationLabel]);
+
+  const handleSelectedSegmentationLabelChange = useCallback((labelIndex: number | null) => {
+    if (onSelectedSegmentationLabelChange) {
+      onSelectedSegmentationLabelChange(labelIndex);
+      return;
+    }
+
+    setInternalSelectedSegmentationLabel(labelIndex);
+  }, [onSelectedSegmentationLabelChange]);
 
   // ------------------------------------------------------------------
   // Render
@@ -1260,7 +1291,7 @@ export function VolumeRenderer({
           </div>
 
           {/* Segmentation opacity slider — only when overlay is active */}
-          {segmentationMask && segmentationLabels && segmentationLabels.length > 0 && (
+          {showSegmentationLabelControls && segmentationMask && segmentationLabels && segmentationLabels.length > 0 && (
             <div className="flex max-h-52 min-w-[220px] flex-col gap-1 overflow-y-auto rounded bg-black/60 px-2 py-1.5">
               <SegOpacitySlider
                 value={segmentationOpacity}
@@ -1281,7 +1312,7 @@ export function VolumeRenderer({
                       <button
                         type="button"
                         className={`flex min-w-0 flex-1 items-center gap-1 rounded px-1 py-0.5 text-left ${selected ? 'bg-white/20 text-white' : 'hover:bg-white/10'}`}
-                        onClick={() => setSelectedSegmentationLabel((current) => current === label.index ? null : label.index)}
+                        onClick={() => handleSelectedSegmentationLabelChange(selected ? null : label.index)}
                       >
                         <span
                           className="h-2 w-2 shrink-0 rounded-full"
