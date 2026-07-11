@@ -79,6 +79,14 @@ interface OrganSurfaceRef {
   normals: any;
 }
 
+interface SegmentationVolumeRef {
+  volume: any;
+  mapper: any;
+  imageData: any;
+  colorTransfer: any;
+  piecewiseFunc: any;
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -88,6 +96,7 @@ const SELECTED_OPACITY_BOOST = 0.16;
 const MIN_ORGAN_SURFACE_VOXELS = 8;
 const SURFACE_SMOOTHING_ITERATIONS = 8;
 const SURFACE_SMOOTHING_PASS_BAND = 0.2;
+const LABEL_HALF_BAND = 0.45;
 
 interface VolumeRendererProps {
   /** Render mode: synthetic phantom (default), real DICOM series, or standalone mesh preview */
@@ -435,6 +444,7 @@ export function VolumeRenderer({
   } | null>(null);
 
   const segRef = useRef<Map<number, OrganSurfaceRef>>(new Map());
+  const segVolumeRef = useRef<SegmentationVolumeRef | null>(null);
 
   // ---- Mesh actor refs (lesion mesh lifecycle management) ----
   const meshActorRef = useRef<LesionActorResult[]>([]);
@@ -735,6 +745,8 @@ export function VolumeRenderer({
       clearTimeout(timer);
 
       cleanupOrganSurfaces(vtkRef.current?.renderer, segRef.current);
+      cleanupSegmentationVolume(vtkRef.current?.renderer, segVolumeRef.current);
+      segVolumeRef.current = null;
 
       const s = vtkRef.current;
       if (s) {
@@ -829,7 +841,11 @@ export function VolumeRenderer({
 
     applyActiveClippingPlanes(
       imageData,
-      [state.mapper, ...Array.from(segRef.current.values()).map((item) => item.mapper)].filter(Boolean),
+      [
+        state.mapper,
+        segVolumeRef.current?.mapper,
+        ...Array.from(segRef.current.values()).map((item) => item.mapper),
+      ].filter(Boolean),
     );
     renderWindow.render();
   }, [applyActiveClippingPlanes, isReady]);
@@ -844,6 +860,8 @@ export function VolumeRenderer({
     const { renderer, renderWindow, imageData: ctImageData } = state;
 
     cleanupOrganSurfaces(renderer, segRef.current);
+    cleanupSegmentationVolume(renderer, segVolumeRef.current);
+    segVolumeRef.current = null;
 
     if (!segmentationMask || !segmentationLabels || segmentationLabels.length === 0) {
       renderWindow.render();
@@ -868,6 +886,69 @@ export function VolumeRenderer({
           '[VolumeRenderer] Dimension mismatch! CT=%d voxels, mask=%d voxels. Skipping overlay.',
           ctVoxelCount, maskVoxelCount,
         );
+        renderWindow.render();
+        return;
+      }
+
+      if (syntheticClipIndex !== undefined && syntheticClipIndex >= 0) {
+        const segImageData = vtkImageData.newInstance();
+        segImageData.setDimensions(ctDims);
+        segImageData.setSpacing(spacing);
+        segImageData.setOrigin(origin);
+        segImageData.getPointData().setScalars(vtkDataArray.newInstance({
+          name: 'SegmentationMask',
+          values: Uint8Array.from(mask, (value) => Math.round(value)),
+          numberOfComponents: 1,
+        }));
+
+        const segColor = vtkColorTransferFunction.newInstance();
+        const segOpacity = vtkPiecewiseFunction.newInstance();
+        segOpacity.addPoint(-0.5, 0.0);
+        segOpacity.addPoint(0.0, 0.0);
+        segOpacity.addPoint(0.5, 0.0);
+
+        for (const label of labels) {
+          const idx = label.index;
+          if (idx <= 0) continue;
+          const [r, g, b] = label.color;
+          const selected = label.selected ?? selectedSegmentationLabel === idx;
+          const visible = (label.visible ?? true) && !hiddenSegmentationLabels.has(idx);
+          const opacity = visible
+            ? Math.min(1, (label.opacity ?? segmentationOpacity) + (selected ? SELECTED_OPACITY_BOOST : 0))
+            : 0;
+
+          segColor.addRGBPoint(idx, r / 255, g / 255, b / 255);
+          segOpacity.addPoint(idx - LABEL_HALF_BAND, 0.0);
+          segOpacity.addPoint(idx, opacity);
+          segOpacity.addPoint(idx + LABEL_HALF_BAND, 0.0);
+        }
+
+        const segMapper = vtkVolumeMapper.newInstance();
+        segMapper.setInputData(segImageData);
+        segMapper.setBlendModeToComposite();
+        if (typeof segMapper.setSampleDistance === 'function') {
+          const minSpacing = Math.min(spacing[0], spacing[1], spacing[2]);
+          segMapper.setSampleDistance(minSpacing * 0.5);
+        }
+
+        const segVolume = vtkVolume.newInstance();
+        segVolume.setMapper(segMapper);
+        const segProp = segVolume.getProperty();
+        segProp.setRGBTransferFunction(0, segColor);
+        segProp.setScalarOpacity(0, segOpacity);
+        segProp.setInterpolationTypeToNearest();
+        segProp.setShade(false);
+        segProp.setIndependentComponents(true);
+
+        renderer.addVolume(segVolume);
+        applyActiveClippingPlanes(ctImageData, [segMapper]);
+        segVolumeRef.current = {
+          volume: segVolume,
+          mapper: segMapper,
+          imageData: segImageData,
+          colorTransfer: segColor,
+          piecewiseFunc: segOpacity,
+        };
         renderWindow.render();
         return;
       }
@@ -1047,7 +1128,16 @@ export function VolumeRenderer({
       console.error('[VolumeRenderer] Segmentation overlay failed:', err);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [applyActiveClippingPlanes, isReady, segmentationLabels, segmentationMask]);
+  }, [
+    applyActiveClippingPlanes,
+    hiddenSegmentationLabels,
+    isReady,
+    segmentationLabels,
+    segmentationMask,
+    selectedSegmentationLabel,
+    segmentationOpacity,
+    syntheticClipIndex,
+  ]);
 
   // ------------------------------------------------------------------
   // 4b. Segmentation opacity live update — when the slider is dragged,
@@ -1055,7 +1145,40 @@ export function VolumeRenderer({
   // ------------------------------------------------------------------
   useEffect(() => {
     const state = vtkRef.current;
-    if (!state || !isReady || !segmentationLabels || segRef.current.size === 0) return;
+    if (!state || !isReady || !segmentationLabels) return;
+
+    if (segVolumeRef.current) {
+      const segColor = segVolumeRef.current.colorTransfer;
+      const segOpacity = segVolumeRef.current.piecewiseFunc;
+      if (!segColor || !segOpacity) return;
+
+      segColor.removeAllPoints();
+      segOpacity.removeAllPoints();
+      segOpacity.addPoint(-0.5, 0.0);
+      segOpacity.addPoint(0.0, 0.0);
+      segOpacity.addPoint(0.5, 0.0);
+
+      for (const label of segmentationLabels) {
+        const idx = label.index;
+        if (idx <= 0) continue;
+        const [r, g, b] = label.color;
+        const selected = label.selected ?? selectedSegmentationLabel === idx;
+        const visible = (label.visible ?? true) && !hiddenSegmentationLabels.has(idx);
+        const opacity = visible
+          ? Math.min(1, (label.opacity ?? segmentationOpacity) + (selected ? SELECTED_OPACITY_BOOST : 0))
+          : 0;
+
+        segColor.addRGBPoint(idx, r / 255, g / 255, b / 255);
+        segOpacity.addPoint(idx - LABEL_HALF_BAND, 0.0);
+        segOpacity.addPoint(idx, opacity);
+        segOpacity.addPoint(idx + LABEL_HALF_BAND, 0.0);
+      }
+
+      state.renderWindow.render();
+      return;
+    }
+
+    if (segRef.current.size === 0) return;
 
     updateOrganSurfaceAppearance(
       segRef.current,
@@ -1424,6 +1547,16 @@ function cleanupOrganSurfaces(renderer: any | undefined, surfaces: Map<number, O
     try { surface.normals.delete(); } catch (_) { /* ignore */ }
   }
   surfaces.clear();
+}
+
+function cleanupSegmentationVolume(renderer: any | undefined, segmentationVolume: SegmentationVolumeRef | null): void {
+  if (!segmentationVolume) return;
+  try { renderer?.removeVolume(segmentationVolume.volume); } catch (_) { /* ignore */ }
+  try { segmentationVolume.volume.delete(); } catch (_) { /* ignore */ }
+  try { segmentationVolume.mapper.delete(); } catch (_) { /* ignore */ }
+  try { segmentationVolume.imageData.delete(); } catch (_) { /* ignore */ }
+  try { segmentationVolume.colorTransfer.delete(); } catch (_) { /* ignore */ }
+  try { segmentationVolume.piecewiseFunc.delete(); } catch (_) { /* ignore */ }
 }
 
 function updateOrganSurfaceAppearance(

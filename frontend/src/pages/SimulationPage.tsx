@@ -254,6 +254,26 @@ function buildVtkVolumePayload(
   };
 }
 
+function transposeZyxMaskToVtkOrder(
+  maskData: ArrayLike<number>,
+  shape: [number, number, number],
+): Float32Array {
+  const [depth, height, width] = shape;
+  const transposed = new Float32Array(width * height * depth);
+
+  for (let z = 0; z < depth; z++) {
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const srcIdx = z * height * width + y * width + x;
+        const dstIdx = x + y * width + z * width * height;
+        transposed[dstIdx] = Number(maskData[srcIdx]) || 0;
+      }
+    }
+  }
+
+  return transposed;
+}
+
 function getCenteredVolumeOriginMm(
   shape: [number, number, number],
   spacing: [number, number, number],
@@ -798,7 +818,11 @@ export default function SimulationPage() {
       }
     }
 
-    return { mask, labels };
+    const shape: [number, number, number] = [depth, height, width];
+    return {
+      mask: transposeZyxMaskToVtkOrder(mask, shape),
+      labels,
+    };
   }, [lesions, phantom]);
 
   // ---- Phase 5: Lesion mesh overlay (transformed to CT phantom coords) ----
@@ -906,6 +930,13 @@ export default function SimulationPage() {
   );
   const loadedWorkspaceStudyId = phantom?.metadata.studyId ?? null;
   const loadedWorkspaceSeriesId = phantom?.metadata.seriesId ?? null;
+  const loadedLabelSource = phantom?.metadata.labelSource ?? null;
+  const loadedLabelModelName = phantom?.metadata.labelModelName ?? null;
+  const loadedLabelsEnabled = phantom?.metadata.labelsEnabled ?? null;
+  const loadedLabelNonzeroCount = useMemo(() => {
+    const counts = phantom?.metadata.labelNonzeroCounts;
+    return counts ? Object.keys(counts).length : 0;
+  }, [phantom?.metadata.labelNonzeroCounts]);
   const activeVolumeDatasetKey = ctParamsResult?.simulatedVolumeBase64 ?? phantom?.volumeBase64 ?? null;
   const activeOrganColorMap = useMemo(() => {
     const labelMap = phantom?.metadata?.labelMap;
@@ -952,7 +983,7 @@ export default function SimulationPage() {
     return {
       // The renderer converts each integer label into its own surface actor;
       // mask value 0 remains absent from every segmentation render layer.
-      mask: Float32Array.from(activeSegmentationLabelData),
+      mask: transposeZyxMaskToVtkOrder(activeSegmentationLabelData, activeVolumeShape),
       labels: orderedLabels,
     };
   }, [
@@ -1195,6 +1226,11 @@ export default function SimulationPage() {
   }, []);
 
   useEffect(() => {
+    if (selectedStudyId || studies.length === 0) return;
+    setSelectedStudyId(studies[0].id);
+  }, [selectedStudyId, studies]);
+
+  useEffect(() => {
     void refreshAtlasCases();
   }, [refreshAtlasCases]);
 
@@ -1257,13 +1293,23 @@ export default function SimulationPage() {
     seriesList,
   ]);
 
+  useEffect(() => {
+    if (selectedSeriesId || ctWorkspaceSeriesList.length === 0) return;
+    setSelectedSeriesId(ctWorkspaceSeriesList[0].id);
+  }, [ctWorkspaceSeriesList, selectedSeriesId]);
+
   // -----------------------------------------------------------------------
   // Handlers: phantom
   // -----------------------------------------------------------------------
 
   const handleGeneratePhantom = async () => {
     const effectiveSeriesId = selectedSeriesId ?? ctWorkspaceSeriesList[0]?.id ?? null;
-    const effectiveSource: 'atlas' | 'dicom' = effectiveSeriesId ? 'dicom' : 'atlas';
+    const effectiveSource: 'atlas' | 'dicom' = selectedStudyId ? 'dicom' : 'atlas';
+
+    if (selectedStudyId && !effectiveSeriesId) {
+      setPhantomError('Select a CT series before loading the DICOM workspace.');
+      return;
+    }
 
     setPickedPosition(null);
     setPickedWorldPositionMm(null);
@@ -2780,6 +2826,22 @@ export default function SimulationPage() {
                           ? ' Selected DICOM series has changed; reload CT volume to simulate the newly selected series.'
                           : ''}
                       </div>
+                      {phantom?.metadata.source === 'dicom' && (
+                        <div className="mt-2 flex flex-wrap gap-2 text-[10px] text-white/70">
+                          <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">
+                            Labels: {loadedLabelsEnabled ? 'on' : 'off'}
+                          </span>
+                          <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">
+                            Source: {loadedLabelSource ?? 'none'}
+                          </span>
+                          <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">
+                            Model: {loadedLabelModelName ?? 'none'}
+                          </span>
+                          <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">
+                            Nonzero labels: {loadedLabelNonzeroCount}
+                          </span>
+                        </div>
+                      )}
                     </div>
                     <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
                       <div className="text-[11px] uppercase tracking-[0.16em] text-white/45">Window</div>

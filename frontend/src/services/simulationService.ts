@@ -70,6 +70,11 @@ export interface PhantomMetadata {
   // ---- Label statistics (atlas mode, when labels available) ----
   labelNonzeroCounts?: Record<number, number>; // label_id → voxel count
   sliceLabelPresence?: Record<string, [number, number]>; // organ_name → [z_min, z_max]
+  labelSource?: string | null;
+  labelModelName?: string | null;
+  labelError?: string | null;
+  labelsEnabled?: boolean;
+  segmentationSeriesId?: string | null;
 }
 
 /** Response from GET /simulation/phantom */
