@@ -864,8 +864,8 @@ export default function SimulationPage() {
       });
 
     return {
-      // Keep the original CT body rendering intact and overlay label colors
-      // as a lightweight translucent volume instead of a separate 3D shell.
+      // The renderer converts each integer label into its own surface actor;
+      // mask value 0 remains absent from every segmentation render layer.
       mask: Float32Array.from(activeSegmentationLabelData),
       labels: orderedLabels,
     };
@@ -923,6 +923,7 @@ export default function SimulationPage() {
       };
     });
   }, [phantom?.metadata?.labelMap, phantom?.metadata?.labelNonzeroCounts]);
+  const hasActiveOrganLabels = Boolean(activeSegmentationLabelData && visibleLabelLegendItems.length > 0);
 
   useEffect(() => {
     if (!activeVolumeShape) return;
@@ -2876,7 +2877,7 @@ export default function SimulationPage() {
               </Button>
 
               {/* Label overlay toggle (only when labels available) */}
-              {phantom?.labelBase64 && (
+              {hasActiveOrganLabels && (
                 <>
                   <div className="h-5 w-px bg-border" />
                   <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
@@ -3436,7 +3437,7 @@ export default function SimulationPage() {
             </div>
 
             {/* ---- Label legend (compact, shown when labels available) ---- */}
-            {phantom?.labelBase64 && showLabelOverlay && (
+            {hasActiveOrganLabels && showLabelOverlay && (
               <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 border-t border-border/50 pt-2">
                 <span className="text-[10px] text-muted-foreground/60">
                   Labels:

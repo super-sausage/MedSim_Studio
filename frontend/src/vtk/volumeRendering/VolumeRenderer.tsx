@@ -13,11 +13,16 @@ import vtkRenderWindowInteractor from '@kitware/vtk.js/Rendering/Core/RenderWind
 import vtkInteractorStyleTrackballCamera from '@kitware/vtk.js/Interaction/Style/InteractorStyleTrackballCamera';
 import vtkVolume from '@kitware/vtk.js/Rendering/Core/Volume';
 import vtkVolumeMapper from '@kitware/vtk.js/Rendering/Core/VolumeMapper';
+import vtkActor from '@kitware/vtk.js/Rendering/Core/Actor';
+import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 import vtkColorTransferFunction from '@kitware/vtk.js/Rendering/Core/ColorTransferFunction';
 import vtkPiecewiseFunction from '@kitware/vtk.js/Common/DataModel/PiecewiseFunction';
 import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 import vtkPlane from '@kitware/vtk.js/Common/DataModel/Plane';
+import vtkImageMarchingCubes from '@kitware/vtk.js/Filters/General/ImageMarchingCubes';
+import vtkWindowedSincPolyDataFilter from '@kitware/vtk.js/Filters/General/WindowedSincPolyDataFilter';
+import vtkPolyDataNormals from '@kitware/vtk.js/Filters/Core/PolyDataNormals';
 
 import { loadDicomVolume, type DicomVolumeData } from './dicomVolumeLoader';
 import { createLesionActor } from '../mesh/createLesionActor';
@@ -41,6 +46,9 @@ interface SegmentationLabelDef {
   index: number;
   name: string;
   color: [number, number, number]; // RGB 0-255
+  visible?: boolean;
+  selected?: boolean;
+  opacity?: number;
 }
 
 /** A single lesion mesh for rendering overlay or standalone preview */
@@ -61,18 +69,25 @@ interface LesionMeshProp {
   visible?: boolean;
 }
 
+interface OrganSurfaceRef {
+  labelIndex: number;
+  actor: any;
+  mapper: any;
+  imageData: any;
+  marchingCubes: any;
+  smoother: any;
+  normals: any;
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Default peak opacity for segmentation overlay (0..1).
- *  This should tint the CT volume, not replace it visually. */
-const DEFAULT_SEG_OPACITY = 0.065;
-
-/** Half-band width around integer label values in the opacity transfer
- *  function.  Keeps the function sharp at each label while preventing
- *  floating-point sampling misses. */
-const LABEL_HALF_BAND = 0.45;
+const DEFAULT_SEG_OPACITY = 0.14;
+const SELECTED_OPACITY_BOOST = 0.16;
+const MIN_ORGAN_SURFACE_VOXELS = 8;
+const SURFACE_SMOOTHING_ITERATIONS = 8;
+const SURFACE_SMOOTHING_PASS_BAND = 0.2;
 
 interface VolumeRendererProps {
   /** Render mode: synthetic phantom (default), real DICOM series, or standalone mesh preview */
@@ -362,9 +377,6 @@ function resetCameraToVolume(
   const fitHeight = radius / Math.tan(viewAngleRad / 2);
   const fitWidth = (radius * aspect) / Math.tan(viewAngleRad / 2);
   const distance = Math.max(fitHeight, fitWidth) * 1.15;
-
-  // Default to an anterior-facing view so the initial 3D presentation
-  // starts from the patient's front rather than the back.
   camera.setPosition(center[0], center[1] - distance, center[2]);
   camera.setViewUp(0, 0, scanView ? -1 : 1);
   renderer.resetCameraClippingRange(bounds);
@@ -407,14 +419,7 @@ export function VolumeRenderer({
     piecewiseFunc?: any;
   } | null>(null);
 
-  // ---- Segmentation overlay volume ref (separate from main CT volume) ----
-  const segRef = useRef<{
-    volume: any;
-    mapper: any;
-    imageData: any;
-    colorTransfer: any;
-    piecewiseFunc: any;
-  } | null>(null);
+  const segRef = useRef<Map<number, OrganSurfaceRef>>(new Map());
 
   // ---- Mesh actor refs (lesion mesh lifecycle management) ----
   const meshActorRef = useRef<LesionActorResult[]>([]);
@@ -426,6 +431,8 @@ export function VolumeRenderer({
   const [activePreset, setActivePreset] = useState<PresetName>(initialPreset);
   const [clip, setClip] = useState<ClipState>({ x: 0, y: 0, z: 0 });
   const [segmentationOpacity, setSegmentationOpacity] = useState(DEFAULT_SEG_OPACITY);
+  const [hiddenSegmentationLabels, setHiddenSegmentationLabels] = useState<Set<number>>(new Set());
+  const [selectedSegmentationLabel, setSelectedSegmentationLabel] = useState<number | null>(null);
 
   const applyActiveClippingPlanes = useCallback((imageData: any, targetMappers: any[]) => {
     if (!imageData || targetMappers.length === 0) return;
@@ -710,21 +717,7 @@ export function VolumeRenderer({
       cancelled = true;
       clearTimeout(timer);
 
-      // Cleanup segmentation overlay first
-      const seg = segRef.current;
-      if (seg) {
-        try {
-          if (vtkRef.current?.renderer) {
-            vtkRef.current.renderer.removeVolume(seg.volume);
-          }
-        } catch (_) { /* ignore */ }
-        try { seg.volume.delete(); } catch (_) { /* ignore */ }
-        try { seg.mapper.delete(); } catch (_) { /* ignore */ }
-        try { seg.imageData.delete(); } catch (_) { /* ignore */ }
-        try { seg.colorTransfer.delete(); } catch (_) { /* ignore */ }
-        try { seg.piecewiseFunc.delete(); } catch (_) { /* ignore */ }
-        segRef.current = null;
-      }
+      cleanupOrganSurfaces(vtkRef.current?.renderer, segRef.current);
 
       const s = vtkRef.current;
       if (s) {
@@ -817,12 +810,15 @@ export function VolumeRenderer({
     const { imageData, renderWindow } = state;
     if (!imageData || !renderWindow) return;
 
-    applyActiveClippingPlanes(imageData, [state.mapper, segRef.current?.mapper].filter(Boolean));
+    applyActiveClippingPlanes(
+      imageData,
+      [state.mapper, ...Array.from(segRef.current.values()).map((item) => item.mapper)].filter(Boolean),
+    );
     renderWindow.render();
   }, [applyActiveClippingPlanes, isReady]);
 
   // ------------------------------------------------------------------
-  // 4. Segmentation overlay — add/remove a second volume for mask
+  // 4. Segmentation overlay: isolated per-label surface actors.
   // ------------------------------------------------------------------
   useEffect(() => {
     const state = vtkRef.current;
@@ -830,63 +826,126 @@ export function VolumeRenderer({
 
     const { renderer, renderWindow, imageData: ctImageData } = state;
 
-    // Cleanup previous segmentation overlay
-    if (segRef.current) {
-      try {
-        renderer.removeVolume(segRef.current.volume);
-        segRef.current.volume.delete();
-        segRef.current.mapper.delete();
-        segRef.current.imageData.delete();
-        segRef.current.colorTransfer.delete();
-        segRef.current.piecewiseFunc.delete();
-      } catch (_) { /* ignore */ }
-      segRef.current = null;
-    }
+    cleanupOrganSurfaces(renderer, segRef.current);
 
-    // If no mask provided, we're done
     if (!segmentationMask || !segmentationLabels || segmentationLabels.length === 0) {
       renderWindow.render();
       return;
     }
 
+    const mask = segmentationMask;
+    const labels = segmentationLabels;
+
     try {
       // Get CT volume dimensions
-      const ctDims = ctImageData.getDimensions(); // [x, y, z]
+      const ctDims = ctImageData.getDimensions();
       const spacing = ctImageData.getSpacing();
       const origin = ctImageData.getOrigin();
 
       const ctVoxelCount = ctDims[0] * ctDims[1] * ctDims[2];
-      const maskVoxelCount = segmentationMask.length;
-
-      console.info(
-        '[VolumeRenderer] CT dims=%o (%d voxels) | mask elements=%d',
-        ctDims, ctVoxelCount, maskVoxelCount,
-      );
+      const maskVoxelCount = mask.length;
 
       // Validate dimension match — critical for correct rendering
       if (maskVoxelCount !== ctVoxelCount) {
         console.error(
-          '[VolumeRenderer] Dimension mismatch! CT=%d voxels, mask=%d voxels. ' +
-          'The segmentation mask was generated for a different volume. Skipping overlay.',
+          '[VolumeRenderer] Dimension mismatch! CT=%d voxels, mask=%d voxels. Skipping overlay.',
           ctVoxelCount, maskVoxelCount,
         );
         renderWindow.render();
         return;
       }
 
-      // ------- segmentation vtkImageData -------
-      const segImageData = vtkImageData.newInstance();
-      segImageData.setDimensions(ctDims);
-      segImageData.setSpacing(spacing);
-      segImageData.setOrigin(origin);
-      // Set origin to match CT so segmentation aligns in world space.
+      for (const label of labels) {
+        if (label.index <= 0) continue;
 
-      const segArray = vtkDataArray.newInstance({
-        name: 'Segmentation',
-        values: segmentationMask,
-        numberOfComponents: 1,
+        const organMask = new Uint8Array(maskVoxelCount);
+        let organVoxelCount = 0;
+        for (let i = 0; i < mask.length; i++) {
+          if (Math.round(mask[i]) === label.index) {
+            organMask[i] = 1;
+            organVoxelCount += 1;
+          }
+        }
+        if (organVoxelCount < MIN_ORGAN_SURFACE_VOXELS) continue;
+
+        const segImageData = vtkImageData.newInstance();
+        segImageData.setDimensions(ctDims);
+        segImageData.setSpacing(spacing);
+        segImageData.setOrigin(origin);
+        segImageData.getPointData().setScalars(vtkDataArray.newInstance({
+          name: `Segmentation-${label.index}`,
+          values: organMask,
+          numberOfComponents: 1,
+        }));
+
+      const marchingCubes = vtkImageMarchingCubes.newInstance({
+        contourValue: 0.5,
+        computeNormals: false,
+        mergePoints: true,
       });
-      segImageData.getPointData().setScalars(segArray);
+      marchingCubes.setInputData(segImageData);
+      marchingCubes.update();
+
+      const smoother = vtkWindowedSincPolyDataFilter.newInstance({
+        numberOfIterations: SURFACE_SMOOTHING_ITERATIONS,
+        passBand: SURFACE_SMOOTHING_PASS_BAND,
+        featureAngle: 100,
+        edgeAngle: 25,
+        featureEdgeSmoothing: 0,
+        boundarySmoothing: 0,
+        normalizeCoordinates: 1,
+      });
+      smoother.setInputData(marchingCubes.getOutputData());
+      smoother.update();
+
+      const normals = vtkPolyDataNormals.newInstance({
+        computePointNormals: true,
+        computeCellNormals: false,
+      });
+      normals.setInputData(smoother.getOutputData());
+      normals.update();
+
+      const segMapper = vtkMapper.newInstance();
+      segMapper.setInputData(normals.getOutputData());
+      segMapper.setScalarVisibility(false);
+
+      const segActor = vtkActor.newInstance();
+      segActor.setMapper(segMapper);
+      const segProp = segActor.getProperty();
+      segProp.setColor(label.color[0] / 255, label.color[1] / 255, label.color[2] / 255);
+      segProp.setOpacity(label.opacity ?? segmentationOpacity);
+      segProp.setAmbient(0.28);
+      segProp.setDiffuse(0.62);
+      segProp.setSpecular(0.18);
+      segProp.setSpecularPower(22.0);
+      if (typeof segProp.setInterpolationToPhong === 'function') {
+        segProp.setInterpolationToPhong();
+      }
+
+      renderer.addActor(segActor);
+      applyActiveClippingPlanes(ctImageData, [segMapper]);
+      segRef.current.set(label.index, {
+        labelIndex: label.index,
+        actor: segActor,
+        mapper: segMapper,
+        imageData: segImageData,
+        marchingCubes,
+        smoother,
+        normals,
+      });
+
+      console.info('[VolumeRenderer] Organ surface %d registered (%d voxels)', label.index, organVoxelCount);
+      }
+      updateOrganSurfaceAppearance(
+        segRef.current,
+        labels,
+        hiddenSegmentationLabels,
+        selectedSegmentationLabel,
+        segmentationOpacity,
+      );
+      renderWindow.render();
+      return;
+      /*
 
       // Determine the scalar range from the data
       let segMin = Infinity;
@@ -966,47 +1025,31 @@ export function VolumeRenderer({
       };
 
       console.info('[VolumeRenderer] Segmentation overlay registered (labels=%d)', segmentationLabels.length);
+      */
     } catch (err) {
       console.error('[VolumeRenderer] Segmentation overlay failed:', err);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [applyActiveClippingPlanes, segmentationMask, segmentationLabels, isReady]);
+  }, [applyActiveClippingPlanes, isReady, segmentationLabels, segmentationMask]);
 
   // ------------------------------------------------------------------
   // 4b. Segmentation opacity live update — when the slider is dragged,
   //     rebuild only the opacity transfer function (no volume recreation).
   // ------------------------------------------------------------------
   useEffect(() => {
-    const seg = segRef.current;
     const state = vtkRef.current;
-    if (!seg || !state || !isReady) return;
+    if (!state || !isReady || !segmentationLabels || segRef.current.size === 0) return;
 
-    const labels = segmentationLabels;
-    if (!labels || labels.length === 0) return;
-
-    const newOpacity = vtkPiecewiseFunction.newInstance();
-
-    // Background — fully transparent
-    newOpacity.addPoint(-0.5, 0.0);
-    newOpacity.addPoint(0.0, 0.0);
-    newOpacity.addPoint(0.5, 0.0);
-
-    // Each label with the new opacity value
-    for (const label of labels) {
-      if (label.index === 0) continue;
-      newOpacity.addPoint(label.index - LABEL_HALF_BAND, 0.0);
-      newOpacity.addPoint(label.index, segmentationOpacity);
-      newOpacity.addPoint(label.index + LABEL_HALF_BAND, 0.0);
-    }
-
-    // Replace the opacity function on the volume property (live update)
-    seg.volume.getProperty().setScalarOpacity(0, newOpacity);
-    // Store for proper cleanup on next segmentation change
-    seg.piecewiseFunc = newOpacity;
+    updateOrganSurfaceAppearance(
+      segRef.current,
+      segmentationLabels,
+      hiddenSegmentationLabels,
+      selectedSegmentationLabel,
+      segmentationOpacity,
+    );
 
     state.renderWindow.render();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segmentationOpacity, isReady]);
+  }, [hiddenSegmentationLabels, isReady, segmentationLabels, segmentationOpacity, selectedSegmentationLabel]);
 
   // ------------------------------------------------------------------
   // 4c. Lesion mesh actors — create/update/cleanup per lesionMeshes prop
@@ -1093,7 +1136,6 @@ export function VolumeRenderer({
         console.warn('[VolumeRenderer] WebGL check error:', e);
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lesionMeshes, isReady, mode]);
 
   // ------------------------------------------------------------------
@@ -1112,7 +1154,12 @@ export function VolumeRenderer({
         if (mode === 'mesh' && meshActorRef.current.length > 0) {
           resetCameraToMesh(state.renderer, meshActorRef.current, container);
         } else if (state.imageData) {
-          resetCameraToVolume(state.renderer, state.imageData, container, scanView);
+          resetCameraToVolume(
+            state.renderer,
+            state.imageData,
+            container,
+            scanView,
+          );
         }
 
         state.renderWindow.render();
@@ -1128,6 +1175,15 @@ export function VolumeRenderer({
   // ------------------------------------------------------------------
   const handlePresetChange = useCallback((name: PresetName) => {
     setActivePreset(name);
+  }, []);
+
+  const toggleSegmentationLabel = useCallback((labelIndex: number) => {
+    setHiddenSegmentationLabels((current) => {
+      const next = new Set(current);
+      if (next.has(labelIndex)) next.delete(labelIndex);
+      else next.add(labelIndex);
+      return next;
+    });
   }, []);
 
   // ------------------------------------------------------------------
@@ -1205,11 +1261,38 @@ export function VolumeRenderer({
 
           {/* Segmentation opacity slider — only when overlay is active */}
           {segmentationMask && segmentationLabels && segmentationLabels.length > 0 && (
-            <div className="flex flex-col gap-0.5 rounded bg-black/60 px-2 py-1.5 min-w-[220px]">
+            <div className="flex max-h-52 min-w-[220px] flex-col gap-1 overflow-y-auto rounded bg-black/60 px-2 py-1.5">
               <SegOpacitySlider
                 value={segmentationOpacity}
                 onChange={setSegmentationOpacity}
               />
+              <div className="mt-1 border-t border-white/10 pt-1">
+                {segmentationLabels.filter((label) => label.index > 0).map((label) => {
+                  const visible = !hiddenSegmentationLabels.has(label.index) && (label.visible ?? true);
+                  const selected = selectedSegmentationLabel === label.index || label.selected === true;
+                  return (
+                    <div key={label.index} className="flex items-center gap-1 text-[10px] text-white/75">
+                      <input
+                        type="checkbox"
+                        checked={visible}
+                        onChange={() => toggleSegmentationLabel(label.index)}
+                        aria-label={`Toggle ${label.name}`}
+                      />
+                      <button
+                        type="button"
+                        className={`flex min-w-0 flex-1 items-center gap-1 rounded px-1 py-0.5 text-left ${selected ? 'bg-white/20 text-white' : 'hover:bg-white/10'}`}
+                        onClick={() => setSelectedSegmentationLabel((current) => current === label.index ? null : label.index)}
+                      >
+                        <span
+                          className="h-2 w-2 shrink-0 rounded-full"
+                          style={{ backgroundColor: `rgb(${label.color.join(',')})` }}
+                        />
+                        <span className="truncate">{label.name}</span>
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -1297,6 +1380,44 @@ function resetCameraToMesh(
   camera.setViewUp(0, 0, -1);
 
   renderer.resetCameraClippingRange(bounds);
+}
+
+function cleanupOrganSurfaces(renderer: any | undefined, surfaces: Map<number, OrganSurfaceRef>): void {
+  for (const surface of surfaces.values()) {
+    try { renderer?.removeActor(surface.actor); } catch (_) { /* ignore */ }
+    try { surface.actor.delete(); } catch (_) { /* ignore */ }
+    try { surface.mapper.delete(); } catch (_) { /* ignore */ }
+    try { surface.imageData.delete(); } catch (_) { /* ignore */ }
+    try { surface.marchingCubes.delete(); } catch (_) { /* ignore */ }
+    try { surface.smoother.delete(); } catch (_) { /* ignore */ }
+    try { surface.normals.delete(); } catch (_) { /* ignore */ }
+  }
+  surfaces.clear();
+}
+
+function updateOrganSurfaceAppearance(
+  surfaces: Map<number, OrganSurfaceRef>,
+  labels: SegmentationLabelDef[],
+  hiddenLabels: Set<number>,
+  selectedLabel: number | null,
+  defaultOpacity: number,
+): void {
+  for (const label of labels) {
+    const surface = surfaces.get(label.index);
+    if (!surface) continue;
+
+    const [r, g, b] = label.color;
+    const selected = label.selected ?? selectedLabel === label.index;
+    const visible = (label.visible ?? true) && !hiddenLabels.has(label.index);
+    const opacity = visible
+      ? Math.min(1, (label.opacity ?? defaultOpacity) + (selected ? SELECTED_OPACITY_BOOST : 0))
+      : 0;
+    const prop = surface.actor.getProperty();
+
+    prop.setColor(r / 255, g / 255, b / 255);
+    prop.setOpacity(opacity);
+    surface.actor.setVisibility(visible || opacity > 0);
+  }
 }
 
 /** Apply a transfer-function preset to brand-new TF instances. */
