@@ -987,8 +987,27 @@ export default function SimulationPage() {
   const activeBodySliceRange = useMemo(() => {
     if (!activeSliceData || !activeVolumeShape) return null;
     const threshold = phantom?.metadata.bodyThresholdHU ?? -500;
+    const hasGantryPoseChange = Boolean(ctParamsResult) && (
+      Math.abs(ctParamsResult?.metadata.gantryPitchDeg ?? 0) > 1e-3 ||
+      Math.abs(ctParamsResult?.metadata.gantryYawDeg ?? 0) > 1e-3 ||
+      Math.abs(ctParamsResult?.metadata.gantryRollDeg ?? 0) > 1e-3
+    );
+    const phantomShape: [number, number, number] | null = phantom
+      ? [phantom.metadata.depth, phantom.metadata.height, phantom.metadata.width]
+      : null;
+    const sameShapeAsPhantom = Boolean(
+      phantomShape
+      && phantomShape[0] === activeVolumeShape[0]
+      && phantomShape[1] === activeVolumeShape[1]
+      && phantomShape[2] === activeVolumeShape[2],
+    );
+
+    if (ctParamsResult && !hasGantryPoseChange && decodedPhantomData && phantomShape && sameShapeAsPhantom) {
+      return findInformativeSliceRange(decodedPhantomData, phantomShape, threshold);
+    }
+
     return findInformativeSliceRange(activeSliceData, activeVolumeShape, threshold);
-  }, [activeSliceData, activeVolumeShape, phantom?.metadata.bodyThresholdHU]);
+  }, [activeSliceData, activeVolumeShape, ctParamsResult, decodedPhantomData, phantom]);
   const activePickedPosition = useMemo(() => {
     if (!pickedWorldPositionMm || !activeVolumeShape || !activeVolumeSpacing) {
       return pickedPosition;
@@ -1043,7 +1062,7 @@ export default function SimulationPage() {
     const counts = phantom?.metadata.labelNonzeroCounts;
     return counts ? Object.keys(counts).length : 0;
   }, [phantom?.metadata.labelNonzeroCounts]);
-  const activeVolumeDatasetKey = ctParamsResult?.simulatedVolumeBase64 ?? phantom?.volumeBase64 ?? null;
+  const phantomDatasetKey = phantom?.volumeBase64 ?? null;
   const activeOrganColorMap = useMemo(() => {
     const labelMap = phantom?.metadata?.labelMap;
     if (!labelMap) return {};
@@ -1177,10 +1196,10 @@ export default function SimulationPage() {
   }, [activeVolumeShape, sliceIndex]);
 
   useEffect(() => {
-    if (!activeVolumeDatasetKey) return;
+    if (!phantomDatasetKey || ctParamsResult) return;
     setSliceIndex(scanStartIndex);
     setPlaying(false);
-  }, [activeVolumeDatasetKey, scanStartIndex]);
+  }, [ctParamsResult, phantomDatasetKey, scanStartIndex]);
 
   useEffect(() => {
     setHiddenOrganLabelIndexes(new Set());

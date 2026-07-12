@@ -91,7 +91,7 @@ def _projection_thickness_surrogate(mu_map: np.ndarray) -> np.ndarray:
 def _extract_body_support_mask(
     volume: np.ndarray,
     label_volume: Optional[np.ndarray] = None,
-    threshold_hu: float = -900.0,
+    threshold_hu: float = 25.0,
 ) -> np.ndarray:
     """
     Approximate the physically meaningful body support region.
@@ -103,6 +103,10 @@ def _extract_body_support_mask(
     internal cavities, and preserve explicit label voxels.
     """
     support_seed = volume > threshold_hu
+    support_seed = np.stack(
+        [binary_fill_holes(support_seed[z]) for z in range(support_seed.shape[0])],
+        axis=0,
+    )
     if label_volume is not None:
         support_seed |= label_volume > 0
 
@@ -384,46 +388,12 @@ def _apply_slice_thickness(
         blurred = blurred * (1.0 - slab_blend_alpha) + slab_avg * slab_blend_alpha
 
     z_reconstruction_scale = 1.0
-    if thickness_ratio > 2.0 and volume.shape[0] > 8:
-        z_reconstruction_scale = max(1.0 / min(np.sqrt(thickness_ratio) * 0.92, 3.2), 0.34)
-        blurred = zoom(
-            zoom(blurred, (z_reconstruction_scale, 1.0, 1.0), order=1, mode="nearest"),
-            (1.0 / z_reconstruction_scale, 1.0, 1.0),
-            order=1,
-            mode="nearest",
-        )
-        if blurred.shape[0] != volume.shape[0]:
-            blurred = zoom(
-                blurred,
-                (volume.shape[0] / blurred.shape[0], 1.0, 1.0),
-                order=1,
-                mode="nearest",
-            )
 
     xy_sigma = max((thickness_ratio - 1.0) * 0.24, 0.0)
     if xy_sigma > 1e-6:
         blurred = gaussian_filter(blurred, sigma=(0.0, xy_sigma, xy_sigma), mode="nearest")
 
     xy_reconstruction_scale = 1.0
-    if thickness_ratio > 3.0 and min(volume.shape[1], volume.shape[2]) > 24:
-        xy_reconstruction_scale = max(1.0 / min(1.0 + (thickness_ratio - 3.0) * 0.12, 1.8), 0.56)
-        blurred = zoom(
-            zoom(blurred, (1.0, xy_reconstruction_scale, xy_reconstruction_scale), order=1, mode="nearest"),
-            (1.0, 1.0 / xy_reconstruction_scale, 1.0 / xy_reconstruction_scale),
-            order=1,
-            mode="nearest",
-        )
-        if blurred.shape[1] != volume.shape[1] or blurred.shape[2] != volume.shape[2]:
-            blurred = zoom(
-                blurred,
-                (
-                    1.0,
-                    volume.shape[1] / blurred.shape[1],
-                    volume.shape[2] / blurred.shape[2],
-                ),
-                order=1,
-                mode="nearest",
-            )
 
     detail_suppression_alpha = min((thickness_ratio - 1.0) * 0.055, 0.42)
     if detail_suppression_alpha > 0.0:
@@ -443,7 +413,7 @@ def _apply_slice_thickness(
         "z_reconstruction_scale": float(z_reconstruction_scale),
         "xy_reconstruction_scale": float(xy_reconstruction_scale),
         "detail_suppression_alpha": float(detail_suppression_alpha),
-        "thickness_model": "z_blur_plus_slab_averaging_plus_coarse_reconstruction",
+        "thickness_model": "coverage_preserving_z_blur_plus_slab_averaging",
     }
 
 
