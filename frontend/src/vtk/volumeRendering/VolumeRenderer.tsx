@@ -91,7 +91,7 @@ interface SegmentationVolumeRef {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SEG_OPACITY = 0.68;
+const DEFAULT_SEG_OPACITY = 0.11;
 const SELECTED_OPACITY_BOOST = 0.10;
 const MIN_ORGAN_SURFACE_VOXELS = 8;
 const SURFACE_SMOOTHING_ITERATIONS = 8;
@@ -331,42 +331,88 @@ function centerVolumeOrigin(
   ];
 }
 
-function createProgressiveClipPlane(
-  axisIdx: number,
+function getScanAxisIndex(axis: 'x' | 'y' | 'z'): number {
+  return axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+}
+
+function isVoxelVisibleForProgressiveScan(
+  coord: number,
   axisDim: number,
-  clipIndex: number,
+  clipIndex: number | undefined,
   direction: 'low_to_high' | 'high_to_low',
-  origin: [number, number, number],
-  spacing: [number, number, number],
-): any | null {
-  if (axisDim <= 0) {
-    return null;
+): boolean {
+  if (clipIndex === undefined || clipIndex < 0 || axisDim <= 0) {
+    return true;
   }
 
   const clampedIndex = Math.max(0, Math.min(axisDim - 1, clipIndex));
-  const normal: [number, number, number] = [0, 0, 0];
-  const planeOrigin: [number, number, number] = [0, 0, 0];
-
   if (direction === 'high_to_low') {
-    const visibleStart = Math.max(axisDim - 1 - clampedIndex, 0);
-    if (visibleStart <= 0) {
-      return null;
+    return coord >= Math.max(axisDim - 1 - clampedIndex, 0);
+  }
+  return coord <= clampedIndex;
+}
+
+function buildProgressiveFloatScalars(
+  source: Float32Array,
+  dims: [number, number, number],
+  scanAxis: 'x' | 'y' | 'z',
+  clipIndex: number | undefined,
+  direction: 'low_to_high' | 'high_to_low',
+  fillValue = -1024,
+): Float32Array {
+  if (clipIndex === undefined || clipIndex < 0) {
+    return source;
+  }
+
+  const [nx, ny, nz] = dims;
+  const axisIdx = getScanAxisIndex(scanAxis);
+  const axisDim = dims[axisIdx];
+  const result = new Float32Array(source.length);
+
+  for (let z = 0; z < nz; z++) {
+    for (let y = 0; y < ny; y++) {
+      for (let x = 0; x < nx; x++) {
+        const idx = x + y * nx + z * nx * ny;
+        const coord = axisIdx === 0 ? x : axisIdx === 1 ? y : z;
+        result[idx] = isVoxelVisibleForProgressiveScan(coord, axisDim, clipIndex, direction)
+          ? source[idx]
+          : fillValue;
+      }
     }
-
-    planeOrigin[axisIdx] =
-      origin[axisIdx] + (visibleStart - 0.5) * spacing[axisIdx];
-    normal[axisIdx] = 1;
-    return vtkPlane.newInstance({ normal, origin: planeOrigin });
   }
 
-  if (clampedIndex >= axisDim - 1) {
-    return null;
+  return result;
+}
+
+function buildProgressiveUint8Scalars(
+  source: Uint8Array,
+  dims: [number, number, number],
+  scanAxis: 'x' | 'y' | 'z',
+  clipIndex: number | undefined,
+  direction: 'low_to_high' | 'high_to_low',
+): Uint8Array {
+  if (clipIndex === undefined || clipIndex < 0) {
+    return source;
   }
 
-  planeOrigin[axisIdx] =
-    origin[axisIdx] + (clampedIndex + 0.5) * spacing[axisIdx];
-  normal[axisIdx] = -1;
-  return vtkPlane.newInstance({ normal, origin: planeOrigin });
+  const [nx, ny, nz] = dims;
+  const axisIdx = getScanAxisIndex(scanAxis);
+  const axisDim = dims[axisIdx];
+  const result = new Uint8Array(source.length);
+
+  for (let z = 0; z < nz; z++) {
+    for (let y = 0; y < ny; y++) {
+      for (let x = 0; x < nx; x++) {
+        const idx = x + y * nx + z * nx * ny;
+        const coord = axisIdx === 0 ? x : axisIdx === 1 ? y : z;
+        result[idx] = isVoxelVisibleForProgressiveScan(coord, axisDim, clipIndex, direction)
+          ? source[idx]
+          : 0;
+      }
+    }
+  }
+
+  return result;
 }
 
 function resetCameraToVolume(
@@ -445,6 +491,7 @@ export function VolumeRenderer({
 
   const segRef = useRef<Map<number, OrganSurfaceRef>>(new Map());
   const segVolumeRef = useRef<SegmentationVolumeRef | null>(null);
+  const syntheticBaseDataRef = useRef<Float32Array | null>(null);
 
   // ---- Mesh actor refs (lesion mesh lifecycle management) ----
   const meshActorRef = useRef<LesionActorResult[]>([]);
@@ -488,31 +535,6 @@ export function VolumeRenderer({
       );
     }
 
-    if (
-      syntheticClipIndex !== undefined &&
-      syntheticClipIndex >= 0 &&
-      syntheticScanAxis
-    ) {
-      const dims = imageData.getDimensions();
-      const spacing = imageData.getSpacing();
-      const origin = imageData.getOrigin();
-      const axisIdx = syntheticScanAxis === 'x' ? 0
-        : syntheticScanAxis === 'y' ? 1 : 2;
-      const axisDim = dims[axisIdx];
-
-      const progressivePlane = createProgressiveClipPlane(
-        axisIdx,
-        axisDim,
-        syntheticClipIndex,
-        syntheticClipDirection,
-        origin,
-        spacing,
-      );
-      if (progressivePlane) {
-        activePlanes.push(progressivePlane);
-      }
-    }
-
     for (const mapper of targetMappers) {
       if (!mapper) continue;
       mapper.removeAllClippingPlanes();
@@ -520,7 +542,7 @@ export function VolumeRenderer({
         mapper.addClippingPlane(plane);
       }
     }
-  }, [clip, syntheticClipDirection, syntheticClipIndex, syntheticScanAxis]);
+  }, [clip]);
 
   const applyCtVolumeLook = useCallback((volume: any, mapper: any) => {
     if (!volume || !mapper) return;
@@ -653,6 +675,17 @@ export function VolumeRenderer({
         if (cancelled) return;
 
         // ------- vtkImageData -------
+        syntheticBaseDataRef.current = mode === 'synthetic' ? volData.scalarData : null;
+        const displayedScalarData = mode === 'synthetic'
+          ? buildProgressiveFloatScalars(
+            volData.scalarData,
+            volData.dimensions,
+            syntheticScanAxis,
+            syntheticClipIndex,
+            syntheticClipDirection,
+          )
+          : volData.scalarData;
+
         const imageData = vtkImageData.newInstance();
         imageData.setDimensions(volData.dimensions);
         imageData.setSpacing(volData.spacing);
@@ -660,7 +693,7 @@ export function VolumeRenderer({
 
         const dataArray = vtkDataArray.newInstance({
           name: 'Scalars',
-          values: volData.scalarData,
+          values: displayedScalarData,
           numberOfComponents: 1,
         });
         imageData.getPointData().setScalars(dataArray);
@@ -829,8 +862,40 @@ export function VolumeRenderer({
     state.renderWindow.render();
   }, [applyCtVolumeLook, isReady]);
 
+  useEffect(() => {
+    const state = vtkRef.current;
+    const baseData = syntheticBaseDataRef.current;
+    if (!state || !isReady || mode !== 'synthetic' || !baseData || !state.imageData || !state.renderWindow) {
+      return;
+    }
+
+    const dims = state.imageData.getDimensions() as [number, number, number];
+    const displayedScalarData = buildProgressiveFloatScalars(
+      baseData,
+      dims,
+      syntheticScanAxis,
+      syntheticClipIndex,
+      syntheticClipDirection,
+    );
+
+    state.imageData.getPointData().setScalars(vtkDataArray.newInstance({
+      name: 'Scalars',
+      values: displayedScalarData,
+      numberOfComponents: 1,
+    }));
+    state.imageData.modified();
+    state.mapper.modified();
+    state.renderWindow.render();
+  }, [
+    isReady,
+    mode,
+    syntheticClipDirection,
+    syntheticClipIndex,
+    syntheticScanAxis,
+  ]);
+
   // ------------------------------------------------------------------
-  // 3. Clipping plane management — user clips + progressive scan clip
+  // 3. Clipping plane management — user-controlled clips only.
   // ------------------------------------------------------------------
   useEffect(() => {
     const state = vtkRef.current;
@@ -895,9 +960,16 @@ export function VolumeRenderer({
         segImageData.setDimensions(ctDims);
         segImageData.setSpacing(spacing);
         segImageData.setOrigin(origin);
+        const progressiveMask = buildProgressiveUint8Scalars(
+          Uint8Array.from(mask, (value) => Math.round(value)),
+          ctDims as [number, number, number],
+          syntheticScanAxis,
+          syntheticClipIndex,
+          syntheticClipDirection,
+        );
         segImageData.getPointData().setScalars(vtkDataArray.newInstance({
           name: 'SegmentationMask',
-          values: Uint8Array.from(mask, (value) => Math.round(value)),
+          values: progressiveMask,
           numberOfComponents: 1,
         }));
 

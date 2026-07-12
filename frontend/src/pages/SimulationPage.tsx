@@ -263,6 +263,71 @@ function buildVtkVolumePayload(
   };
 }
 
+function suppressExteriorAirForVtk(
+  volumeData: Float32Array,
+  shape: [number, number, number],
+  applyAnatomicalSilhouette = true,
+): Float32Array {
+  const [depth, height, width] = shape;
+  const cleaned = new Float32Array(volumeData);
+  const sliceSize = width * height;
+  const exteriorAirThresholdHU = 25;
+
+  for (let z = 0; z < depth; z++) {
+    const sliceOffset = z * sliceSize;
+    const visited = new Uint8Array(sliceSize);
+    const queue: number[] = [];
+
+    const enqueueIfExteriorAir = (idx: number) => {
+      if (visited[idx] || cleaned[sliceOffset + idx] > exteriorAirThresholdHU) return;
+      visited[idx] = 1;
+      queue.push(idx);
+    };
+
+    for (let x = 0; x < width; x++) {
+      enqueueIfExteriorAir(x);
+      enqueueIfExteriorAir((height - 1) * width + x);
+    }
+    for (let y = 0; y < height; y++) {
+      enqueueIfExteriorAir(y * width);
+      enqueueIfExteriorAir(y * width + width - 1);
+    }
+
+    for (let head = 0; head < queue.length; head++) {
+      const idx = queue[head];
+      cleaned[sliceOffset + idx] = -1024;
+      const x = idx % width;
+      const y = Math.floor(idx / width);
+
+      if (x > 0) enqueueIfExteriorAir(idx - 1);
+      if (x + 1 < width) enqueueIfExteriorAir(idx + 1);
+      if (y > 0) enqueueIfExteriorAir(idx - width);
+      if (y + 1 < height) enqueueIfExteriorAir(idx + width);
+    }
+
+    if (applyAnatomicalSilhouette) {
+      const zProgress = depth > 1 ? z / (depth - 1) : 0.5;
+      const torsoTaper = 0.76 + 0.24 * Math.sin(Math.PI * zProgress);
+      const rx = Math.max(width * 0.34, width * 0.48 * torsoTaper);
+      const ry = Math.max(height * 0.32, height * 0.46 * torsoTaper);
+      const cx = (width - 1) * 0.5;
+      const cy = (height - 1) * 0.52;
+
+      for (let y = 0; y < height; y++) {
+        const yn = (y - cy) / ry;
+        for (let x = 0; x < width; x++) {
+          const xn = (x - cx) / rx;
+          if (xn * xn + yn * yn > 1.0) {
+            cleaned[sliceOffset + y * width + x] = -1024;
+          }
+        }
+      }
+    }
+  }
+
+  return cleaned;
+}
+
 function transposeZyxMaskToVtkOrder(
   maskData: ArrayLike<number>,
   shape: [number, number, number],
@@ -281,6 +346,38 @@ function transposeZyxMaskToVtkOrder(
   }
 
   return transposed;
+}
+
+function isLikelyBackgroundLabel(
+  labelData: ArrayLike<number>,
+  shape: [number, number, number],
+  labelIndex: number,
+): boolean {
+  const [depth, height, width] = shape;
+  const sliceSize = width * height;
+  const voxelCount = depth * sliceSize;
+  let count = 0;
+  let faceCount = 0;
+
+  for (let z = 0; z < depth; z++) {
+    const zFace = z === 0 || z === depth - 1;
+    for (let y = 0; y < height; y++) {
+      const yFace = y === 0 || y === height - 1;
+      for (let x = 0; x < width; x++) {
+        const idx = z * sliceSize + y * width + x;
+        if (Number(labelData[idx]) !== labelIndex) continue;
+        count++;
+        if (zFace || yFace || x === 0 || x === width - 1) {
+          faceCount++;
+        }
+      }
+    }
+  }
+
+  if (count === 0) return false;
+  const volumeFraction = count / Math.max(voxelCount, 1);
+  const faceFraction = faceCount / Math.max(count, 1);
+  return volumeFraction > 0.35 || (volumeFraction > 0.05 && faceFraction > 0.18);
 }
 
 function getCenteredVolumeOriginMm(
@@ -969,6 +1066,9 @@ export default function SimulationPage() {
       .filter(([index]) => {
         const count = phantom.metadata.labelNonzeroCounts?.[index];
         return count === undefined || Number(count) > 0;
+      })
+      .filter(([index]) => {
+        return !isLikelyBackgroundLabel(activeSegmentationLabelData, activeVolumeShape, index);
       });
 
     if (availableLabels.length === 0) return null;
@@ -1096,8 +1196,18 @@ export default function SimulationPage() {
     }
 
     try {
-      const { transposedData, dims, vtkSpacing: spacing } = buildVtkVolumePayload(
+      const hasGantryPoseChange = Boolean(ctParamsResult) && (
+        Math.abs(ctParamsResult?.metadata.gantryPitchDeg ?? 0) > 1e-3 ||
+        Math.abs(ctParamsResult?.metadata.gantryYawDeg ?? 0) > 1e-3 ||
+        Math.abs(ctParamsResult?.metadata.gantryRollDeg ?? 0) > 1e-3
+      );
+      const vtkSourceData = suppressExteriorAirForVtk(
         activeSliceData,
+        activeVolumeShape,
+        !hasGantryPoseChange,
+      );
+      const { transposedData, dims, vtkSpacing: spacing } = buildVtkVolumePayload(
+        vtkSourceData,
         activeVolumeShape,
         activeVolumeSpacing,
       );
@@ -1110,7 +1220,7 @@ export default function SimulationPage() {
       setVtkDims(null);
       setVtkSpacing(null);
     }
-  }, [activeSliceData, activeVolumeShape, activeVolumeSpacing]);
+  }, [activeSliceData, activeVolumeShape, activeVolumeSpacing, ctParamsResult]);
 
   // ---- Axial slice canvas rendering ----
   const renderSlice = useCallback(() => {

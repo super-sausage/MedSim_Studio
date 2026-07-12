@@ -104,7 +104,7 @@ def _extract_body_support_mask(
     """
     support_seed = volume > threshold_hu
     if label_volume is not None:
-      support_seed |= label_volume > 0
+        support_seed |= label_volume > 0
 
     labeled, num_features = label(support_seed)
     if num_features <= 0:
@@ -1093,10 +1093,7 @@ def simulate_ct_scan_params(
 
     working = volume.astype(np.float32, copy=True)
     working_labels = label_volume.astype(np.uint8, copy=True) if label_volume is not None else None
-    working_support_mask = working > -980.0
-    if working_labels is not None:
-        working_support_mask |= working_labels > 0
-    working_support_mask = binary_dilation(working_support_mask, iterations=1)
+    working_support_mask = _extract_body_support_mask(working, working_labels)
     input_spacing = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
     warnings: list[str] = []
     resolved_params = _resolve_params(params)
