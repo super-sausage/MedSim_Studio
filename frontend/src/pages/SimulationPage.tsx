@@ -219,6 +219,10 @@ interface SliceDisplayEmphasis {
   highKvpFlattenStrength: number;
   lowKvpBrightnessLift: number;
   highKvpBrightnessDrop: number;
+  highPitchArtifactStrength: number;
+  lowPitchCrispnessStrength: number;
+  lowMatrixPixelationStrength: number;
+  highMatrixCrispnessStrength: number;
 }
 
 function clampByte(value: number): number {
@@ -245,12 +249,20 @@ function buildSliceDisplayEmphasis(
   const highMasSmoothingStrength = Math.max(0, Math.min(1.1, (params.mAs - 140) / 130));
   const lowKvpContrastStrength = Math.max(0, Math.min(1.25, (125 - params.kVp) / 35));
   const highKvpFlattenStrength = Math.max(0, Math.min(1.1, (params.kVp - 115) / 20));
+  const highPitchArtifactStrength = Math.max(0, Math.min(2.5, (params.pitch - 1.0) / 0.5));
+  const lowPitchCrispnessStrength = Math.max(0, Math.min(1.7, (1.0 - params.pitch) / 0.5));
+  const lowMatrixPixelationStrength = Math.max(0, Math.min(2.4, (512 - params.matrixSize) / 256));
+  const highMatrixCrispnessStrength = Math.max(0, Math.min(2.0, (params.matrixSize - 512) / 512));
 
   if (
     lowMasNoiseStrength <= 1e-3
     && highMasSmoothingStrength <= 1e-3
     && lowKvpContrastStrength <= 1e-3
     && highKvpFlattenStrength <= 1e-3
+    && highPitchArtifactStrength <= 1e-3
+    && lowPitchCrispnessStrength <= 1e-3
+    && lowMatrixPixelationStrength <= 1e-3
+    && highMatrixCrispnessStrength <= 1e-3
   ) {
     return null;
   }
@@ -262,6 +274,10 @@ function buildSliceDisplayEmphasis(
     highKvpFlattenStrength,
     lowKvpBrightnessLift: lowKvpContrastStrength,
     highKvpBrightnessDrop: highKvpFlattenStrength,
+    highPitchArtifactStrength,
+    lowPitchCrispnessStrength,
+    lowMatrixPixelationStrength,
+    highMatrixCrispnessStrength,
   };
 }
 
@@ -586,13 +602,36 @@ function renderVolumeSliceToCanvas({
   const imageData = ctx.createImageData(width, height);
 
   for (let i = 0; i < sliceSize; i++) {
+    const x = i % width;
+    const y = Math.floor(i / width);
     const hu = slice[i];
-    let gray = applyWindowLevel(hu, windowLevel, windowWidth);
+    let displayHu = hu;
+
+    if (displayEmphasis && displayEmphasis.lowMatrixPixelationStrength > 1e-3 && hu > -980) {
+      const blockSize = Math.max(3, Math.round(5 + displayEmphasis.lowMatrixPixelationStrength * 7));
+      const anchorX = Math.min(Math.floor(x / blockSize) * blockSize, width - 1);
+      const anchorY = Math.min(Math.floor(y / blockSize) * blockSize, height - 1);
+      const anchorHu = slice[anchorY * width + anchorX];
+      const blockAlpha = Math.min(0.96, 0.68 + displayEmphasis.lowMatrixPixelationStrength * 0.18);
+      displayHu = displayHu * (1 - blockAlpha) + anchorHu * blockAlpha;
+    }
+
+    if (displayEmphasis && displayEmphasis.highPitchArtifactStrength > 1e-3 && hu > -980) {
+      const bandHeight = Math.max(2, Math.round(3 + displayEmphasis.highPitchArtifactStrength * 4));
+      const bandY = Math.min(Math.floor(y / bandHeight) * bandHeight, height - 1);
+      const nextBandY = Math.min(bandY + bandHeight, height - 1);
+      const bandHu = slice[bandY * width + x];
+      const nextBandHu = slice[nextBandY * width + x];
+      const bandBlend = 0.5 + 0.5 * stableSignedNoise(x, 0, sliceIndex, 271);
+      const stripedHu = bandHu * (1 - bandBlend) + nextBandHu * bandBlend;
+      const bandAlpha = Math.min(0.9, 0.5 + displayEmphasis.highPitchArtifactStrength * 0.16);
+      displayHu = displayHu * (1 - bandAlpha) + stripedHu * bandAlpha;
+    }
+
+    let gray = applyWindowLevel(displayHu, windowLevel, windowWidth);
     const pixelIdx = i * 4;
 
     if (displayEmphasis && hu > -980) {
-      const x = i % width;
-      const y = Math.floor(i / width);
       const bodyWeight = hu >= -700 ? 1 : Math.max(0, Math.min(1, (hu + 980) / 280));
 
       if (bodyWeight > 0) {
@@ -635,6 +674,46 @@ function renderVolumeSliceToCanvas({
         if (displayEmphasis.highMasSmoothingStrength > 1e-3) {
           const smoothTowardMid = 0.14 + 0.24 * displayEmphasis.highMasSmoothingStrength;
           gray = gray * (1 - smoothTowardMid) + 127.5 * smoothTowardMid;
+        }
+
+        if (displayEmphasis.highPitchArtifactStrength > 1e-3) {
+          const zStripe = stableSignedNoise(0, 0, sliceIndex, 211);
+          const xBand = stableSignedNoise(Math.floor(x / 6), 0, sliceIndex, 223);
+          const yBand = stableSignedNoise(0, Math.floor(y / 6), sliceIndex, 227);
+          const stairStep = stableSignedNoise(Math.floor(x / 4), Math.floor(y / 2), sliceIndex, 241);
+          const banding = stableSignedNoise(0, Math.floor(y / 3), sliceIndex, 251);
+          const pitchNoise = (xBand * 0.42 + yBand * 0.24 + stairStep * 0.18 + banding * 0.16) * zStripe;
+          gray += pitchNoise * (42 + 54 * displayEmphasis.highPitchArtifactStrength) * bodyWeight;
+          gray -= bodyWeight * displayEmphasis.highPitchArtifactStrength * 22;
+          gray = Math.round(gray / 16) * 16;
+        }
+
+        if (displayEmphasis.lowPitchCrispnessStrength > 1e-3) {
+          const rightHu = x + 1 < width ? slice[i + 1] : hu;
+          const downHu = y + 1 < height ? slice[i + width] : hu;
+          const localEdge = (Math.abs(hu - rightHu) + Math.abs(hu - downHu)) * 0.5;
+          gray += Math.min(localEdge / 140, 1) * 44 * displayEmphasis.lowPitchCrispnessStrength * bodyWeight;
+        }
+
+        if (displayEmphasis.lowMatrixPixelationStrength > 1e-3) {
+          const blockNoise = stableSignedNoise(Math.floor(x / 5), Math.floor(y / 5), sliceIndex, 239);
+          const macroBlock = stableSignedNoise(Math.floor(x / 8), Math.floor(y / 8), sliceIndex, 257);
+          gray += (blockNoise * 0.55 + macroBlock * 0.45) * 24 * displayEmphasis.lowMatrixPixelationStrength * bodyWeight;
+          gray = Math.round(gray / 28) * 28;
+        }
+
+        if (displayEmphasis.highMatrixCrispnessStrength > 1e-3) {
+          const rightHu = x + 1 < width ? slice[i + 1] : hu;
+          const downHu = y + 1 < height ? slice[i + width] : hu;
+          const diagonalHu = x + 1 < width && y + 1 < height ? slice[i + width + 1] : hu;
+          const localContrast = (
+            Math.abs(hu - rightHu)
+            + Math.abs(hu - downHu)
+            + Math.abs(hu - diagonalHu)
+          ) / 3;
+          gray += Math.min(localContrast / 120, 1) * 52 * displayEmphasis.highMatrixCrispnessStrength * bodyWeight;
+          gray += (hu > 120 ? 16 : 0) * displayEmphasis.highMatrixCrispnessStrength * bodyWeight;
+          gray = 127.5 + ((gray - 127.5) * (1 + 0.3 * displayEmphasis.highMatrixCrispnessStrength));
         }
 
         gray = clampByte(gray);

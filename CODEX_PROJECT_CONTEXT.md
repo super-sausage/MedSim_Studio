@@ -1,5 +1,165 @@
 # MedSim Studio Codex Project Context
 
+## Update 2026-07-12 - pitch and matrix size visibility still too weak after first tuning pass
+
+This pass happened after the user reported that `pitch` and `matrix size`
+still did not look sufficiently different in the CT Simulation page.
+
+The user requirement in this pass remained narrow:
+
+- inspect the actual current logic instead of guessing
+- keep changes minimal and targeted
+- focus only on `pitch` and `matrix size`
+- preserve the existing right-side 3D slice-synced accumulation behavior
+- avoid broad retuning of unrelated parameters
+
+### What was confirmed
+
+- backend already had implemented `pitch` degradation and `matrix` effects in
+  `backend/app/simulation/ct_params_simulator.py`
+- frontend already had a retained 2D-only display emphasis path for `mAs` and
+  `kVp` in `frontend/src/pages/SimulationPage.tsx`
+- the first tuning pass increased:
+  - backend `pitch` blur / helical blend / artifact strength
+  - backend `matrix` low-resolution degradation and `1024` edge enhancement
+  - frontend 2D-only display emphasis for `pitch` and `matrix`
+- after that pass, the user still judged the visible difference as
+  insufficient
+
+### Important implication for the next pass
+
+- if `pitch` / `matrix` still look weak, prefer strengthening the left 2D
+  display communication again before making broader 3D-path changes
+- stronger visible differentiation is still allowed for these two parameters,
+  but it should stay narrowly scoped and should not disturb:
+  - DICOM loading
+  - segmentation overlays
+  - Slice Sync
+  - right-side 3D accumulation geometry
+
+### Follow-up on the same day
+
+- a second and then third narrowly scoped tuning pass further increased:
+  - backend `pitch` blur / helical blend / jitter / artifact amplitude
+  - backend `256` degradation and `1024` enhancement strength
+  - frontend 2D-only `pitch` banding / coarse instability cues
+  - frontend 2D-only `matrix` pixelation / crispness cues
+- if the user still says the difference is weak after these passes, the next
+  preferred direction is still to intensify left-side 2D communication first,
+  because backend `1024` vs `512` differences will remain naturally limited in
+  an image-domain approximation
+- a later same-day follow-up then changed strategy further toward explicit
+  left-side 2D display communication:
+  - low `matrix` now mixes toward coarse block-anchor sampling before grayscale
+    mapping so pixelation is easier to see
+  - high `pitch` now mixes toward banded row sampling before grayscale mapping
+    so striping / instability is easier to see
+  - this remains display-oriented and should still not change the right-side 3D
+    accumulation model
+- after the user still reported that the difference was hard to see, another
+  same-day pass increased the display emphasis further toward obvious
+  human-visible communication:
+  - low `matrix` uses larger block anchors, stronger block blending, and
+    coarser grayscale quantization
+  - high `matrix` uses stronger local-contrast and edge emphasis
+  - high `pitch` uses stronger row-banding blend plus stronger grayscale
+    stepping / instability cues
+  - this pass intentionally prioritizes visual discrimination in the left 2D
+    preview over subtle realism for these two parameters
+
+## Update 2026-07-12 - CT mAs and kVp differences are now emphasized in 2D preview only
+
+This pass happened after the user reported that changing `mAs` and `kVp` still
+looked nearly ineffective in the CT Simulation page.
+
+The user then clarified one hard constraint that overrode other approaches:
+
+- the left 2D CT view should make current / voltage differences visually clear
+- the right 3D view should continue to be derived from stacked 2D CT slices
+- non-angle parameter changes must not reintroduce the old
+  rectangle / thin-slab / compressed-body failure in the right 3D view
+- every change must avoid disturbing unrelated flows such as DICOM loading,
+  label overlays, Slice Sync, and existing 3D accumulation behavior
+
+### What was tried and what was intentionally not kept
+
+Several intermediate attempts were explored during this pass:
+
+- increasing backend `mAs` / `kVp` effect strength directly in
+  `backend/app/simulation/ct_params_simulator.py`
+- moving backend noise later in the CT simulation pipeline
+- adding stronger right-side 3D support masking / volume clamping
+
+Those approaches were **not** retained as final behavior because they could:
+
+- make the right 3D accumulation look like a rectangle again
+- clip body content or make the anatomy look compressed
+- change the simulated volume path instead of only changing visible 2D
+  communication
+
+The final retained solution for this pass is therefore narrower:
+
+- keep backend CT simulation / 3D accumulation path functionally unchanged
+- emphasize `mAs` / `kVp` differences only in the left 2D slice canvas display
+
+### Final frontend changes made
+
+#### `frontend/src/pages/SimulationPage.tsx`
+
+- added a display-only `SliceDisplayEmphasis` helper for CT parameter preview
+- added deterministic 2D slice rendering emphasis that activates only when
+  `ctParamsResult` is present
+- low `mAs` is now shown more clearly in 2D as:
+  - heavier grain
+  - coarse noise
+  - banding / streak-like texture
+- high `mAs` is now shown more clearly in 2D as:
+  - smoother
+  - cleaner
+  - less noisy
+- low `kVp` is now shown more clearly in 2D as:
+  - stronger contrast
+  - stronger edge emphasis
+  - brighter / harder appearance in denser structures
+- high `kVp` is now shown more clearly in 2D as:
+  - flatter
+  - softer
+  - darker / less contrasty
+- this emphasis is applied only in the 2D canvas grayscale mapping step
+- no retained final change in this pass alters:
+  - `sliceIndex` behavior
+  - `syntheticClipIndex`
+  - VTK 3D accumulation logic
+  - DICOM workspace loading flow
+  - segmentation overlay logic
+
+### Validation performed
+
+- `npx tsc --noEmit` passed in `frontend`
+- the user confirmed this version was the good one and asked for it to be
+  committed
+
+### Repository state
+
+This pass was committed and pushed.
+
+- commit: `67af39e`
+- message: `feat: emphasize CT mAs and kVp effects in 2D preview`
+- branch: `main`
+- remote: `origin/main`
+
+### Important notes for the next conversation
+
+- the retained `mAs` / `kVp` differentiation in this pass is a
+  **display-oriented 2D preview emphasis**, not a new backend CT physics model
+- if future work wants stronger visible parameter differences, prefer changing
+  the left 2D render path first
+- avoid reintroducing backend / VTK-side experimental masking or support
+  clamping for non-angle parameter runs unless the user explicitly asks for a
+  new 3D behavior change
+- the right 3D path should remain the slice-synced accumulation of the current
+  CT stack, not a separately stylized rendering path
+
 ## Update 2026-07-12 - CT params no longer collapse slice-synced 3D accumulation into a rectangle
 
 This pass fixed the CT Simulation page issue where changing almost any CT

@@ -646,14 +646,21 @@ def _apply_pitch_effect(
     if pitch <= 1.0:
         return volume, {
             "z_sigma_voxels": 0.0,
+            "xy_sigma_voxels": 0.0,
             "artifact_amplitude_hu": 0.0,
             "helical_blend_alpha": 0.0,
+            "slice_jitter_alpha": 0.0,
             "pitch_model": "identity",
         }
 
-    sigma_voxels = (pitch - 1.0) * 0.8
+    pitch_excess = max(pitch - 1.0, 0.0)
+    sigma_voxels = pitch_excess * 2.25
     degraded = gaussian_filter1d(volume, sigma=sigma_voxels, axis=0, mode="nearest")
-    helical_blend_alpha = min((pitch - 1.0) * 0.34, 0.22)
+    xy_sigma = pitch_excess * 0.5
+    if xy_sigma > 1e-6:
+        degraded = gaussian_filter(degraded, sigma=(0.0, xy_sigma, xy_sigma), mode="nearest")
+
+    helical_blend_alpha = min(pitch_excess * 0.8, 0.62)
     if helical_blend_alpha > 0.0 and degraded.shape[0] > 3:
         shifted_up = np.roll(degraded, -1, axis=0)
         shifted_down = np.roll(degraded, 1, axis=0)
@@ -663,7 +670,16 @@ def _apply_pitch_effect(
         helical_interp = interpolation_mix * shifted_up + (1.0 - interpolation_mix) * shifted_down
         degraded = degraded * (1.0 - helical_blend_alpha) + helical_interp * helical_blend_alpha
 
-    artifact_amplitude = min((pitch - 1.0) * 7.5, 6.5)
+    slice_jitter_alpha = min(pitch_excess * 0.42, 0.34)
+    if slice_jitter_alpha > 0.0 and degraded.shape[0] > 4:
+        shifted_far_up = np.roll(degraded, -2, axis=0)
+        shifted_far_down = np.roll(degraded, 2, axis=0)
+        slice_phase = np.sin(
+            np.linspace(0.0, 2.0 * np.pi * (0.6 + pitch_excess), degraded.shape[0], dtype=np.float32)
+        )[:, None, None]
+        degraded = degraded + (shifted_far_up - shifted_far_down) * slice_phase * slice_jitter_alpha
+
+    artifact_amplitude = min(pitch_excess * 26.0, 24.0)
     if artifact_amplitude > 0.0 and degraded.shape[0] > 3:
         z = np.linspace(0.0, 2.0 * np.pi, degraded.shape[0], dtype=np.float32)[:, None, None]
         x = np.linspace(0.0, 2.0 * np.pi * (0.55 + pitch * 0.25), degraded.shape[2], dtype=np.float32)[None, None, :]
@@ -672,12 +688,15 @@ def _apply_pitch_effect(
         body_mask = (degraded > -850.0).astype(np.float32)
         artifact = ripple * body_mask * np.tanh(z_gradient / 110.0) * artifact_amplitude
         degraded = degraded + artifact
+        degraded = degraded - body_mask * pitch_excess * 9.0
 
     return degraded.astype(np.float32, copy=False), {
         "z_sigma_voxels": float(sigma_voxels),
+        "xy_sigma_voxels": float(xy_sigma),
         "artifact_amplitude_hu": float(artifact_amplitude),
         "helical_blend_alpha": float(helical_blend_alpha),
-        "pitch_model": "helical_interpolation_blur_plus_windmill_artifact",
+        "slice_jitter_alpha": float(slice_jitter_alpha),
+        "pitch_model": "helical_interpolation_blur_plus_windmill_artifact_and_slice_jitter",
     }
 
 
@@ -791,17 +810,22 @@ def _apply_matrix_effect(
         # Higher display matrix at fixed FOV should look slightly crisper and less pixel-limited,
         # even though this preview cannot invent true detector-domain information.
         upscale_factor = matrix_size / 512.0
-        base_sigma = max((upscale_factor - 1.0) * 0.12, 0.0)
+        base_sigma = max((upscale_factor - 1.0) * 0.04, 0.0)
         denoised = gaussian_filter(volume, sigma=(0.0, base_sigma, base_sigma), mode="nearest")
-        detail = volume - gaussian_filter(volume, sigma=(0.0, 0.4, 0.4), mode="nearest")
-        enhanced = denoised + min((upscale_factor - 1.0) * 0.18, 0.16) * detail
+        detail = volume - gaussian_filter(volume, sigma=(0.0, 0.32, 0.32), mode="nearest")
+        fine_detail = volume - gaussian_filter(volume, sigma=(0.0, 0.16, 0.16), mode="nearest")
+        edge_boost = min((upscale_factor - 1.0) * 0.82, 0.78)
+        micro_boost = min((upscale_factor - 1.0) * 0.28, 0.24)
+        enhanced = denoised + edge_boost * detail + micro_boost * fine_detail
+        enhanced = enhanced + np.tanh(detail / 85.0).astype(np.float32, copy=False) * (16.0 * (upscale_factor - 1.0))
         enhanced = _clipped_float32(enhanced)
         return enhanced, {
             "downsample_factor": 1.0,
             "effective_matrix_size": int(matrix_size),
             "matrix_model": "high_matrix_edge_enhancement",
             "upscale_factor_reference": float(upscale_factor),
-            "edge_boost_amount": float(min((upscale_factor - 1.0) * 0.18, 0.16)),
+            "edge_boost_amount": float(edge_boost),
+            "micro_boost_amount": float(micro_boost),
         }
 
     if matrix_size == 512:
@@ -812,9 +836,10 @@ def _apply_matrix_effect(
         }
 
     scale = matrix_size / 512.0
+    alias_sigma = max((1.0 / max(scale, 1e-6) - 1.0) * 0.78, 0.0)
     prefiltered = gaussian_filter(
         volume,
-        sigma=(0.0, max((1.0 / max(scale, 1e-6) - 1.0) * 0.22, 0.0), max((1.0 / max(scale, 1e-6) - 1.0) * 0.22, 0.0)),
+        sigma=(0.0, alias_sigma, alias_sigma),
         mode="nearest",
     )
     down = _resize_xy(prefiltered, scale, order=1)
@@ -825,13 +850,19 @@ def _apply_matrix_effect(
         mode="nearest",
     )
     restored = _crop_or_pad_to_shape(restored.astype(np.float32, copy=False), (volume.shape[1], volume.shape[2]))
-    edge_loss_sigma = max((1.0 / max(scale, 1e-6) - 1.0) * 0.12, 0.0)
+    edge_loss_sigma = max((1.0 / max(scale, 1e-6) - 1.0) * 0.62, 0.0)
     if edge_loss_sigma > 1e-6:
         restored = gaussian_filter(restored, sigma=(0.0, edge_loss_sigma, edge_loss_sigma), mode="nearest")
+    block_alpha = min((1.0 / max(scale, 1e-6) - 1.0) * 0.42, 0.4)
+    if block_alpha > 1e-6:
+        blocky = _resize_xy(down, 1.0 / max(scale, 1e-6), order=0)
+        blocky = _crop_or_pad_to_shape(blocky.astype(np.float32, copy=False), (volume.shape[1], volume.shape[2]))
+        restored = restored * (1.0 - block_alpha) + blocky * block_alpha
     return restored, {
         "downsample_factor": float(scale),
         "effective_matrix_size": int(matrix_size),
         "matrix_model": "downsample_restore_with_antialias",
+        "blockiness_alpha": float(block_alpha),
     }
 
 
