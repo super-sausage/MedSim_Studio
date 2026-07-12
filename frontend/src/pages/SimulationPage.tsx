@@ -212,6 +212,59 @@ function applyWindowLevel(
   return ((hu - low) / windowWidth) * 255;
 }
 
+interface SliceDisplayEmphasis {
+  lowMasNoiseStrength: number;
+  highMasSmoothingStrength: number;
+  lowKvpContrastStrength: number;
+  highKvpFlattenStrength: number;
+  lowKvpBrightnessLift: number;
+  highKvpBrightnessDrop: number;
+}
+
+function clampByte(value: number): number {
+  return Math.max(0, Math.min(255, value));
+}
+
+function stableSignedNoise(x: number, y: number, z: number, seed: number): number {
+  let h = Math.imul(x + 1, 374761393);
+  h = Math.imul(h ^ (y + 1), 668265263);
+  h = Math.imul(h ^ (z + 1), 2147483647);
+  h = Math.imul(h ^ seed, 1274126177);
+  h ^= h >>> 13;
+  h = Math.imul(h, 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967295 * 2 - 1;
+}
+
+function buildSliceDisplayEmphasis(
+  params: CtParamsPreviewParams | null,
+): SliceDisplayEmphasis | null {
+  if (!params) return null;
+
+  const lowMasNoiseStrength = Math.max(0, Math.min(1.25, (170 - params.mAs) / 110));
+  const highMasSmoothingStrength = Math.max(0, Math.min(1.1, (params.mAs - 140) / 130));
+  const lowKvpContrastStrength = Math.max(0, Math.min(1.25, (125 - params.kVp) / 35));
+  const highKvpFlattenStrength = Math.max(0, Math.min(1.1, (params.kVp - 115) / 20));
+
+  if (
+    lowMasNoiseStrength <= 1e-3
+    && highMasSmoothingStrength <= 1e-3
+    && lowKvpContrastStrength <= 1e-3
+    && highKvpFlattenStrength <= 1e-3
+  ) {
+    return null;
+  }
+
+  return {
+    lowMasNoiseStrength,
+    highMasSmoothingStrength,
+    lowKvpContrastStrength,
+    highKvpFlattenStrength,
+    lowKvpBrightnessLift: lowKvpContrastStrength,
+    highKvpBrightnessDrop: highKvpFlattenStrength,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Decode base64 → Float32Array
 // ---------------------------------------------------------------------------
@@ -499,6 +552,7 @@ function renderVolumeSliceToCanvas({
   labelColors,
   showLabelOverlay = false,
   pickedPosition,
+  displayEmphasis,
 }: {
   canvas: HTMLCanvasElement;
   width: number;
@@ -512,6 +566,7 @@ function renderVolumeSliceToCanvas({
   labelColors?: Record<number, [number, number, number]>;
   showLabelOverlay?: boolean;
   pickedPosition?: { x: number; y: number; z: number } | null;
+  displayEmphasis?: SliceDisplayEmphasis | null;
 }): void {
   if (sliceIndex < 0 || sliceIndex >= depth) return;
 
@@ -531,8 +586,60 @@ function renderVolumeSliceToCanvas({
   const imageData = ctx.createImageData(width, height);
 
   for (let i = 0; i < sliceSize; i++) {
-    const gray = applyWindowLevel(slice[i], windowLevel, windowWidth);
+    const hu = slice[i];
+    let gray = applyWindowLevel(hu, windowLevel, windowWidth);
     const pixelIdx = i * 4;
+
+    if (displayEmphasis && hu > -980) {
+      const x = i % width;
+      const y = Math.floor(i / width);
+      const bodyWeight = hu >= -700 ? 1 : Math.max(0, Math.min(1, (hu + 980) / 280));
+
+      if (bodyWeight > 0) {
+        const normalizedGray = (gray - 127.5) / 127.5;
+
+        if (displayEmphasis.lowKvpContrastStrength > 1e-3) {
+          const rightHu = x + 1 < width ? slice[i + 1] : hu;
+          const downHu = y + 1 < height ? slice[i + width] : hu;
+          const edgeHu = (Math.abs(hu - rightHu) + Math.abs(hu - downHu)) * 0.5;
+          const edgeBoost = Math.min(edgeHu / 110, 1) * 72 * displayEmphasis.lowKvpContrastStrength;
+          gray = 127.5 + normalizedGray * (1 + 0.72 * displayEmphasis.lowKvpContrastStrength) * 127.5;
+          gray += edgeBoost * bodyWeight;
+          gray += bodyWeight * displayEmphasis.lowKvpContrastStrength * (hu > 90 ? 40 : 16);
+          gray += (hu > 250 ? 24 : 0) * displayEmphasis.lowKvpContrastStrength * bodyWeight;
+          gray += displayEmphasis.lowKvpBrightnessLift * bodyWeight * 12;
+        }
+
+        if (displayEmphasis.highKvpFlattenStrength > 1e-3) {
+          gray = 127.5 + normalizedGray * (1 - 0.45 * displayEmphasis.highKvpFlattenStrength) * 127.5;
+          gray -= bodyWeight * (20 + 22 * displayEmphasis.highKvpFlattenStrength);
+          gray -= displayEmphasis.highKvpBrightnessDrop * bodyWeight * 10;
+        }
+
+        if (displayEmphasis.lowMasNoiseStrength > 1e-3) {
+          const grain = stableSignedNoise(x, y, sliceIndex, 17);
+          const coarse = stableSignedNoise(Math.floor(x / 3), Math.floor(y / 3), sliceIndex, 43);
+          const banding = stableSignedNoise(0, y, sliceIndex, 71) * 0.55
+            + stableSignedNoise(x, 0, sliceIndex, 97) * 0.45;
+          const streak = stableSignedNoise(Math.floor(x / 8), 0, sliceIndex, 131) * 0.6
+            + stableSignedNoise(0, Math.floor(y / 8), sliceIndex, 151) * 0.4;
+          const checker = stableSignedNoise(Math.floor(x / 2), Math.floor(y / 2), sliceIndex, 173);
+          const noiseAmp = (28 + 52 * displayEmphasis.lowMasNoiseStrength) * bodyWeight;
+          gray += grain * noiseAmp * 0.55;
+          gray += coarse * noiseAmp * 0.52;
+          gray += banding * noiseAmp * 0.78;
+          gray += streak * noiseAmp * 0.55;
+          gray += checker * noiseAmp * 0.35;
+        }
+
+        if (displayEmphasis.highMasSmoothingStrength > 1e-3) {
+          const smoothTowardMid = 0.14 + 0.24 * displayEmphasis.highMasSmoothingStrength;
+          gray = gray * (1 - smoothTowardMid) + 127.5 * smoothTowardMid;
+        }
+
+        gray = clampByte(gray);
+      }
+    }
 
     if (labelSlice && labelSlice[i] > 0) {
       const organColor = labelColors?.[labelSlice[i]] ?? getOrganColor(labelSlice[i]);
@@ -1049,6 +1156,10 @@ export default function SimulationPage() {
   const previewStats = ctParamsResult?.metadata.previewStats;
   const originalCenterSliceStats = previewStats?.originalCenterSliceStats;
   const simulatedCenterSliceStats = previewStats?.simulatedCenterSliceStats;
+  const activeDisplayEmphasis = useMemo(() => {
+    if (!ctParamsResult) return null;
+    return buildSliceDisplayEmphasis(ctParams);
+  }, [ctParams, ctParamsResult]);
   const ctWorkspaceSeriesList = useMemo(
     () => seriesList.filter((series) => !series.modality || series.modality.toUpperCase() === 'CT'),
     [seriesList],
@@ -1261,8 +1372,10 @@ export default function SimulationPage() {
       labelColors: activeOrganColorMap,
       showLabelOverlay,
       pickedPosition: activePickedPosition,
+      displayEmphasis: activeDisplayEmphasis,
     });
   }, [
+    activeDisplayEmphasis,
     activePreset,
     activeOrganColorMap,
     activeSliceData,
