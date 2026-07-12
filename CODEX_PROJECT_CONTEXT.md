@@ -1,5 +1,110 @@
 # MedSim Studio Codex Project Context
 
+## Update 2026-07-12 - CT params no longer collapse slice-synced 3D accumulation into a rectangle
+
+This pass fixed the CT Simulation page issue where changing almost any CT
+parameter could make the right-side 3D view appear as a long rectangle / thin
+slab.
+
+The user's clarified requirement was:
+
+- the right 3D view is built from the same left 2D CT slice stack
+- `Slice Sync` / progressive accumulation must remain the core behavior
+- thickness, dose, mAs, kVp, pitch, FOV, matrix, kernel, and contrast changes
+  must not destroy the anatomical completeness of the CT volume
+- slice thickness should affect slice count / quality / partial-volume blur,
+  not make the CT body incomplete
+- a rectangular/expanded output box is only expected when gantry angle changes
+  actually rotate/resample the volume
+
+### Real root cause found
+
+The main frontend bug was in `frontend/src/pages/SimulationPage.tsx`.
+
+Before this fix, the active dataset key included
+`ctParamsResult.simulatedVolumeBase64`. A `useEffect` watched that key and reset
+`sliceIndex` to `scanStartIndex` whenever a new simulated CT result arrived.
+
+Because the right 3D renderer displays progressive accumulation from the left
+2D stack up to the current `sliceIndex`, every parameter run effectively reset
+the 3D view back to the first informative slice. The result looked like a
+rectangular slab even though the full simulated volume still existed.
+
+### Frontend changes made
+
+#### `frontend/src/pages/SimulationPage.tsx`
+
+- replaced the result-dependent reset key with a phantom/workspace-only key:
+  - old behavior: reset slice index whenever `ctParamsResult` changed
+  - new behavior: reset slice index only when the loaded phantom/workspace
+    changes
+- CT parameter updates now preserve the current slice position and therefore
+  preserve the intended 2D-to-3D progressive accumulation behavior
+- for non-gantry parameter runs, the informative body slice range is based on
+  the original loaded phantom when the simulated result shape still matches the
+  phantom
+- this prevents thickness/noise/intensity changes from redefining the visible
+  anatomical scan range
+
+#### `frontend/src/vtk/volumeRendering/VolumeRenderer.tsx`
+
+- adjusted CT transfer-function opacity so low-HU air/background is not rendered
+  as an opaque box
+- lung / soft-tissue / angio presets now keep air and low-HU background
+  transparent before tissue-level opacity begins
+
+### Backend changes made
+
+#### `backend/app/simulation/ct_params_simulator.py`
+
+- body support extraction now uses a stricter tissue threshold and fills
+  per-axial-slice support holes before connected-component cleanup
+- slice thickness simulation was changed to preserve volume coverage:
+  - keep z/xy reconstruction scale at `1.0`
+  - retain blur / slab averaging / partial-volume effects
+  - remove the coarse downsample-and-upsample reconstruction step that could
+    make thick slices look like they damaged CT completeness
+- thickness model metadata is now:
+  - `coverage_preserving_z_blur_plus_slab_averaging`
+
+### Validation performed
+
+- `python -m py_compile backend/app/simulation/ct_params_simulator.py` passed
+- `npx tsc --noEmit` passed in `frontend`
+- Docker frontend/backend were rebuilt/recreated during validation
+- running backend container was checked and contained the current simulator
+  changes
+- running frontend bundle was checked and contained the new
+  `phantomDatasetKey` slice-reset logic
+- the user confirmed the issue was solved after the final fix
+
+### Repository state
+
+This pass was committed and pushed.
+
+- commit: `46bac12`
+- message: `fix: preserve ct slice accumulation during parameter updates`
+- branch: `main`
+- remote: `origin/main`
+
+### Important notes for the next conversation
+
+- do not reintroduce `ctParamsResult.simulatedVolumeBase64` into the slice-reset
+  effect dependency path
+- right-side 3D must continue to be derived from the same active CT stack as the
+  left-side 2D slice view
+- non-angle CT parameter changes should preserve body geometry and slice-sync
+  accumulation
+- only gantry pitch/yaw/roll changes should be expected to alter the output
+  bounding box / rotated rectangular extent
+- if a similar rectangle issue returns, first inspect:
+  1. whether `sliceIndex` is being reset after parameter runs
+  2. whether progressive scalar filling is receiving the expected
+     `syntheticClipIndex`
+  3. whether transfer functions are making air/background visible
+  4. whether the frontend Docker image was rebuilt and the browser is loading
+     the new bundle
+
 ## Update 2026-07-11 - organ colors darkened and separation increased for CT overlays
 
 This pass happened after the user reviewed the latest lighter organ overlay
