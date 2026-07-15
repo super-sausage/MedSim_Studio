@@ -9,10 +9,13 @@ CT phantom generation, and result export for synthetic medical image generation.
 import os
 import io
 import base64
+import copy
 import uuid
 import tempfile
 import logging
+import threading
 from functools import lru_cache
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
@@ -46,10 +49,23 @@ from app.schemas.simulation import (
     LesionInPhantomPreviewResponse,
     CTParamsPreviewRequest,
     CTParamsPreviewResponse,
+    PathologyNoduleOnDicomRequest,
+    PathologyNoduleOnDicomResponse,
+    PathologySampledParameters,
+    PathologyPlacementInfo,
+    PathologySegmentationLabel,
 )
+from app.ai.nnunet_lung_lobe import (
+    CustomModelNotAvailableError as LungLobeModelNotAvailableError,
+    remap_lung_lobe_labels_to_upper_body,
+    run_nnunet_lung_lobe,
+)
+from app.ai.nnunet_lung_lobe.labels import LUNG_LOBE_LABEL_MAP, MODEL_NAME as LUNG_LOBE_MODEL_NAME, get_label_defs as get_lung_lobe_label_defs
 from app.simulation.lesion.generator import LesionGenerator
 from app.simulation.lesion.analyzer import extract_mesh
+from app.simulation.lung_region_determiner import LungRegionDeterminer
 from app.simulation.organ.simulator import OrganSimulator
+from app.simulation.pathology import PathologyGenerator
 from app.simulation.volume_builder import build_volume_from_dicom, build_synthetic_volume
 from app.simulation.exporter import export_nrrd, export_nifti, export_dicom_zip
 from app.simulation.ct_params_simulator import simulate_ct_scan_params
@@ -318,6 +334,15 @@ def _debug_log_spacing(
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/simulation", tags=["Simulation"])
+_PATHOLOGY_LOBE_CACHE_LOCK = threading.Lock()
+_PATHOLOGY_LOBE_CACHE: "OrderedDict[tuple[str, str, tuple[int, int, int]], np.ndarray]" = OrderedDict()
+_PATHOLOGY_LOBE_CACHE_MAX_ITEMS = 4
+_PATHOLOGY_VOLUME_CACHE_LOCK = threading.Lock()
+_PATHOLOGY_VOLUME_CACHE: "OrderedDict[tuple[str, str], tuple[np.ndarray, Dict[str, Any]]]" = OrderedDict()
+_PATHOLOGY_VOLUME_CACHE_MAX_ITEMS = 3
+_PATHOLOGY_PREVIEW_CACHE_LOCK = threading.Lock()
+_PATHOLOGY_PREVIEW_CACHE: "OrderedDict[tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
+_PATHOLOGY_PREVIEW_CACHE_MAX_ITEMS = 6
 DEFAULT_STANDARDIZED_NOTES = [
     "axis_order = zyx",
     "dtype = float32",
@@ -472,7 +497,7 @@ def _resample_label_volume_to_shape(
 ) -> np.ndarray:
     """Nearest-neighbor resample a zyx label volume to an exact target shape."""
     if tuple(int(dim) for dim in label_volume.shape) == tuple(int(dim) for dim in output_shape):
-        return np.asarray(label_volume, dtype=np.uint8, copy=False)
+        return label_volume.astype(np.uint8, copy=False)
 
     zoom_factors = tuple(
         float(target_dim) / float(source_dim)
@@ -485,6 +510,123 @@ def _resample_label_volume_to_shape(
         mode="nearest",
     )
     return np.asarray(np.rint(resized), dtype=np.uint8)
+
+
+def _get_cached_pathology_lobe_labels(
+    cache_key: tuple[str, str, tuple[int, int, int]],
+) -> Optional[np.ndarray]:
+    with _PATHOLOGY_LOBE_CACHE_LOCK:
+        cached = _PATHOLOGY_LOBE_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        _PATHOLOGY_LOBE_CACHE.move_to_end(cache_key)
+        return np.array(cached, dtype=np.uint8, copy=True)
+
+
+def _set_cached_pathology_lobe_labels(
+    cache_key: tuple[str, str, tuple[int, int, int]],
+    label_volume: np.ndarray,
+) -> None:
+    with _PATHOLOGY_LOBE_CACHE_LOCK:
+        _PATHOLOGY_LOBE_CACHE[cache_key] = np.array(label_volume, dtype=np.uint8, copy=True)
+        _PATHOLOGY_LOBE_CACHE.move_to_end(cache_key)
+        while len(_PATHOLOGY_LOBE_CACHE) > _PATHOLOGY_LOBE_CACHE_MAX_ITEMS:
+            _PATHOLOGY_LOBE_CACHE.popitem(last=False)
+
+
+def _get_cached_pathology_volume(
+    cache_key: tuple[str, str],
+) -> Optional[tuple[np.ndarray, Dict[str, Any]]]:
+    with _PATHOLOGY_VOLUME_CACHE_LOCK:
+        cached = _PATHOLOGY_VOLUME_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        _PATHOLOGY_VOLUME_CACHE.move_to_end(cache_key)
+        volume, metadata = cached
+        return volume, dict(metadata)
+
+
+def _set_cached_pathology_volume(
+    cache_key: tuple[str, str],
+    volume: np.ndarray,
+    metadata: Dict[str, Any],
+) -> None:
+    with _PATHOLOGY_VOLUME_CACHE_LOCK:
+        _PATHOLOGY_VOLUME_CACHE[cache_key] = (
+            np.array(volume, dtype=np.float32, copy=True),
+            dict(metadata),
+        )
+        _PATHOLOGY_VOLUME_CACHE.move_to_end(cache_key)
+        while len(_PATHOLOGY_VOLUME_CACHE) > _PATHOLOGY_VOLUME_CACHE_MAX_ITEMS:
+            _PATHOLOGY_VOLUME_CACHE.popitem(last=False)
+
+
+def _get_cached_pathology_preview_response(
+    cache_key: tuple[Any, ...],
+) -> Optional[Dict[str, Any]]:
+    with _PATHOLOGY_PREVIEW_CACHE_LOCK:
+        cached = _PATHOLOGY_PREVIEW_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        _PATHOLOGY_PREVIEW_CACHE.move_to_end(cache_key)
+        return copy.deepcopy(cached)
+
+
+def _set_cached_pathology_preview_response(
+    cache_key: tuple[Any, ...],
+    payload: Dict[str, Any],
+) -> None:
+    with _PATHOLOGY_PREVIEW_CACHE_LOCK:
+        _PATHOLOGY_PREVIEW_CACHE[cache_key] = copy.deepcopy(payload)
+        _PATHOLOGY_PREVIEW_CACHE.move_to_end(cache_key)
+        while len(_PATHOLOGY_PREVIEW_CACHE) > _PATHOLOGY_PREVIEW_CACHE_MAX_ITEMS:
+            _PATHOLOGY_PREVIEW_CACHE.popitem(last=False)
+
+
+def _estimate_thoracic_crop_bounds(
+    volume: np.ndarray,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Estimate a thoracic ROI so lung-lobe inference keeps native spacing but avoids whole-body scans."""
+    volume = np.asarray(volume, dtype=np.float32)
+    body_mask = volume > -700.0
+    if not np.any(body_mask):
+        body_mask = volume > -850.0
+
+    z_idx, y_idx, x_idx = np.where(body_mask)
+    if len(z_idx) == 0:
+        return (0, volume.shape[0]), (0, volume.shape[1]), (0, volume.shape[2])
+
+    body_bbox = np.zeros_like(body_mask, dtype=bool)
+    body_bbox[
+        int(z_idx.min()): int(z_idx.max()) + 1,
+        int(y_idx.min()): int(y_idx.max()) + 1,
+        int(x_idx.min()): int(x_idx.max()) + 1,
+    ] = True
+
+    lung_like = (volume >= -980.0) & (volume <= -250.0) & body_bbox
+    slice_counts = np.count_nonzero(lung_like, axis=(1, 2))
+    min_pixels = max(48, int(volume.shape[1] * volume.shape[2] * 0.002))
+    valid_z = np.where(slice_counts >= min_pixels)[0]
+    if len(valid_z) == 0:
+        return (0, volume.shape[0]), (0, volume.shape[1]), (0, volume.shape[2])
+
+    z_margin = 16
+    z0 = max(0, int(valid_z.min()) - z_margin)
+    z1 = min(volume.shape[0], int(valid_z.max()) + z_margin + 1)
+
+    cropped_lung_like = lung_like[z0:z1]
+    yz_idx = np.where(cropped_lung_like)
+    if len(yz_idx[0]) == 0:
+        return (z0, z1), (0, volume.shape[1]), (0, volume.shape[2])
+
+    y_margin = 18
+    x_margin = 18
+    y0 = max(0, int(yz_idx[1].min()) - y_margin)
+    y1 = min(volume.shape[1], int(yz_idx[1].max()) + y_margin + 1)
+    x0 = max(0, int(yz_idx[2].min()) - x_margin)
+    x1 = min(volume.shape[2], int(yz_idx[2].max()) + x_margin + 1)
+
+    return (z0, z1), (y0, y1), (x0, x1)
 
 
 def _read_dicom_dataset_from_storage(storage: Any, object_key: Optional[str]) -> Optional[Any]:
@@ -1961,6 +2103,267 @@ async def preview_lesion_on_dicom_3d(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"DICOM 3D lesion preview failed: {str(e)[:500]}",
+        )
+
+
+@router.post(
+    "/pathology-nodule-on-dicom",
+    response_model=PathologyNoduleOnDicomResponse,
+)
+async def pathology_nodule_on_dicom(
+    request: PathologyNoduleOnDicomRequest,
+    db: Session = Depends(get_db),
+):
+    """Generate a pathology-aware lung nodule inside a target segmented lobe."""
+    try:
+        response_cache_key = (
+            str(request.series_id),
+            str(request.scan_direction),
+            int(request.preview_size),
+            str(request.nodule_type),
+            str(request.size_category),
+            str(request.risk_level),
+            str(request.target_lobe),
+            request.random_seed,
+        )
+        cached_response = _get_cached_pathology_preview_response(response_cache_key)
+        if cached_response is not None:
+            logger.info(
+                "Pathology preview response cache hit: series=%s preview_size=%d target_lobe=%s",
+                request.series_id,
+                request.preview_size,
+                request.target_lobe,
+            )
+            return PathologyNoduleOnDicomResponse(**cached_response)
+
+        instances = (
+            db.query(DicomInstance)
+            .filter(DicomInstance.series_id == request.series_id)
+            .order_by(DicomInstance.instance_number.asc().nulls_last())
+            .all()
+        )
+        if not instances:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Series {request.series_id} not found",
+            )
+
+        storage = get_storage_backend()
+        volume_cache_key = (
+            str(request.series_id),
+            str(request.scan_direction),
+        )
+        cached_volume = _get_cached_pathology_volume(volume_cache_key)
+        if cached_volume is not None:
+            full_volume, metadata = cached_volume
+            logger.info(
+                "Pathology volume cache hit: series=%s scan_direction=%s",
+                request.series_id,
+                request.scan_direction,
+            )
+        else:
+            full_volume, metadata = build_volume_from_dicom(storage, instances)
+            full_volume, metadata = _normalize_dicom_scan_direction(
+                full_volume,
+                metadata,
+                request.scan_direction,
+            )
+            _set_cached_pathology_volume(volume_cache_key, full_volume, metadata)
+            logger.info(
+                "Pathology volume cache store: series=%s scan_direction=%s shape=%s",
+                request.series_id,
+                request.scan_direction,
+                list(full_volume.shape),
+            )
+        full_spacing = tuple(float(v) for v in metadata.get("spacing", (1.0, 1.0, 1.0)))
+
+        preview_volume, preview_spacing, preview_scale = _downsample_volume_to_max_dim(
+            full_volume,
+            full_spacing,
+            request.preview_size,
+            order=1,
+        )
+
+        logger.info(
+            "Pathology nodule preview started: series=%s full_shape=%s preview_shape=%s preview_size=%d",
+            request.series_id,
+            list(full_volume.shape),
+            list(preview_volume.shape),
+            request.preview_size,
+        )
+
+        cache_key = (
+            str(request.series_id),
+            str(request.scan_direction),
+            tuple(int(dim) for dim in preview_volume.shape),
+        )
+        segmentation_source_model = LUNG_LOBE_MODEL_NAME
+        lobe_labels = _get_cached_pathology_lobe_labels(cache_key)
+        if lobe_labels is not None:
+            logger.info(
+                "Pathology lobe cache hit: series=%s preview_shape=%s",
+                request.series_id,
+                list(preview_volume.shape),
+            )
+        else:
+            (crop_z, crop_y, crop_x) = _estimate_thoracic_crop_bounds(full_volume)
+            segmentation_volume = full_volume[crop_z[0]:crop_z[1], crop_y[0]:crop_y[1], crop_x[0]:crop_x[1]]
+            segmentation_spacing = full_spacing
+            logger.info(
+                "Pathology model segmentation crop: series=%s crop_shape=%s crop_bounds_zyx=%s",
+                request.series_id,
+                list(segmentation_volume.shape),
+                {
+                    "z": [crop_z[0], crop_z[1]],
+                    "y": [crop_y[0], crop_y[1]],
+                    "x": [crop_x[0], crop_x[1]],
+                },
+            )
+            try:
+                raw_lobe_labels = run_nnunet_lung_lobe(
+                    volume=segmentation_volume,
+                    spacing=segmentation_spacing,
+                )
+            except LungLobeModelNotAvailableError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=str(exc),
+                ) from exc
+
+            cropped_lobe_labels = remap_lung_lobe_labels_to_upper_body(raw_lobe_labels)
+            full_lobe_labels = np.zeros(full_volume.shape, dtype=np.uint8)
+            full_lobe_labels[
+                crop_z[0]:crop_z[1],
+                crop_y[0]:crop_y[1],
+                crop_x[0]:crop_x[1],
+            ] = np.asarray(cropped_lobe_labels, dtype=np.uint8)
+            lobe_labels = _resample_label_volume_to_shape(
+                full_lobe_labels,
+                tuple(int(dim) for dim in preview_volume.shape),
+            )
+            lobe_labels = np.asarray(lobe_labels, dtype=np.uint8)
+            _set_cached_pathology_lobe_labels(cache_key, lobe_labels)
+            logger.info(
+                "Pathology lobe cache store: series=%s preview_shape=%s source=%s",
+                request.series_id,
+                list(preview_volume.shape),
+                segmentation_source_model,
+            )
+
+        target_label = LUNG_LOBE_LABEL_MAP[request.target_lobe]
+        target_mask = lobe_labels == int(target_label)
+        if not np.any(target_mask):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Target lobe '{request.target_lobe}' was not present in the segmentation result",
+            )
+
+        pathology_generator = PathologyGenerator(seed=request.random_seed)
+        sampled = pathology_generator.sample(
+            nodule_type=request.nodule_type,
+            size_category=request.size_category,
+            risk_level=request.risk_level,
+            target_lobe=request.target_lobe,
+        )
+
+        region_determiner = LungRegionDeterminer(seed=request.random_seed)
+        placement = region_determiner.find_safe_center(
+            ct_volume=preview_volume,
+            lobe_mask=target_mask,
+            spacing=tuple(float(v) for v in preview_spacing),
+            diameter_mm=float(sampled.diameter_mm),
+        )
+
+        generator = LesionGenerator(seed=request.random_seed)
+        lesion_cfg = sampled.to_generator_config(
+            center_x=placement.center_x,
+            center_y=placement.center_y,
+            center_z=placement.center_z,
+        )
+        lesion_volume = generator.generate_lesion(
+            volume_shape=tuple(int(dim) for dim in preview_volume.shape),
+            config=lesion_cfg,
+            spacing=tuple(float(v) for v in preview_spacing),
+        )
+        lesion_mask = lesion_volume != 0
+        if not np.any(lesion_mask):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Lesion generator produced an empty mask",
+            )
+
+        result_volume = np.asarray(preview_volume, dtype=np.float32).copy()
+        result_volume[lesion_mask] = lesion_volume[lesion_mask]
+        mesh_data = extract_mesh(lesion_mask, spacing=tuple(float(v) for v in preview_spacing))
+
+        sx, sy, sz = preview_spacing[2], preview_spacing[1], preview_spacing[0]
+        dx, dy, dz = result_volume.shape[2], result_volume.shape[1], result_volume.shape[0]
+        origin_x = -((dx - 1) * sx) / 2.0
+        origin_y = -((dy - 1) * sy) / 2.0
+        origin_z = -((dz - 1) * sz) / 2.0
+        centered_verts = [
+            [v[0] + origin_x, v[1] + origin_y, v[2] + origin_z]
+            for v in mesh_data["vertices"]
+        ]
+        centered_center = list(mesh_data["center"])
+        centered_center[0] += origin_x
+        centered_center[1] += origin_y
+        centered_center[2] += origin_z
+
+        volume_base64 = base64.b64encode(
+            np.asarray(result_volume, dtype="<f4").tobytes()
+        ).decode("ascii")
+        segmentation_mask_base64 = base64.b64encode(
+            np.asarray(lobe_labels, dtype="<f4").tobytes()
+        ).decode("ascii")
+
+        logger.info(
+            "Pathology nodule preview: series=%s preview_shape=%s preview_spacing=%s target_lobe=%s center=%s diameter_mm=%.2f scale=%.3f",
+            request.series_id,
+            list(result_volume.shape),
+            [round(float(v), 3) for v in preview_spacing],
+            request.target_lobe,
+            [placement.center_z, placement.center_y, placement.center_x],
+            sampled.diameter_mm,
+            preview_scale,
+        )
+
+        response_payload = {
+            "volume_base64": volume_base64,
+            "volume_shape": [int(dim) for dim in result_volume.shape],
+            "volume_spacing": [float(v) for v in preview_spacing],
+            "segmentation_mask_base64": segmentation_mask_base64,
+            "segmentation_labels": [
+                PathologySegmentationLabel(**label_def).model_dump()
+                for label_def in get_lung_lobe_label_defs()
+            ],
+            "segmentation_source_model": segmentation_source_model,
+            "lesion_vertices": centered_verts,
+            "lesion_faces": mesh_data["faces"],
+            "lesion_normals": mesh_data["normals"],
+            "lesion_center_mm": [float(v) for v in centered_center],
+            "lesion_volume_mm3": float(mesh_data["volume_mm3"]),
+            "lesion_center_voxel_zyx": [
+                float(placement.center_z),
+                float(placement.center_y),
+                float(placement.center_x),
+            ],
+            "sampled_parameters": PathologySampledParameters(**sampled.to_response_dict()).model_dump(),
+            "placement": PathologyPlacementInfo(**placement.as_dict()).model_dump(),
+        }
+        _set_cached_pathology_preview_response(response_cache_key, response_payload)
+
+        return PathologyNoduleOnDicomResponse(
+            **response_payload,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Pathology DICOM nodule preview failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Pathology DICOM nodule preview failed: {str(e)[:500]}",
         )
 
 

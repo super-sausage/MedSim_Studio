@@ -445,7 +445,7 @@ class DicomLesion3DPreviewRequest(BaseModel):
     normalized_center_y: float = Field(0.0, description="Normalized center Y (0-1, 0=auto)")
     normalized_center_z: float = Field(0.0, description="Normalized center Z (0-1, 0=auto)")
     scan_direction: Literal["head_to_feet", "feet_to_head"] = "head_to_feet"
-    preview_size: int = Field(192, ge=64, le=320, description="Max edge size in voxels for preview downsampling")
+    preview_size: int = Field(128, ge=64, le=320, description="Max edge size in voxels for preview downsampling")
 
 
 class DicomLesion3DPreviewResponse(BaseModel):
@@ -477,6 +477,83 @@ class DicomLesion3DPreviewResponse(BaseModel):
         ..., min_length=3, max_length=3, description="Center of lesion bounding box [cx, cy, cz] in mm"
     )
     lesion_volume_mm3: float = Field(0.0, description="Approximate enclosed volume in mm³")
+
+
+class PathologySegmentationLabel(BaseModel):
+    index: int
+    name: str
+    color: List[int]
+
+
+class PathologyNoduleOnDicomRequest(BaseModel):
+    """High-level pathology-aware lung nodule request on a DICOM CT volume."""
+
+    series_id: str = Field(..., description="DICOM series ID to load")
+    nodule_type: Literal["solid", "part_solid", "ggo", "calcified"] = "solid"
+    size_category: Literal["micro", "small", "medium", "large"] = "small"
+    risk_level: Literal["low", "medium", "high"] = "medium"
+    target_lobe: Literal[
+        "left_lung_lower_lobe",
+        "right_lung_lower_lobe",
+        "right_lung_middle_lobe",
+        "left_lung_upper_lobe",
+        "right_lung_upper_lobe",
+    ] = "right_lung_upper_lobe"
+    scan_direction: Literal["head_to_feet", "feet_to_head"] = "head_to_feet"
+    preview_size: int = Field(192, ge=64, le=320, description="Max edge size in voxels for preview downsampling")
+    random_seed: Optional[int] = Field(None, description="Optional seed for deterministic parameter sampling")
+
+
+class PathologySampledParameters(BaseModel):
+    nodule_type: str
+    size_category: str
+    risk_level: str
+    target_lobe: str
+    lesion_type: str
+    shape: str
+    diameter_mm: float
+    radius_mm: List[float] = Field(..., min_length=3, max_length=3)
+    hu_mean: float
+    hu_std: float
+    margin_sharpness: float
+    spiculation_degree: float
+    lobulation_degree: float
+    calcification_fraction: float
+    necrosis_fraction: float
+    placement_margin_mm: float
+    guideline_basis: List[str]
+    notes: List[str]
+
+
+class PathologyPlacementInfo(BaseModel):
+    center_voxel_zyx: List[float] = Field(..., min_length=3, max_length=3)
+    edge_margin_mm: float
+    candidate_count: int
+    local_hu_mean: float
+    strategy: str
+
+
+class PathologyNoduleOnDicomResponse(BaseModel):
+    """Downsampled DICOM CT volume with pathology-driven lesion and lobe overlay."""
+
+    volume_base64: str = Field(
+        ..., description="Base64-encoded raw Float32 volume data (z, y, x, little-endian)"
+    )
+    volume_shape: List[int] = Field(..., min_length=3, max_length=3)
+    volume_spacing: List[float] = Field(..., min_length=3, max_length=3)
+    segmentation_mask_base64: str = Field(
+        ..., description="Base64-encoded raw Float32 lobe label volume aligned to the preview CT"
+    )
+    segmentation_labels: List[PathologySegmentationLabel]
+    segmentation_source_model: str
+    lesion_vertices: List[List[float]]
+    lesion_faces: List[List[int]]
+    lesion_normals: List[List[float]]
+    lesion_center_mm: List[float] = Field(..., min_length=3, max_length=3)
+    lesion_volume_mm3: float = Field(0.0, description="Approximate enclosed volume in mm鲁")
+    lesion_center_voxel_zyx: List[float] = Field(..., min_length=3, max_length=3)
+    sampled_parameters: PathologySampledParameters
+    placement: PathologyPlacementInfo
 
 
 class Lesion3DPreviewResponse(BaseModel):

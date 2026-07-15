@@ -11,6 +11,7 @@ Start command:
 
 import logging
 from contextlib import asynccontextmanager
+import threading
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from app import __version__, __app_name__
 from app.core.config import settings
 from app.api.v1 import health_router, dicom_router, simulation_router, segmentation_router
+from app.ai.nnunet_lung_lobe import warmup_nnunet_lung_lobe
 from app.dicom.storage import StorageBackend, get_storage_backend
 from app.database.session import engine, Base
 import app.models.dicom  # noqa: F401 — register models for create_all
@@ -98,6 +100,19 @@ async def lifespan(app: FastAPI):
 
     # TODO: Load AI models (if enabled)
     # TODO: Initialize volume rendering cache
+    def _warm_lung_lobe_model() -> None:
+        try:
+            logger.info("Warming nnUNet lung-lobe predictor")
+            warmup_nnunet_lung_lobe()
+            logger.info("nnUNet lung-lobe predictor warmup complete")
+        except Exception:
+            logger.exception("nnUNet lung-lobe predictor warmup failed")
+
+    threading.Thread(
+        target=_warm_lung_lobe_model,
+        name="nnunet-lung-lobe-warmup",
+        daemon=True,
+    ).start()
 
     yield
 

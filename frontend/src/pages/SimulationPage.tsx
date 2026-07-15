@@ -14,6 +14,12 @@ import type {
   Lesion3DPreviewResponse,
   LesionInPhantomPreviewResponse,
   DicomLesion3DPreviewResponse,
+  PathologyNoduleOnDicomResponse,
+  PathologyNoduleType,
+  PathologyNoduleSizeCategory,
+  PathologyRiskLevel,
+  LungLobeTarget,
+  PathologySegmentationLabel,
   LesionMeshData,
   LesionConfig,
   LesionType,
@@ -835,6 +841,46 @@ const shapeLabel: Record<LesionShape, string> = {
   spiculated: 'Spiculated',
 };
 
+const PATHOLOGY_NODULE_TYPE_LABEL: Record<PathologyNoduleType, string> = {
+  solid: 'Solid',
+  part_solid: 'Part-solid',
+  ggo: 'GGO',
+  calcified: 'Calcified',
+};
+
+const PATHOLOGY_SIZE_LABEL: Record<PathologyNoduleSizeCategory, string> = {
+  micro: 'Micro',
+  small: 'Small',
+  medium: 'Medium',
+  large: 'Large',
+};
+
+const PATHOLOGY_RISK_LABEL: Record<PathologyRiskLevel, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+};
+
+const LUNG_LOBE_LABEL: Record<LungLobeTarget, string> = {
+  left_lung_lower_lobe: 'Left Lower Lobe',
+  right_lung_lower_lobe: 'Right Lower Lobe',
+  right_lung_middle_lobe: 'Right Middle Lobe',
+  left_lung_upper_lobe: 'Left Upper Lobe',
+  right_lung_upper_lobe: 'Right Upper Lobe',
+};
+
+const DEFAULT_PATHOLOGY_FORM: {
+  noduleType: PathologyNoduleType;
+  sizeCategory: PathologyNoduleSizeCategory;
+  riskLevel: PathologyRiskLevel;
+  targetLobe: LungLobeTarget;
+} = {
+  noduleType: 'solid',
+  sizeCategory: 'small',
+  riskLevel: 'medium',
+  targetLobe: 'right_lung_upper_lobe',
+};
+
 /** Distinct colors for 3D lesion overlay (up to 8 lesions) */
 const LESION_OVERLAY_COLORS: Array<[number, number, number]> = [
   [255, 60, 60],    // Red
@@ -894,6 +940,7 @@ export default function SimulationPage() {
 
   // ---- Form state ----
   const [form, setForm] = useState(DEFAULT_FORM);
+  const [pathologyForm, setPathologyForm] = useState(DEFAULT_PATHOLOGY_FORM);
 
   // ---- Preview state ----
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -953,6 +1000,9 @@ export default function SimulationPage() {
   const [meshPreviewData, setMeshPreviewData] = useState<LesionMeshData | null>(null);
   const [meshPreviewLoading, setMeshPreviewLoading] = useState(false);
   const [meshPreviewError, setMeshPreviewError] = useState<string | null>(null);
+  const [meshPreviewSummary, setMeshPreviewSummary] = useState<string | null>(null);
+  const [meshPreviewSegmentationData, setMeshPreviewSegmentationData] = useState<Float32Array | null>(null);
+  const [meshPreviewSegmentationLabels, setMeshPreviewSegmentationLabels] = useState<PathologySegmentationLabel[] | null>(null);
   /** Phantom volume data for the in-body 3D preview */
   const [previewPhantomData, setPreviewPhantomData] = useState<Float32Array | null>(null);
   const [previewPhantomDims, setPreviewPhantomDims] = useState<[number, number, number] | null>(null);
@@ -1842,6 +1892,20 @@ export default function SimulationPage() {
       setForm((prev) => ({ ...prev, [key]: value })),
     [],
   );
+  const updatePathologyForm = useCallback(
+    <K extends keyof typeof pathologyForm>(key: K, value: (typeof pathologyForm)[K]) =>
+      setPathologyForm((prev) => ({ ...prev, [key]: value })),
+    [],
+  );
+
+  const decodeBase64Float32 = useCallback((value: string): Float32Array => {
+    const binaryStr = atob(value);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+    return new Float32Array(bytes.buffer);
+  }, []);
 
   /** Handle click on CT phantom canvas to pick lesion position */
   const handleCanvasClick = useCallback(
@@ -2024,6 +2088,9 @@ export default function SimulationPage() {
     setPreviewPhantomDims(null);
     setPreviewPhantomSpacing(null);
     setMeshPreviewError(null);
+    setMeshPreviewSummary(null);
+    setMeshPreviewSegmentationData(null);
+    setMeshPreviewSegmentationLabels(null);
     setMeshPreviewLoading(true);
     setMeshPreviewOpen(true);
 
@@ -2150,12 +2217,7 @@ export default function SimulationPage() {
       }
 
       // ── Decode volume (base64 → Float32Array) ──
-      const binaryStr = atob(volumeBase64);
-      const bytes = new Uint8Array(binaryStr.length);
-      for (let i = 0; i < binaryStr.length; i++) {
-        bytes[i] = binaryStr.charCodeAt(i);
-      }
-      const floatArray = new Float32Array(bytes.buffer);
+      const floatArray = decodeBase64Float32(volumeBase64);
 
       // Backend returns shape/spacing in [z, y, x]; VolumeRenderer expects [x, y, z]
       const [sz, sy, sx] = volumeShape;
@@ -2186,6 +2248,7 @@ export default function SimulationPage() {
   }, [
     activeVolumeShape,
     activeVolumeSpacing,
+    decodeBase64Float32,
     form,
     sourceType,
     selectedSeriesId,
@@ -2193,6 +2256,85 @@ export default function SimulationPage() {
     vtkSpacing,
     vtkVolumeData,
   ]);
+
+  const handlePathologyPreview3D = useCallback(async () => {
+    if (!selectedSeriesId) {
+      setMeshPreviewError('Select a DICOM series before running pathology preview');
+      return;
+    }
+
+    setMeshPreviewData(null);
+    setPreviewPhantomData(null);
+    setPreviewPhantomDims(null);
+    setPreviewPhantomSpacing(null);
+    setMeshPreviewError(null);
+    setMeshPreviewSummary(null);
+    setMeshPreviewSegmentationData(null);
+    setMeshPreviewSegmentationLabels(null);
+    setMeshPreviewLoading(true);
+    setMeshPreviewOpen(true);
+
+    try {
+      const result: PathologyNoduleOnDicomResponse =
+        await simulationService.previewPathologyNoduleOnDicom({
+          seriesId: selectedSeriesId,
+          noduleType: pathologyForm.noduleType,
+          sizeCategory: pathologyForm.sizeCategory,
+          riskLevel: pathologyForm.riskLevel,
+          targetLobe: pathologyForm.targetLobe,
+          scanDirection: 'head_to_feet',
+          previewSize: 128,
+        });
+
+      const volumeArray = decodeBase64Float32(result.volumeBase64);
+      const segmentationArray = decodeBase64Float32(result.segmentationMaskBase64);
+      const [sz, sy, sx] = result.volumeShape;
+      const [spz, spy, spx] = result.volumeSpacing;
+
+      setPreviewPhantomData(volumeArray);
+      setPreviewPhantomDims([sx, sy, sz]);
+      setPreviewPhantomSpacing([spx, spy, spz]);
+      setMeshPreviewSegmentationData(segmentationArray);
+      setMeshPreviewSegmentationLabels(result.segmentationLabels);
+      setMeshPreviewData({
+        id: 'pathology-preview',
+        vertices: result.lesionVertices,
+        faces: result.lesionFaces,
+        normals: result.lesionNormals,
+        opacity: 1.0,
+        color: [1, 0.35, 0.35],
+        visible: true,
+      });
+
+      setMeshPreviewSummary(
+        `${PATHOLOGY_NODULE_TYPE_LABEL[result.sampledParameters.noduleType]} · `
+        + `${PATHOLOGY_SIZE_LABEL[result.sampledParameters.sizeCategory]} · `
+        + `${PATHOLOGY_RISK_LABEL[result.sampledParameters.riskLevel]} risk · `
+        + `${LUNG_LOBE_LABEL[result.sampledParameters.targetLobe]} · `
+        + `Ø ${result.sampledParameters.diameterMm.toFixed(1)} mm · `
+        + `HU ${result.sampledParameters.huMean.toFixed(0)} ± ${result.sampledParameters.huStd.toFixed(0)}`
+      );
+
+      setForm((prev) => ({
+        ...prev,
+        lesionType: result.sampledParameters.lesionType === 'calcification' ? 'calcification' : 'nodule',
+        shape: result.sampledParameters.shape,
+        huMean: result.sampledParameters.huMean,
+        huStd: result.sampledParameters.huStd,
+        diameter: result.sampledParameters.diameterMm,
+        marginSharpness: result.sampledParameters.marginSharpness,
+        spiculationDegree: result.sampledParameters.spiculationDegree,
+        centerX: result.placement.centerVoxelZyx[2],
+        centerY: result.placement.centerVoxelZyx[1],
+        centerZ: result.placement.centerVoxelZyx[0],
+      }));
+    } catch (err: any) {
+      console.error('[SimulationPage] pathology 3D preview failed:', err);
+      setMeshPreviewError(err?.message || 'Pathology 3D preview failed');
+    } finally {
+      setMeshPreviewLoading(false);
+    }
+  }, [decodeBase64Float32, pathologyForm, selectedSeriesId]);
 
   /** Remove a lesion by index */
   const handleRemoveLesion = useCallback(
@@ -2280,6 +2422,9 @@ export default function SimulationPage() {
     setMeshPreviewOpen(false);
     setMeshPreviewData(null);
     setMeshPreviewError(null);
+    setMeshPreviewSummary(null);
+    setMeshPreviewSegmentationData(null);
+    setMeshPreviewSegmentationLabels(null);
     setPreviewPhantomData(null);
     setPreviewPhantomDims(null);
     setPreviewPhantomSpacing(null);
@@ -2796,6 +2941,65 @@ export default function SimulationPage() {
                   )}
                 </div>
 
+                <div className="border-t border-border pt-3">
+                  <div className="mb-2">
+                    <h4 className="text-xs font-medium text-muted-foreground">Pathology Auto-Config</h4>
+                    <p className="mt-1 text-[10px] text-muted-foreground">
+                      Sample clinically shaped nodule parameters from Fleischner/Lung-RADS style buckets.
+                    </p>
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <div>
+                      <label className="text-xs text-muted-foreground">Nodule Type</label>
+                      <select
+                        value={pathologyForm.noduleType}
+                        onChange={(e) => updatePathologyForm('noduleType', e.target.value as PathologyNoduleType)}
+                        className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                      >
+                        {Object.entries(PATHOLOGY_NODULE_TYPE_LABEL).map(([value, label]) => (
+                          <option key={value} value={value}>{label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground">Size Bucket</label>
+                      <select
+                        value={pathologyForm.sizeCategory}
+                        onChange={(e) => updatePathologyForm('sizeCategory', e.target.value as PathologyNoduleSizeCategory)}
+                        className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                      >
+                        {Object.entries(PATHOLOGY_SIZE_LABEL).map(([value, label]) => (
+                          <option key={value} value={value}>{label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground">Risk Level</label>
+                      <select
+                        value={pathologyForm.riskLevel}
+                        onChange={(e) => updatePathologyForm('riskLevel', e.target.value as PathologyRiskLevel)}
+                        className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                      >
+                        {Object.entries(PATHOLOGY_RISK_LABEL).map(([value, label]) => (
+                          <option key={value} value={value}>{label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground">Target Lobe</label>
+                      <select
+                        value={pathologyForm.targetLobe}
+                        onChange={(e) => updatePathologyForm('targetLobe', e.target.value as LungLobeTarget)}
+                        className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                      >
+                        {Object.entries(LUNG_LOBE_LABEL).map(([value, label]) => (
+                          <option key={value} value={value}>{label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
                 {/* Add Lesion button */}
                 <Button onClick={handleAddLesion} className="w-full">
                   Add Lesion
@@ -2886,13 +3090,22 @@ export default function SimulationPage() {
 
             {/* Preview on CT — only when DICOM source is selected */}
             {sourceType === 'dicom' && selectedSeriesId && (
-              <Button
-                variant="outline"
-                onClick={handleDicomPreview}
-                disabled={dicomPreviewLoading}
-              >
-                {dicomPreviewLoading ? 'Loading CT Preview...' : 'Preview on CT'}
-              </Button>
+              <>
+                <Button
+                  variant="outline"
+                  onClick={handlePathologyPreview3D}
+                  disabled={meshPreviewLoading}
+                >
+                  {meshPreviewLoading ? 'Sampling Pathology...' : 'Pathology 3D Preview'}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={handleDicomPreview}
+                  disabled={dicomPreviewLoading}
+                >
+                  {dicomPreviewLoading ? 'Loading CT Preview...' : 'Preview on CT'}
+                </Button>
+              </>
             )}
 
             {/* Preview result */}
@@ -4155,6 +4368,11 @@ export default function SimulationPage() {
                 {meshPreviewError && (
                   <span className="text-xs text-destructive">{meshPreviewError}</span>
                 )}
+                {meshPreviewSummary && (
+                  <span className="max-w-[480px] truncate rounded bg-white/5 px-2 py-0.5 text-[11px] text-white/75">
+                    {meshPreviewSummary}
+                  </span>
+                )}
                 {meshPreviewData && (
                   <span className="rounded bg-primary/10 px-2 py-0.5 text-[11px] text-primary">
                     {meshPreviewData.vertices.length} vertices · {meshPreviewData.faces.length} triangles
@@ -4179,6 +4397,8 @@ export default function SimulationPage() {
                   syntheticData={previewPhantomData}
                   syntheticDims={previewPhantomDims}
                   syntheticSpacing={previewPhantomSpacing}
+                  segmentationMask={meshPreviewSegmentationData}
+                  segmentationLabels={meshPreviewSegmentationLabels}
                   lesionMeshes={meshPreviewData ? [meshPreviewData] : null}
                 />
               ) : (

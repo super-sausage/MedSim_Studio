@@ -12,6 +12,7 @@ from app.ai.nnunet_lung_lobe.segmenter import (
     run_nnunet_lung_lobe,
     is_available,
     CustomModelNotAvailableError,
+    warmup_nnunet_lung_lobe,
 )
 from app.ai.nnunet_lung_lobe.labels import remap_lung_lobe_labels_to_upper_body
 
@@ -19,5 +20,6 @@ __all__ = [
     "run_nnunet_lung_lobe",
     "is_available",
     "CustomModelNotAvailableError",
+    "warmup_nnunet_lung_lobe",
     "remap_lung_lobe_labels_to_upper_body",
 ]

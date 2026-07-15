@@ -9,6 +9,8 @@ import type {
   LesionInPhantomPreviewResponse,
   DicomLesion3DPreviewRequest,
   DicomLesion3DPreviewResponse,
+  PathologyNoduleOnDicomRequest,
+  PathologyNoduleOnDicomResponse,
   LesionConfig,
   SimulationJob,
 } from '@/types/simulation';
@@ -354,6 +356,14 @@ export const simulationService = {
   ): Promise<DicomLesion3DPreviewResponse> =>
     api.post<DicomLesion3DPreviewResponse>('/simulation/preview/lesion-on-dicom-3d', params, {
       timeout: 180000,
+    }),
+
+  /** Pathology-aware pulmonary nodule generation on a real DICOM CT series */
+  previewPathologyNoduleOnDicom: (
+    params: PathologyNoduleOnDicomRequest,
+  ): Promise<PathologyNoduleOnDicomResponse> =>
+    api.post<PathologyNoduleOnDicomResponse>('/simulation/pathology-nodule-on-dicom', params, {
+      timeout: 300000,
     }),
 };
 

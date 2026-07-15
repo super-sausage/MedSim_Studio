@@ -19,7 +19,7 @@ x-backend-env: &backend-env
   MINIO_BUCKET: ${MINIO_BUCKET:-dicom-studies}
   DATABASE_URL: ${DATABASE_URL:-postgresql://ctuser:ctpass123@postgres:5432/ct_simulator}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
-  AI_DEVICE: ${AI_DEVICE:-cuda}
+  AI_DEVICE: cuda
   AI_MODEL_PATH: ${AI_MODEL_PATH:-/app/custom-models}
   TOTALSEGMENTATOR_DIR: ${TOTALSEGMENTATOR_DIR:-/app/models/totalsegmentator}
   TOTALSEGMENTATOR_FAST: ${TOTALSEGMENTATOR_FAST:-false}
@@ -65,7 +65,7 @@ services:
       - ./models/totalsegmentator:/app/models/totalsegmentator
       - ./models/nnunet701_full_handoff/nnunet_handoff/model/Dataset701_TotalSegOrgans6/nnUNetTrainer__nnUNetPlans__3d_fullres:/app/models/nnunet_handoff
       - ./models/nnunet702_handoff:/app/models/nnunet702_handoff
-      - ./models/nnunet_lung_lobe:/app/models/nnunet_lung_lobe
+      - ./nnunet_lung_lobe:/app/models/nnunet_lung_lobe
       - ./models/phantom_atlas:/app/models/phantom_atlas
       - ./data/lung_lobe_samples:/app/data/lung_lobe_samples:ro
     shm_size: 8g

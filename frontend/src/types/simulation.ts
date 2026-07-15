@@ -360,3 +360,76 @@ export interface DicomLesion3DPreviewResponse {
   lesionVolumeMm3: number;
 }
 
+export type PathologyNoduleType = 'solid' | 'part_solid' | 'ggo' | 'calcified';
+export type PathologyNoduleSizeCategory = 'micro' | 'small' | 'medium' | 'large';
+export type PathologyRiskLevel = 'low' | 'medium' | 'high';
+export type LungLobeTarget =
+  | 'left_lung_lower_lobe'
+  | 'right_lung_lower_lobe'
+  | 'right_lung_middle_lobe'
+  | 'left_lung_upper_lobe'
+  | 'right_lung_upper_lobe';
+
+export interface PathologySegmentationLabel {
+  index: number;
+  name: string;
+  color: [number, number, number];
+}
+
+export interface PathologyNoduleOnDicomRequest {
+  seriesId: string;
+  noduleType: PathologyNoduleType;
+  sizeCategory: PathologyNoduleSizeCategory;
+  riskLevel: PathologyRiskLevel;
+  targetLobe: LungLobeTarget;
+  scanDirection?: CtScanDirection;
+  previewSize?: number;
+  randomSeed?: number | null;
+}
+
+export interface PathologySampledParameters {
+  noduleType: PathologyNoduleType;
+  sizeCategory: PathologyNoduleSizeCategory;
+  riskLevel: PathologyRiskLevel;
+  targetLobe: LungLobeTarget;
+  lesionType: string;
+  shape: LesionShape;
+  diameterMm: number;
+  radiusMm: [number, number, number];
+  huMean: number;
+  huStd: number;
+  marginSharpness: number;
+  spiculationDegree: number;
+  lobulationDegree: number;
+  calcificationFraction: number;
+  necrosisFraction: number;
+  placementMarginMm: number;
+  guidelineBasis: string[];
+  notes: string[];
+}
+
+export interface PathologyPlacementInfo {
+  centerVoxelZyx: [number, number, number];
+  edgeMarginMm: number;
+  candidateCount: number;
+  localHuMean: number;
+  strategy: string;
+}
+
+export interface PathologyNoduleOnDicomResponse {
+  volumeBase64: string;
+  volumeShape: [number, number, number];
+  volumeSpacing: [number, number, number];
+  segmentationMaskBase64: string;
+  segmentationLabels: PathologySegmentationLabel[];
+  segmentationSourceModel: string;
+  lesionVertices: number[][];
+  lesionFaces: number[][];
+  lesionNormals: number[][];
+  lesionCenterMm: [number, number, number];
+  lesionVolumeMm3: number;
+  lesionCenterVoxelZyx: [number, number, number];
+  sampledParameters: PathologySampledParameters;
+  placement: PathologyPlacementInfo;
+}
+

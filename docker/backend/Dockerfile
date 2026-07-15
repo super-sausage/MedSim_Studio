@@ -138,11 +138,6 @@ COPY backend/ .
 # Create necessary directories
 RUN mkdir -p /tmp/uploads /app/ai-models /app/custom-models /app/static
 
-# Copy custom-trained MONAI UNet weights to a path NOT overridden by volumes
-# (/app/ai-models is mounted as a named volume in docker-compose, which
-#  would hide files COPY'd there at build time)
-COPY unet.pth /app/custom-models/unet.pth
-
 # TotalSegmentator pretrained weights dir (~2GB, downloaded on first use)
 # Cache them so they persist across container restarts
 ENV TOTALSEGMENTATOR_DIR=/app/ai-models/totalsegmentator
@@ -154,5 +149,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
 
 EXPOSE 8000
 
-# Run with uvicorn (2 workers — one for background tasks, one to stay responsive)
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Run with a single worker so large in-memory DICOM/pathology preview caches
+# are reused consistently instead of being split across multiple processes.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

@@ -20,14 +20,17 @@ Architecture flow:
 import logging
 import os
 import shutil
+import threading
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+_PREDICTOR_LOCK = threading.Lock()
+_PREDICTOR_CACHE: dict[str, Any] = {}
 
 
 class CustomModelNotAvailableError(RuntimeError):
@@ -147,30 +150,7 @@ def run_nnunet_lung_lobe(
         )
 
     # ---- Initialize nnUNetPredictor ----
-    from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
-
-    predictor = nnUNetPredictor(
-        tile_step_size=0.5,
-        use_gaussian=True,
-        use_mirroring=True,
-        perform_everything_on_device=True,
-        device=device,
-        verbose=False,
-        verbose_preprocessing=False,
-        allow_tqdm=False,
-    )
-
-    _t1 = __import__("time").time()
-    predictor.initialize_from_trained_model_folder(
-        str(model_folder),
-        use_folds=("0",),
-        checkpoint_name="checkpoint_best.pth",
-    )
-    logger.info(
-        "[nnUNet-LungLobe] Model loaded (%.1fs)  trainer=%s",
-        __import__("time").time() - _t1,
-        model_folder.name,
-    )
+    predictor = _get_or_create_predictor(model_folder, device)
 
     # ---- Run prediction ----
     _t2 = __import__("time").time()
@@ -216,3 +196,60 @@ def run_nnunet_lung_lobe(
     )
 
     return label_map
+
+
+def warmup_nnunet_lung_lobe() -> None:
+    """Load and cache the predictor during app startup."""
+    model_folder = _get_model_folder()
+    if model_folder is None:
+        raise CustomModelNotAvailableError(
+            f"Lung lobe nnUNet model not found at {settings.NNUNET_LUNG_LOBE_MODEL_PATH}. "
+            "Make sure the model directory is mounted correctly."
+        )
+
+    import torch
+
+    is_cpu = settings.AI_DEVICE == "cpu"
+    device = torch.device("cpu") if is_cpu else torch.device("cuda", 0)
+    _get_or_create_predictor(model_folder, device)
+
+
+def _get_or_create_predictor(model_folder: Path, device: "Any") -> "Any":
+    cache_key = f"{model_folder.resolve()}::{device}"
+    cached = _PREDICTOR_CACHE.get(cache_key)
+    if cached is not None:
+        logger.info("[nnUNet-LungLobe] Reusing cached predictor for %s", model_folder.name)
+        return cached
+
+    with _PREDICTOR_LOCK:
+        cached = _PREDICTOR_CACHE.get(cache_key)
+        if cached is not None:
+            logger.info("[nnUNet-LungLobe] Reusing cached predictor for %s", model_folder.name)
+            return cached
+
+        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+
+        predictor = nnUNetPredictor(
+            tile_step_size=0.5,
+            use_gaussian=True,
+            use_mirroring=True,
+            perform_everything_on_device=True,
+            device=device,
+            verbose=False,
+            verbose_preprocessing=False,
+            allow_tqdm=False,
+        )
+
+        _t1 = __import__("time").time()
+        predictor.initialize_from_trained_model_folder(
+            str(model_folder),
+            use_folds=("0",),
+            checkpoint_name="checkpoint_best.pth",
+        )
+        logger.info(
+            "[nnUNet-LungLobe] Model loaded (%.1fs)  trainer=%s",
+            __import__("time").time() - _t1,
+            model_folder.name,
+        )
+        _PREDICTOR_CACHE[cache_key] = predictor
+        return predictor
