@@ -65,7 +65,7 @@ services:
       - ./models/totalsegmentator:/app/models/totalsegmentator
       - ./models/nnunet701_full_handoff/nnunet_handoff/model/Dataset701_TotalSegOrgans6/nnUNetTrainer__nnUNetPlans__3d_fullres:/app/models/nnunet_handoff
       - ./models/nnunet702_handoff:/app/models/nnunet702_handoff
-      - ./nnunet_lung_lobe:/app/models/nnunet_lung_lobe
+      - ./models/nnunet_lung_lobe:/app/models/nnunet_lung_lobe
       - ./models/phantom_atlas:/app/models/phantom_atlas
       - ./data/lung_lobe_samples:/app/data/lung_lobe_samples:ro
     shm_size: 8g
